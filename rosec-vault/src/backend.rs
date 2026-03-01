@@ -81,16 +81,27 @@ impl LocalVault {
         }
 
         // Try each wrapping entry until one succeeds.
-        let vault_key = vault_file
-            .wrapping_entries
-            .iter()
-            .find_map(|entry| crypto::unwrap_vault_key(entry, password))
+        let mut vault_key = None;
+        for entry in &vault_file.wrapping_entries {
+            match crypto::unwrap_vault_key(entry, password) {
+                Ok(Some(key)) => {
+                    vault_key = Some(key);
+                    break;
+                }
+                Ok(None) => continue,
+                Err(e) => return Err(BackendError::Other(e.into())),
+            }
+        }
+        let vault_key = vault_key
             .ok_or_else(|| BackendError::Other(anyhow::anyhow!("HMAC verification failed")))?;
 
-        let mac_key = crypto::derive_mac_key(&*vault_key);
+        let mac_key =
+            crypto::derive_mac_key(&*vault_key).map_err(|e| BackendError::Other(e.into()))?;
 
         let encrypted_data = vault_file.encrypted_data_bytes();
-        if !crypto::verify_hmac(&*mac_key, &encrypted_data, &vault_file.hmac_bytes()) {
+        let hmac_valid = crypto::verify_hmac(&*mac_key, &encrypted_data, &vault_file.hmac_bytes())
+            .map_err(|e| BackendError::Other(e.into()))?;
+        if !hmac_valid {
             return Err(BackendError::Other(anyhow::anyhow!(
                 "vault data HMAC verification failed"
             )));
@@ -111,15 +122,18 @@ impl LocalVault {
         password: &[u8],
     ) -> Result<(VaultData, Zeroizing<[u8; 32]>, Vec<WrappingEntry>), BackendError> {
         let vault_key = crypto::generate_vault_key();
-        let mac_key = crypto::derive_mac_key(&*vault_key);
+        let mac_key =
+            crypto::derive_mac_key(&*vault_key).map_err(|e| BackendError::Other(e.into()))?;
         let data = VaultData::default();
 
-        let entry = crypto::wrap_vault_key(&vault_key, password, Some("master".to_string()));
+        let entry = crypto::wrap_vault_key(&vault_key, password, Some("master".to_string()))
+            .map_err(|e| BackendError::Other(e.into()))?;
         let wrapping_entries = vec![entry];
 
         let plaintext = serde_json::to_vec(&data).map_err(|e| BackendError::Other(e.into()))?;
         let encrypted = crypto::encrypt(&plaintext, &*vault_key);
-        let hmac = crypto::compute_hmac(&*mac_key, &encrypted);
+        let hmac = crypto::compute_hmac(&*mac_key, &encrypted)
+            .map_err(|e| BackendError::Other(e.into()))?;
 
         let vault_file = VaultFile::new(wrapping_entries.clone(), &encrypted, &hmac);
         let content =
@@ -152,7 +166,8 @@ impl LocalVault {
         let plaintext =
             serde_json::to_vec(&state.data).map_err(|e| BackendError::Other(e.into()))?;
         let encrypted = crypto::encrypt(&plaintext, &*state.vault_key);
-        let hmac = crypto::compute_hmac(&*state.mac_key, &encrypted);
+        let hmac = crypto::compute_hmac(&*state.mac_key, &encrypted)
+            .map_err(|e| BackendError::Other(e.into()))?;
 
         let vault_file = VaultFile::new(state.wrapping_entries.clone(), &encrypted, &hmac);
         let content =
@@ -170,89 +185,6 @@ impl LocalVault {
     // -----------------------------------------------------------------------
     // Key wrapping management (public API for CLI)
     // -----------------------------------------------------------------------
-
-    /// Add a new password as a wrapping entry for this vault.
-    ///
-    /// The vault must be unlocked. The new password wraps the same vault key
-    /// that the existing entries protect. Labels must be non-empty and unique
-    /// within the vault.
-    pub async fn add_password(
-        &self,
-        password: &[u8],
-        label: String,
-    ) -> Result<String, BackendError> {
-        if label.is_empty() {
-            return Err(BackendError::InvalidInput(
-                "password label cannot be empty".into(),
-            ));
-        }
-
-        let mut guard = self.state.write().await;
-        let state = guard.as_mut().ok_or(BackendError::Locked)?;
-
-        if state
-            .wrapping_entries
-            .iter()
-            .any(|e| e.label.as_deref() == Some(label.as_str()))
-        {
-            return Err(BackendError::InvalidInput(
-                format!("a password with label '{label}' already exists").into(),
-            ));
-        }
-
-        let entry = crypto::wrap_vault_key(&state.vault_key, password, Some(label));
-        let id = entry.id.clone();
-        state.wrapping_entries.push(entry);
-        state.dirty = true;
-
-        drop(guard);
-        self.save().await?;
-
-        info!(entry_id = %id, "added wrapping entry");
-        Ok(id)
-    }
-
-    /// Remove a wrapping entry by ID.
-    ///
-    /// The vault must be unlocked and must have at least 2 wrapping entries
-    /// (cannot remove the last one).
-    pub async fn remove_password(&self, entry_id: &str) -> Result<(), BackendError> {
-        let mut guard = self.state.write().await;
-        let state = guard.as_mut().ok_or(BackendError::Locked)?;
-
-        if state.wrapping_entries.len() <= 1 {
-            return Err(BackendError::InvalidInput(
-                "cannot remove the last wrapping entry".into(),
-            ));
-        }
-
-        let initial_len = state.wrapping_entries.len();
-        state.wrapping_entries.retain(|e| e.id != entry_id);
-
-        if state.wrapping_entries.len() == initial_len {
-            return Err(BackendError::NotFound);
-        }
-
-        state.dirty = true;
-
-        drop(guard);
-        self.save().await?;
-
-        info!(entry_id = %entry_id, "removed wrapping entry");
-        Ok(())
-    }
-
-    /// List all wrapping entries (id + label only, no key material).
-    pub async fn list_passwords(&self) -> Result<Vec<(String, Option<String>)>, BackendError> {
-        let guard = self.state.read().await;
-        let state = guard.as_ref().ok_or(BackendError::Locked)?;
-
-        Ok(state
-            .wrapping_entries
-            .iter()
-            .map(|e| (e.id.clone(), e.label.clone()))
-            .collect())
-    }
 
     /// Return the on-disk path of this vault file.
     pub fn path(&self) -> &Path {
@@ -371,7 +303,8 @@ impl VaultBackend for LocalVault {
             Err(e) => return Err(e),
         };
 
-        let mac_key = crypto::derive_mac_key(&*vault_key);
+        let mac_key =
+            crypto::derive_mac_key(&*vault_key).map_err(|e| BackendError::Other(e.into()))?;
 
         *guard = Some(UnlockedState {
             vault_key,
@@ -438,14 +371,20 @@ impl VaultBackend for LocalVault {
         let old_entry_idx = state
             .wrapping_entries
             .iter()
-            .position(|entry| crypto::unwrap_vault_key(entry, old_password.as_bytes()).is_some())
+            .position(|entry| {
+                crypto::unwrap_vault_key(entry, old_password.as_bytes())
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
             .ok_or(BackendError::AuthFailed)?;
 
         // Inherit the label from the old entry.
         let label = state.wrapping_entries[old_entry_idx].label.clone();
 
         // Create a new wrapping entry for the new password with the same vault key.
-        let new_entry = crypto::wrap_vault_key(&state.vault_key, new_password.as_bytes(), label);
+        let new_entry = crypto::wrap_vault_key(&state.vault_key, new_password.as_bytes(), label)
+            .map_err(|e| BackendError::Other(e.into()))?;
 
         // Replace atomically: add new entry, then remove old.
         let old_entry_id = state.wrapping_entries[old_entry_idx].id.clone();
@@ -692,6 +631,80 @@ impl VaultBackend for LocalVault {
             .map_err(|_| BackendError::Other(anyhow::anyhow!("callbacks lock poisoned")))?;
         *guard = callbacks;
         Ok(())
+    }
+
+    async fn vault_add_password(
+        &self,
+        password: &[u8],
+        label: String,
+    ) -> Result<String, BackendError> {
+        if label.is_empty() {
+            return Err(BackendError::InvalidInput(
+                "password label cannot be empty".into(),
+            ));
+        }
+
+        let mut guard = self.state.write().await;
+        let state = guard.as_mut().ok_or(BackendError::Locked)?;
+
+        if state
+            .wrapping_entries
+            .iter()
+            .any(|e| e.label.as_deref() == Some(label.as_str()))
+        {
+            return Err(BackendError::InvalidInput(
+                format!("a password with label '{label}' already exists").into(),
+            ));
+        }
+
+        let entry = crypto::wrap_vault_key(&state.vault_key, password, Some(label))
+            .map_err(|e| BackendError::Other(e.into()))?;
+        let id = entry.id.clone();
+        state.wrapping_entries.push(entry);
+        state.dirty = true;
+
+        drop(guard);
+        self.save().await?;
+
+        info!(entry_id = %id, "added wrapping entry");
+        Ok(id)
+    }
+
+    async fn vault_remove_password(&self, entry_id: &str) -> Result<(), BackendError> {
+        let mut guard = self.state.write().await;
+        let state = guard.as_mut().ok_or(BackendError::Locked)?;
+
+        if state.wrapping_entries.len() <= 1 {
+            return Err(BackendError::InvalidInput(
+                "cannot remove the last wrapping entry".into(),
+            ));
+        }
+
+        let initial_len = state.wrapping_entries.len();
+        state.wrapping_entries.retain(|e| e.id != entry_id);
+
+        if state.wrapping_entries.len() == initial_len {
+            return Err(BackendError::NotFound);
+        }
+
+        state.dirty = true;
+
+        drop(guard);
+        self.save().await?;
+
+        info!(entry_id = %entry_id, "removed wrapping entry");
+        Ok(())
+    }
+
+    async fn vault_list_passwords(&self) -> Result<Vec<(String, Option<String>)>, BackendError> {
+        let guard = self.state.read().await;
+        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+
+        Ok(state
+            .wrapping_entries
+            .iter()
+            .map(|e| (e.id.clone(), e.label.clone()))
+            .collect())
     }
 }
 
@@ -1053,13 +1066,13 @@ mod tests {
 
         // Add a second password
         let entry_id = backend
-            .add_password(b"login-password", "login".to_string())
+            .vault_add_password(b"login-password", "login".to_string())
             .await
             .unwrap();
         assert!(!entry_id.is_empty());
 
         // Verify we have 2 wrapping entries
-        let entries = backend.list_passwords().await.unwrap();
+        let entries = backend.vault_list_passwords().await.unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].1.as_deref(), Some("master"));
         assert_eq!(entries[1].1.as_deref(), Some("login"));
@@ -1092,14 +1105,14 @@ mod tests {
 
         // Add second password
         let entry_id = backend
-            .add_password(b"second", "second".to_string())
+            .vault_add_password(b"second", "second".to_string())
             .await
             .unwrap();
 
         // Remove the second password
-        backend.remove_password(&entry_id).await.unwrap();
+        backend.vault_remove_password(&entry_id).await.unwrap();
 
-        let entries = backend.list_passwords().await.unwrap();
+        let entries = backend.vault_list_passwords().await.unwrap();
         assert_eq!(entries.len(), 1);
 
         // Lock and try the removed password — should fail
@@ -1125,10 +1138,10 @@ mod tests {
             .await
             .unwrap();
 
-        let entries = backend.list_passwords().await.unwrap();
+        let entries = backend.vault_list_passwords().await.unwrap();
         assert_eq!(entries.len(), 1);
 
-        let result = backend.remove_password(&entries[0].0).await;
+        let result = backend.vault_remove_password(&entries[0].0).await;
         assert!(matches!(result, Err(BackendError::InvalidInput(_))));
     }
 
@@ -1141,7 +1154,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = backend.add_password(b"another", String::new()).await;
+        let result = backend.vault_add_password(b"another", String::new()).await;
         assert!(matches!(result, Err(BackendError::InvalidInput(_))));
     }
 
@@ -1156,16 +1169,18 @@ mod tests {
 
         // Add a password with label "login"
         backend
-            .add_password(b"login-pw", "login".to_string())
+            .vault_add_password(b"login-pw", "login".to_string())
             .await
             .unwrap();
 
         // Try to add another password with the same label — should fail
-        let result = backend.add_password(b"other-pw", "login".to_string()).await;
+        let result = backend
+            .vault_add_password(b"other-pw", "login".to_string())
+            .await;
         assert!(matches!(result, Err(BackendError::InvalidInput(_))));
 
         // Verify only 2 entries exist (master + login), not 3
-        let entries = backend.list_passwords().await.unwrap();
+        let entries = backend.vault_list_passwords().await.unwrap();
         assert_eq!(entries.len(), 2);
     }
 
@@ -1270,7 +1285,7 @@ mod tests {
             .unwrap();
 
         // The first wrapping entry has the label "master" by convention.
-        let entries_before = backend.list_passwords().await.unwrap();
+        let entries_before = backend.vault_list_passwords().await.unwrap();
         assert_eq!(entries_before.len(), 1);
         assert_eq!(entries_before[0].1, Some("master".to_string()));
 
@@ -1283,7 +1298,7 @@ mod tests {
             .await
             .unwrap();
 
-        let entries_after = backend.list_passwords().await.unwrap();
+        let entries_after = backend.vault_list_passwords().await.unwrap();
         assert_eq!(entries_after.len(), 1);
         assert_eq!(entries_after[0].1, Some("master".to_string()));
 
@@ -1303,7 +1318,7 @@ mod tests {
 
         // Add a second password.
         backend
-            .add_password(b"second-pw", "login".to_string())
+            .vault_add_password(b"second-pw", "login".to_string())
             .await
             .unwrap();
 
@@ -1317,7 +1332,7 @@ mod tests {
             .unwrap();
 
         // Should still have 2 entries.
-        let entries = backend.list_passwords().await.unwrap();
+        let entries = backend.vault_list_passwords().await.unwrap();
         assert_eq!(entries.len(), 2);
 
         // Lock and verify both passwords work.

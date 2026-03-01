@@ -615,43 +615,37 @@ impl BitwardenBackend {
         }
     }
 
-    /// Map a decrypted cipher to a VaultItemMeta.
+    /// Populate public (non-sensitive) attributes shared by both
+    /// `cipher_to_meta` and `build_item_attributes`.
     ///
-    /// Takes `backend_id` explicitly so multiple Bitwarden instances attribute
-    /// their items to the correct instance ID rather than a hardcoded string.
-    ///
-    /// Only populates **public** attributes — no sensitive data appears here.
-    /// Sensitive attribute names are available via `build_item_attributes()`.
-    fn cipher_to_meta(backend_id: &str, dc: &DecryptedCipher) -> VaultItemMeta {
-        let mut attributes = Attributes::new();
-
+    /// Fills `attrs` with: xdg:schema, type, folder, org_id, org,
+    /// login username/URIs, card brand, SSH public_key/fingerprint,
+    /// and non-hidden custom fields (text + boolean + linked).
+    fn populate_public_attrs(attrs: &mut Attributes, dc: &DecryptedCipher) {
         // xdg:schema — required for Secret Service compatibility
         let schema = match dc.cipher_type {
             CipherType::Login => "org.freedesktop.Secret.Generic",
             CipherType::SecureNote => "org.freedesktop.Secret.Note",
             _ => "org.freedesktop.Secret.Generic",
         };
-        attributes.insert("xdg:schema".to_string(), schema.to_string());
-
-        // Standard attributes for D-Bus Secret Service compatibility
-        attributes.insert("type".to_string(), dc.cipher_type.as_str().to_string());
+        attrs.insert("xdg:schema".to_string(), schema.to_string());
+        attrs.insert("type".to_string(), dc.cipher_type.as_str().to_string());
 
         if let Some(folder) = &dc.folder_name {
-            attributes.insert("folder".to_string(), folder.clone());
+            attrs.insert("folder".to_string(), folder.clone());
         }
-
         if let Some(org_id) = &dc.organization_id {
-            attributes.insert("org_id".to_string(), org_id.clone());
+            attrs.insert("org_id".to_string(), org_id.clone());
         }
         if let Some(org_name) = &dc.organization_name {
-            attributes.insert("org".to_string(), org_name.clone());
+            attrs.insert("org".to_string(), org_name.clone());
         }
 
         // Login-specific public attributes
         if let Some(login) = &dc.login {
             // username is public per attribute-model decision
             if let Some(username) = &login.username {
-                attributes.insert("username".to_string(), username.as_str().to_string());
+                attrs.insert("username".to_string(), username.as_str().to_string());
             }
             // All URIs are public. First is "uri" (index 0, backwards compat);
             // subsequent ones are "uri.1", "uri.2", etc.
@@ -661,7 +655,7 @@ impl BitwardenBackend {
                 } else {
                     format!("uri.{i}")
                 };
-                attributes.insert(key, uri.clone());
+                attrs.insert(key, uri.clone());
             }
         }
 
@@ -669,21 +663,21 @@ impl BitwardenBackend {
         if let Some(card) = &dc.card
             && let Some(brand) = &card.brand
         {
-            attributes.insert("brand".to_string(), brand.clone());
+            attrs.insert("brand".to_string(), brand.clone());
         }
 
         // SSH key public attributes
         if let Some(ssh_key) = &dc.ssh_key {
             if let Some(pub_key) = &ssh_key.public_key {
-                attributes.insert("public_key".to_string(), pub_key.clone());
+                attrs.insert("public_key".to_string(), pub_key.clone());
             }
             if let Some(fp) = &ssh_key.fingerprint {
-                attributes.insert("fingerprint".to_string(), fp.clone());
+                attrs.insert("fingerprint".to_string(), fp.clone());
             }
         }
 
-        // Custom fields as attributes — only text (type 0) and boolean (type 2).
-        // Hidden fields (type 1) are sensitive and excluded from public attrs.
+        // Custom fields as attributes — only text (type 0), boolean (type 2),
+        // and linked (type 3). Hidden fields (type 1) are sensitive and excluded.
         //
         // When a field name appears more than once, indexed keys are emitted:
         //   custom.ssh-host   → first value (unindexed alias)
@@ -691,9 +685,21 @@ impl BitwardenBackend {
         //   custom.ssh-host.1 → second value
         //   custom.ssh-host.2 → third value
         // When a name appears only once, just the unindexed key is used.
-        for (key, value) in index_custom_fields(&dc.fields, &[0, 2]) {
-            attributes.insert(key, value);
+        for (key, value) in index_custom_fields(&dc.fields, &[0, 2, 3]) {
+            attrs.insert(key, value);
         }
+    }
+
+    /// Map a decrypted cipher to a VaultItemMeta.
+    ///
+    /// Takes `backend_id` explicitly so multiple Bitwarden instances attribute
+    /// their items to the correct instance ID rather than a hardcoded string.
+    ///
+    /// Only populates **public** attributes — no sensitive data appears here.
+    /// Sensitive attribute names are available via `build_item_attributes()`.
+    fn cipher_to_meta(backend_id: &str, dc: &DecryptedCipher) -> VaultItemMeta {
+        let mut attributes = Attributes::new();
+        Self::populate_public_attrs(&mut attributes, dc);
 
         let created = dc.creation_date.as_ref().and_then(|s| parse_iso8601(s));
         let modified = dc.revision_date.as_ref().and_then(|s| parse_iso8601(s));
@@ -762,45 +768,19 @@ impl BitwardenBackend {
         let mut public = Attributes::new();
         let mut secret_names = Vec::new();
 
-        // -- Common public attributes --
-        let schema = match dc.cipher_type {
-            CipherType::Login => "org.freedesktop.Secret.Generic",
-            CipherType::SecureNote => "org.freedesktop.Secret.Note",
-            _ => "org.freedesktop.Secret.Generic",
-        };
-        public.insert("xdg:schema".to_string(), schema.to_string());
-        public.insert("type".to_string(), dc.cipher_type.as_str().to_string());
-        public.insert("backend_id".to_string(), backend_id.to_string());
+        // Shared public attributes (schema, type, folder, org, login, card, ssh, custom fields)
+        Self::populate_public_attrs(&mut public, dc);
 
-        if let Some(folder) = &dc.folder_name {
-            public.insert("folder".to_string(), folder.clone());
-        }
-        if let Some(org_id) = &dc.organization_id {
-            public.insert("org_id".to_string(), org_id.clone());
-        }
+        // backend_id is only in ItemAttributes, not VaultItemMeta
+        public.insert("backend_id".to_string(), backend_id.to_string());
 
         // notes — always sensitive
         if dc.notes.is_some() {
             secret_names.push("notes".to_string());
         }
 
-        // -- Login --
+        // -- Login sensitive --
         if let Some(login) = &dc.login {
-            // username is public
-            if let Some(username) = &login.username {
-                public.insert("username".to_string(), username.as_str().to_string());
-            }
-            // All URIs are public. First is "uri" (index 0, backwards compat);
-            // subsequent ones are "uri.1", "uri.2", etc.
-            for (i, uri) in login.uris.iter().enumerate() {
-                let key = if i == 0 {
-                    "uri".to_string()
-                } else {
-                    format!("uri.{i}")
-                };
-                public.insert(key, uri.clone());
-            }
-            // sensitive
             if login.password.is_some() {
                 secret_names.push("password".to_string());
             }
@@ -809,13 +789,8 @@ impl BitwardenBackend {
             }
         }
 
-        // -- Card --
+        // -- Card sensitive --
         if let Some(card) = &dc.card {
-            // brand is public
-            if let Some(brand) = &card.brand {
-                public.insert("brand".to_string(), brand.clone());
-            }
-            // all others are sensitive
             if card.cardholder_name.is_some() {
                 secret_names.push("cardholder".to_string());
             }
@@ -833,19 +808,11 @@ impl BitwardenBackend {
             }
         }
 
-        // -- SSH Key --
-        if let Some(ssh_key) = &dc.ssh_key {
-            // public_key and fingerprint are public
-            if let Some(pub_key) = &ssh_key.public_key {
-                public.insert("public_key".to_string(), pub_key.clone());
-            }
-            if let Some(fp) = &ssh_key.fingerprint {
-                public.insert("fingerprint".to_string(), fp.clone());
-            }
-            // private_key is sensitive
-            if ssh_key.private_key.is_some() {
-                secret_names.push("private_key".to_string());
-            }
+        // -- SSH Key sensitive --
+        if let Some(ssh_key) = &dc.ssh_key
+            && ssh_key.private_key.is_some()
+        {
+            secret_names.push("private_key".to_string());
         }
 
         // -- Identity (all fields are sensitive PII) --
@@ -877,12 +844,7 @@ impl BitwardenBackend {
             }
         }
 
-        // -- Custom fields --
-        // Public (text/boolean/linked) fields are indexed via `index_custom_fields`.
-        // Hidden fields go into `secret_names` with the same indexing scheme.
-        for (key, value) in index_custom_fields(&dc.fields, &[0, 2, 3]) {
-            public.insert(key, value);
-        }
+        // -- Hidden custom fields are sensitive --
         for (key, _) in index_custom_fields(&dc.fields, &[1]) {
             secret_names.push(key);
         }
@@ -1217,7 +1179,6 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
                 password,
                 registration_fields,
             } => (password, Some(registration_fields)),
-            _ => return Err(BackendError::NotSupported),
         };
 
         // If registration credentials were supplied, register the device first
@@ -1240,16 +1201,24 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         let notifications_handle = if self.config.realtime_sync {
             let access_token = auth_state.access_token.clone();
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(());
-            let on_sync_nudge = self
-                .on_sync_nudge
-                .lock()
-                .expect("on_sync_nudge mutex poisoned")
-                .clone();
-            let on_lock_nudge = self
-                .on_lock_nudge
-                .lock()
-                .expect("on_lock_nudge mutex poisoned")
-                .clone();
+            let on_sync_nudge = match self.on_sync_nudge.lock() {
+                Ok(guard) => guard.clone(),
+                Err(e) => {
+                    tracing::error!("on_sync_nudge mutex poisoned: {e}");
+                    return Err(BackendError::Other(anyhow::anyhow!(
+                        "on_sync_nudge mutex poisoned"
+                    )));
+                }
+            };
+            let on_lock_nudge = match self.on_lock_nudge.lock() {
+                Ok(guard) => guard.clone(),
+                Err(e) => {
+                    tracing::error!("on_lock_nudge mutex poisoned: {e}");
+                    return Err(BackendError::Other(anyhow::anyhow!(
+                        "on_lock_nudge mutex poisoned"
+                    )));
+                }
+            };
             let task = notifications::start(NotificationsConfig {
                 notifications_url: self.api.notifications_url().to_string(),
                 access_token,
@@ -2352,10 +2321,12 @@ mod tests {
         let mut dc = make_cipher(CipherType::Login);
         dc.folder_name = Some("Work".to_string());
         dc.organization_id = Some("org-abc".to_string());
+        dc.organization_name = Some("Acme Corp".to_string());
 
         let attrs = BitwardenBackend::build_item_attributes("bw", &dc);
         assert_eq!(attrs.public.get("folder"), Some(&"Work".to_string()));
         assert_eq!(attrs.public.get("org_id"), Some(&"org-abc".to_string()));
+        assert_eq!(attrs.public.get("org"), Some(&"Acme Corp".to_string()));
     }
 
     // --- resolve_secret_attr ---

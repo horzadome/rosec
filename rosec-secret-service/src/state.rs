@@ -28,6 +28,36 @@ use crate::session::SessionManager;
 /// `backend.get_secret()` only if no attribute matches (backward compatibility).
 const DEFAULT_RETURN_ATTR: &[&str] = &["password", "number", "private_key", "notes"];
 
+// TODO(P3-12): Decompose ServiceState into focused sub-structs.
+//
+// Current state: 15+ fields covering 4 distinct concerns.  Proposed grouping:
+//
+// 1. **BackendRegistry** — `backends`, `backend_order`, `return_attr_map`,
+//    `collection_map`.  Owns backend lifecycle (add/remove/hot-reload) and
+//    per-backend config.  Methods: `get()`, `get_order()`, `add()`, `remove()`,
+//    `reload()`, `return_attr_for()`, `collection_for()`.
+//
+// 2. **ItemCache** — `items`, `registered_items`, `metadata_cache`, `last_sync`.
+//    Owns the D-Bus item registration and the persistent metadata cache.
+//    Methods: `rebuild()`, `search()`, `search_glob()`, `mark_locked()`,
+//    `mark_unlocked()`, `resolve_path()`.
+//
+// 3. **LockPolicy** — `last_activity`, `unlocked_since`, `unlocked_since_map`,
+//    `unlock_in_progress`, `sync_in_progress`.  Owns idle/max-unlocked
+//    tracking and sync coalescing.  Methods: `touch_activity()`,
+//    `mark_backend_unlocked()`, `clear_backend_unlocked()`,
+//    `should_idle_lock()`, `should_max_unlock_lock()`.
+//
+// 4. **PromptManager** — `prompt_counter`, `active_prompts`, `prompt_config`.
+//    Owns prompt subprocess lifecycle.  Methods: `next_path()`,
+//    `register()`, `dismiss()`, `update_config()`.
+//
+// Shared / top-level: `router`, `sessions`, `conn`, `tokio_handle`,
+// `live_config` stay on `ServiceState` as injected dependencies.
+//
+// Migration: introduce sub-structs one at a time behind the same public API.
+// Start with PromptManager (smallest, fewest callers), then LockPolicy,
+// then ItemCache, then BackendRegistry.  Each step is independently testable.
 pub struct ServiceState {
     /// All registered backends, keyed by backend ID.
     /// Wrapped in `RwLock` to support hot-reload without restarting.
@@ -1177,31 +1207,7 @@ impl ServiceState {
             map_backend_error(BackendError::Unavailable("items lock poisoned".to_string()))
         })?;
 
-        let mut unlocked = Vec::new();
-        let mut locked = Vec::new();
-
-        'item: for (path, meta) in items.iter() {
-            for (key, pattern) in attrs {
-                let value = if key == "name" {
-                    meta.label.as_str()
-                } else {
-                    meta.attributes
-                        .get(key.as_str())
-                        .map(String::as_str)
-                        .unwrap_or("")
-                };
-                if !WildMatch::new(pattern).matches(value) {
-                    continue 'item;
-                }
-            }
-            if meta.locked {
-                locked.push(path.clone());
-            } else {
-                unlocked.push(path.clone());
-            }
-        }
-
-        Ok((unlocked, locked))
+        Ok(partition_by_glob(items.iter(), attrs))
     }
 
     /// Search the persistent metadata cache using exact attribute matching.
@@ -1255,31 +1261,7 @@ impl ServiceState {
             ))
         })?;
 
-        let mut unlocked = Vec::new();
-        let mut locked = Vec::new();
-
-        'item: for (path, meta) in cache.iter() {
-            for (key, pattern) in attrs {
-                let value = if key == "name" {
-                    meta.label.as_str()
-                } else {
-                    meta.attributes
-                        .get(key.as_str())
-                        .map(String::as_str)
-                        .unwrap_or("")
-                };
-                if !WildMatch::new(pattern).matches(value) {
-                    continue 'item;
-                }
-            }
-            if meta.locked {
-                locked.push(path.clone());
-            } else {
-                unlocked.push(path.clone());
-            }
-        }
-
-        Ok((unlocked, locked))
+        Ok(partition_by_glob(cache.iter(), attrs))
     }
 
     /// Mark all items belonging to a specific backend as locked in the
@@ -1819,6 +1801,42 @@ fn attributes_match(item: &Attributes, query: &Attributes) -> bool {
     query
         .iter()
         .all(|(key, value)| item.get(key) == Some(value))
+}
+
+/// Partition `(path, meta)` entries into `(unlocked, locked)` by glob matching.
+///
+/// Each attribute pattern in `attrs` is matched using wildmatch semantics.
+/// The special key `"name"` matches against the item label.  All patterns must
+/// match (AND semantics) for an item to be included.
+fn partition_by_glob<'a>(
+    entries: impl Iterator<Item = (&'a String, &'a VaultItemMeta)>,
+    attrs: &HashMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut unlocked = Vec::new();
+    let mut locked = Vec::new();
+
+    'item: for (path, meta) in entries {
+        for (key, pattern) in attrs {
+            let value = if key == "name" {
+                meta.label.as_str()
+            } else {
+                meta.attributes
+                    .get(key.as_str())
+                    .map(String::as_str)
+                    .unwrap_or("")
+            };
+            if !WildMatch::new(pattern).matches(value) {
+                continue 'item;
+            }
+        }
+        if meta.locked {
+            locked.push(path.clone());
+        } else {
+            unlocked.push(path.clone());
+        }
+    }
+
+    (unlocked, locked)
 }
 
 pub(crate) fn make_item_path(backend: &str, item_id: &str) -> String {

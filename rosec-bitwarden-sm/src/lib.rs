@@ -69,7 +69,7 @@ use sha2::Sha256;
 use std::sync::RwLock;
 
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -331,10 +331,6 @@ stored locally — you will not need to enter it again.",
                     })?
                     .clone();
                 (password, Some(token))
-            }
-            other => {
-                warn!(backend = %self.config.id, "SM backend received unexpected input: {:?}", other);
-                return Err(BackendError::NotSupported);
             }
         };
 

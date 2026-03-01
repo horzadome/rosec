@@ -169,124 +169,7 @@ async fn run() -> Result<()> {
     }
 
     let cache_rebuild_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        let mut consecutive_failures = 0u32;
-        loop {
-            // Re-read refresh_interval_secs from the live config on every tick
-            // so changes to the config file take effect without a restart.
-            let interval_secs = cache_rebuild_state
-                .live_config()
-                .service
-                .refresh_interval_secs
-                .unwrap_or(60);
-            tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
-
-            // For each unlocked backend, check for remote changes and sync if
-            // needed.  Locked backends are skipped entirely — all backends
-            // require an interactive password to unlock and the daemon never
-            // prompts autonomously.
-            //
-            // After per-backend work we still call rebuild_cache() as a safety
-            // net so the in-process cache always reflects the latest state.
-
-            let mut did_any_work = false;
-
-            for backend in cache_rebuild_state.backends_ordered() {
-                let backend_id = backend.id().to_string();
-                let locked = match backend.status().await {
-                    Ok(s) => s.locked,
-                    Err(e) => {
-                        tracing::debug!(backend = %backend_id, error = %e, "status check failed, skipping");
-                        continue;
-                    }
-                };
-
-                if locked {
-                    // All backends need a user-supplied password — the
-                    // background poller never unlocks autonomously.
-                    tracing::debug!(backend = %backend_id, "background: backend locked, skipping sync");
-                    continue;
-                }
-
-                // Unlocked: check for remote changes before syncing.
-                match backend.check_remote_changed().await {
-                    Ok(true) => {
-                        tracing::debug!(backend = %backend_id, "background: remote changed, syncing");
-                        match cache_rebuild_state.try_sync_backend(&backend_id).await {
-                            Ok(true) => {
-                                tracing::debug!(backend = %backend_id, "background: sync ok");
-                                did_any_work = true;
-                            }
-                            Ok(false) => {
-                                tracing::debug!(backend = %backend_id, "background: sync skipped (already in progress)");
-                            }
-                            Err(e) => {
-                                let err_str = e.to_string();
-                                if err_str.starts_with("locked::") {
-                                    tracing::debug!(backend = %backend_id, "background: sync skipped — backend locked");
-                                } else {
-                                    consecutive_failures += 1;
-                                    if consecutive_failures <= 3 {
-                                        tracing::warn!(backend = %backend_id, attempt = consecutive_failures, "background sync failed: {e}");
-                                    } else if consecutive_failures == 4 {
-                                        tracing::warn!(backend = %backend_id,
-                                            "background sync has failed {} times, suppressing further warnings",
-                                            consecutive_failures);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(false) => {
-                        tracing::debug!(backend = %backend_id, "background: no remote changes");
-                    }
-                    Err(e) => {
-                        tracing::debug!(backend = %backend_id, error = %e,
-                            "background: remote-changed check failed, skipping sync");
-                    }
-                }
-            }
-
-            // Safety-net rebuild: keep the in-process item cache consistent
-            // even if no per-backend sync ran (e.g. all unlocked backends had
-            // no remote changes).
-            if !did_any_work {
-                match cache_rebuild_state.rebuild_cache().await {
-                    Ok(entries) => {
-                        tracing::debug!("background cache rebuild: {} items", entries.len());
-                        consecutive_failures = 0;
-                        // SSH key rebuilds are driven by on_sync_succeeded callbacks;
-                        // no explicit rebuild needed here.
-                    }
-                    Err(err) => {
-                        let err_str = err.to_string();
-                        if err_str.starts_with("locked::") {
-                            tracing::debug!(
-                                "background cache rebuild skipped: backend not yet unlocked"
-                            );
-                        } else {
-                            consecutive_failures += 1;
-                            if consecutive_failures <= 3 {
-                                tracing::warn!(
-                                    attempt = consecutive_failures,
-                                    "background cache rebuild failed: {err}"
-                                );
-                            } else if consecutive_failures == 4 {
-                                tracing::warn!(
-                                    "background cache rebuild has failed {} times, suppressing further warnings",
-                                    consecutive_failures
-                                );
-                            }
-                        }
-                    }
-                }
-            } else {
-                consecutive_failures = 0;
-                // SSH key rebuilds are driven by on_sync_succeeded callbacks;
-                // no explicit rebuild needed here.
-            }
-        }
-    });
+    tokio::spawn(background_sync_loop(cache_rebuild_state));
 
     // Auto-lock policy background task.
     // Reads autolock settings from live_config on every tick so changes to the
@@ -295,66 +178,7 @@ async fn run() -> Result<()> {
     // any per-backend/per-vault overrides).
     let autolock_state = Arc::clone(&state);
     let autolock_ssh = ssh_manager.clone();
-    tokio::spawn(async move {
-        let check_interval = tokio::time::Duration::from_secs(30);
-        loop {
-            tokio::time::sleep(check_interval).await;
-
-            let mut any_locked = false;
-
-            for backend in autolock_state.backends_ordered() {
-                let backend_id = backend.id().to_string();
-                let policy = autolock_state.effective_autolock_policy(&backend_id);
-
-                // Check idle timeout (global idle time, per-backend threshold).
-                // 0 means disabled (same as omitting the field); skip the check.
-                if let Some(idle_min) = policy.idle_timeout_minutes
-                    && idle_min != 0
-                    && autolock_state.is_idle_expired(idle_min)
-                {
-                    tracing::info!(
-                        backend = %backend_id,
-                        idle_minutes = idle_min,
-                        "idle timeout expired, locking backend"
-                    );
-                    if let Err(e) = autolock_state.auto_lock_backend(&backend_id).await {
-                        tracing::warn!(backend = %backend_id, "auto-lock failed: {e}");
-                    } else {
-                        any_locked = true;
-                    }
-                    continue;
-                }
-
-                // Check max-unlocked timeout (per-backend unlock timestamp).
-                // 0 means disabled (same as omitting the field); skip the check.
-                if let Some(max_min) = policy.max_unlocked_minutes
-                    && max_min != 0
-                    && autolock_state.is_backend_max_unlocked_expired(&backend_id, max_min)
-                {
-                    tracing::info!(
-                        backend = %backend_id,
-                        max_minutes = max_min,
-                        "max-unlocked timeout expired, locking backend"
-                    );
-                    if let Err(e) = autolock_state.auto_lock_backend(&backend_id).await {
-                        tracing::warn!(backend = %backend_id, "auto-lock failed: {e}");
-                    } else {
-                        any_locked = true;
-                    }
-                }
-            }
-
-            // If any backends were locked and all are now locked, clear SSH keys.
-            if any_locked && autolock_state.all_backends_locked() {
-                if let Some(ref sm) = autolock_ssh {
-                    sm.clear();
-                }
-                // Clear the global activity timestamp so the idle check doesn't
-                // keep re-firing every poll interval on already-locked backends.
-                autolock_state.mark_locked();
-            }
-        }
-    });
+    tokio::spawn(autolock_loop(autolock_state, autolock_ssh));
 
     // Wait for SIGTERM or SIGINT for graceful shutdown.
     shutdown_signal().await;
@@ -371,6 +195,179 @@ async fn run() -> Result<()> {
     }
     tracing::info!("all backends locked, exiting");
     Ok(())
+}
+
+/// Background sync loop: periodically checks each unlocked backend for remote
+/// changes, syncs when needed, and rebuilds the item cache as a safety net.
+///
+/// Reads `refresh_interval_secs` from live config on every tick so config file
+/// changes take effect without a restart.
+async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
+    let mut consecutive_failures = 0u32;
+    loop {
+        let interval_secs = state
+            .live_config()
+            .service
+            .refresh_interval_secs
+            .unwrap_or(60);
+        tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+
+        let mut did_any_work = false;
+
+        for backend in state.backends_ordered() {
+            let backend_id = backend.id().to_string();
+            let locked = match backend.status().await {
+                Ok(s) => s.locked,
+                Err(e) => {
+                    tracing::debug!(backend = %backend_id, error = %e, "status check failed, skipping");
+                    continue;
+                }
+            };
+
+            if locked {
+                tracing::debug!(backend = %backend_id, "background: backend locked, skipping sync");
+                continue;
+            }
+
+            match backend.check_remote_changed().await {
+                Ok(true) => {
+                    tracing::debug!(backend = %backend_id, "background: remote changed, syncing");
+                    match state.try_sync_backend(&backend_id).await {
+                        Ok(true) => {
+                            tracing::debug!(backend = %backend_id, "background: sync ok");
+                            did_any_work = true;
+                        }
+                        Ok(false) => {
+                            tracing::debug!(backend = %backend_id, "background: sync skipped (already in progress)");
+                        }
+                        Err(e) => {
+                            log_background_failure(
+                                &mut consecutive_failures,
+                                &backend_id,
+                                "sync",
+                                &e,
+                            );
+                        }
+                    }
+                }
+                Ok(false) => {
+                    tracing::debug!(backend = %backend_id, "background: no remote changes");
+                }
+                Err(e) => {
+                    tracing::debug!(backend = %backend_id, error = %e,
+                        "background: remote-changed check failed, skipping sync");
+                }
+            }
+        }
+
+        // Safety-net rebuild: keep the in-process item cache consistent
+        // even if no per-backend sync ran.
+        if !did_any_work {
+            match state.rebuild_cache().await {
+                Ok(entries) => {
+                    tracing::debug!("background cache rebuild: {} items", entries.len());
+                    consecutive_failures = 0;
+                }
+                Err(err) => {
+                    log_background_failure(&mut consecutive_failures, "", "cache rebuild", &err);
+                }
+            }
+        } else {
+            consecutive_failures = 0;
+        }
+    }
+}
+
+/// Auto-lock policy loop: evaluates idle-timeout and max-unlocked policies for
+/// each backend every 30 seconds.
+///
+/// Reads autolock settings from live_config on every tick so config file changes
+/// take effect without a restart.
+async fn autolock_loop(
+    state: Arc<rosec_secret_service::ServiceState>,
+    ssh_manager: Option<Arc<ssh::SshManager>>,
+) {
+    let check_interval = tokio::time::Duration::from_secs(30);
+    loop {
+        tokio::time::sleep(check_interval).await;
+
+        let mut any_locked = false;
+
+        for backend in state.backends_ordered() {
+            let backend_id = backend.id().to_string();
+            let policy = state.effective_autolock_policy(&backend_id);
+
+            // Check idle timeout (0 means disabled).
+            if let Some(idle_min) = policy.idle_timeout_minutes
+                && idle_min != 0
+                && state.is_idle_expired(idle_min)
+            {
+                tracing::info!(
+                    backend = %backend_id,
+                    idle_minutes = idle_min,
+                    "idle timeout expired, locking backend"
+                );
+                if let Err(e) = state.auto_lock_backend(&backend_id).await {
+                    tracing::warn!(backend = %backend_id, "auto-lock failed: {e}");
+                } else {
+                    any_locked = true;
+                }
+                continue;
+            }
+
+            // Check max-unlocked timeout (0 means disabled).
+            if let Some(max_min) = policy.max_unlocked_minutes
+                && max_min != 0
+                && state.is_backend_max_unlocked_expired(&backend_id, max_min)
+            {
+                tracing::info!(
+                    backend = %backend_id,
+                    max_minutes = max_min,
+                    "max-unlocked timeout expired, locking backend"
+                );
+                if let Err(e) = state.auto_lock_backend(&backend_id).await {
+                    tracing::warn!(backend = %backend_id, "auto-lock failed: {e}");
+                } else {
+                    any_locked = true;
+                }
+            }
+        }
+
+        if any_locked && state.all_backends_locked() {
+            if let Some(ref sm) = ssh_manager {
+                sm.clear();
+            }
+            state.mark_locked();
+        }
+    }
+}
+
+/// Log a background task failure with progressive suppression.
+///
+/// Logs warnings for the first 3 failures, a suppression notice on the 4th,
+/// and silently skips further warnings. Errors starting with `"locked::"` are
+/// logged at debug level since they indicate an expected locked-backend state.
+fn log_background_failure(
+    consecutive: &mut u32,
+    backend_id: &str,
+    operation: &str,
+    error: &dyn std::fmt::Display,
+) {
+    let err_str = error.to_string();
+    if err_str.starts_with("locked::") {
+        tracing::debug!(backend = %backend_id, "background {operation} skipped — backend locked");
+        return;
+    }
+    *consecutive += 1;
+    if *consecutive <= 3 {
+        tracing::warn!(backend = %backend_id, attempt = *consecutive, "background {operation} failed: {error}");
+    } else if *consecutive == 4 {
+        tracing::warn!(
+            backend = %backend_id,
+            "background {operation} has failed {} times, suppressing further warnings",
+            *consecutive
+        );
+    }
 }
 
 /// Query the D-Bus daemon for who currently owns `name`, returning a

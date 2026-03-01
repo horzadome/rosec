@@ -452,7 +452,17 @@ impl VaultState {
         let fields = match &sc.fields {
             Some(fs) => fs
                 .iter()
-                .filter_map(|f| self.decrypt_field(f, keys).ok())
+                .filter_map(|f| match self.decrypt_field(f, keys) {
+                    Ok(field) => Some(field),
+                    Err(e) => {
+                        warn!(
+                            cipher_id = %id,
+                            error = %e,
+                            "failed to decrypt custom field, skipping"
+                        );
+                        None
+                    }
+                })
                 .collect(),
             None => Vec::new(),
         };

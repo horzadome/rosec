@@ -528,13 +528,6 @@ impl RosecManagement {
             .backend_by_id(&vault_id)
             .ok_or_else(|| FdoError::Failed(format!("vault '{vault_id}' not found")))?;
 
-        // Verify this is a local vault before spawning the tokio task.
-        if !backend.as_any().is::<rosec_vault::LocalVault>() {
-            return Err(FdoError::Failed(format!(
-                "'{vault_id}' is not a local vault"
-            )));
-        }
-
         let label = if label.is_empty() {
             return Err(FdoError::Failed("password label cannot be empty".into()));
         } else {
@@ -543,12 +536,8 @@ impl RosecManagement {
 
         self.state
             .run_on_tokio(async move {
-                let local_vault = backend
-                    .as_any()
-                    .downcast_ref::<rosec_vault::LocalVault>()
-                    .expect("type check passed above");
-                local_vault
-                    .add_password(&password, label)
+                backend
+                    .vault_add_password(&password, label)
                     .await
                     .map_err(|e| FdoError::Failed(format!("add_password failed: {e}")))
             })
@@ -572,20 +561,10 @@ impl RosecManagement {
             .backend_by_id(&vault_id)
             .ok_or_else(|| FdoError::Failed(format!("vault '{vault_id}' not found")))?;
 
-        if !backend.as_any().is::<rosec_vault::LocalVault>() {
-            return Err(FdoError::Failed(format!(
-                "'{vault_id}' is not a local vault"
-            )));
-        }
-
         self.state
             .run_on_tokio(async move {
-                let local_vault = backend
-                    .as_any()
-                    .downcast_ref::<rosec_vault::LocalVault>()
-                    .expect("type check passed above");
-                local_vault
-                    .remove_password(&entry_id)
+                backend
+                    .vault_remove_password(&entry_id)
                     .await
                     .map_err(|e| FdoError::Failed(format!("remove_password failed: {e}")))
             })
@@ -608,21 +587,11 @@ impl RosecManagement {
             .backend_by_id(&vault_id)
             .ok_or_else(|| FdoError::Failed(format!("vault '{vault_id}' not found")))?;
 
-        if !backend.as_any().is::<rosec_vault::LocalVault>() {
-            return Err(FdoError::Failed(format!(
-                "'{vault_id}' is not a local vault"
-            )));
-        }
-
         let entries = self
             .state
             .run_on_tokio(async move {
-                let local_vault = backend
-                    .as_any()
-                    .downcast_ref::<rosec_vault::LocalVault>()
-                    .expect("type check passed above");
-                local_vault
-                    .list_passwords()
+                backend
+                    .vault_list_passwords()
                     .await
                     .map_err(|e| FdoError::Failed(format!("list_passwords failed: {e}")))
             })

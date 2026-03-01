@@ -18,25 +18,43 @@ const KEY_LEN: usize = 32;
 const IV_LEN: usize = 16;
 const MAC_KEY_LEN: usize = 32;
 
+/// Errors from cryptographic operations within the vault.
+#[derive(Debug, thiserror::Error)]
+pub enum CryptoError {
+    #[error("invalid base64 in KDF salt: {0}")]
+    InvalidSalt(#[from] base64::DecodeError),
+    #[error("HKDF expand failed: {0}")]
+    HkdfExpand(hkdf::InvalidLength),
+    #[error("HMAC key setup failed")]
+    HmacKey,
+    #[error("decryption failed")]
+    Decryption,
+}
+
 // ---------------------------------------------------------------------------
 // Key derivation
 // ---------------------------------------------------------------------------
 
 /// Derive a 32-byte key from a password using PBKDF2-SHA256.
-pub fn derive_key(password: &[u8], kdf: &KdfParams) -> Zeroizing<[u8; KEY_LEN]> {
-    let salt = BASE64_STANDARD.decode(&kdf.salt).unwrap_or_default();
+///
+/// Returns `CryptoError::InvalidSalt` if the KDF salt is not valid base64.
+pub fn derive_key(
+    password: &[u8],
+    kdf: &KdfParams,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
+    let salt = BASE64_STANDARD.decode(&kdf.salt)?;
     let mut key = Zeroizing::new([0u8; KEY_LEN]);
     pbkdf2_hmac::<Sha256>(password, &salt, kdf.iterations, &mut *key);
-    key
+    Ok(key)
 }
 
 /// Derive a MAC key from an encryption key using HKDF-SHA256.
-pub fn derive_mac_key(encryption_key: &[u8]) -> Zeroizing<[u8; MAC_KEY_LEN]> {
+pub fn derive_mac_key(encryption_key: &[u8]) -> Result<Zeroizing<[u8; MAC_KEY_LEN]>, CryptoError> {
     let hkdf = Hkdf::<Sha256>::new(None, encryption_key);
     let mut mac_key = Zeroizing::new([0u8; MAC_KEY_LEN]);
     hkdf.expand(b"mac key", &mut *mac_key)
-        .expect("HKDF expand should not fail for 32-byte output");
-    mac_key
+        .map_err(CryptoError::HkdfExpand)?;
+    Ok(mac_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -63,51 +81,54 @@ pub fn wrap_vault_key(
     vault_key: &[u8; KEY_LEN],
     password: &[u8],
     label: Option<String>,
-) -> WrappingEntry {
+) -> Result<WrappingEntry, CryptoError> {
     let kdf = KdfParams::new_random();
-    let wrapping_key = derive_key(password, &kdf);
-    let wrapping_mac_key = derive_mac_key(&*wrapping_key);
+    let wrapping_key = derive_key(password, &kdf)?;
+    let wrapping_mac_key = derive_mac_key(&*wrapping_key)?;
 
     let wrapped = encrypt(vault_key, &*wrapping_key);
-    let hmac = compute_hmac(&*wrapping_mac_key, &wrapped);
+    let hmac = compute_hmac(&*wrapping_mac_key, &wrapped)?;
 
-    WrappingEntry {
+    Ok(WrappingEntry {
         id: Uuid::new_v4().to_string(),
         label,
         kdf,
         wrapped_vault_key: BASE64_STANDARD.encode(&wrapped),
         wrapped_key_hmac: BASE64_STANDARD.encode(hmac),
-    }
+    })
 }
 
 /// Try to unwrap the vault key from a wrapping entry using a password.
 ///
-/// Returns `Some(vault_key)` if the password is correct (HMAC verifies),
-/// or `None` if the password is wrong.
+/// Returns `Ok(Some(vault_key))` if the password is correct (HMAC verifies),
+/// `Ok(None)` if the password is wrong, or `Err` on a crypto setup failure.
 pub fn unwrap_vault_key(
     entry: &WrappingEntry,
     password: &[u8],
-) -> Option<Zeroizing<[u8; KEY_LEN]>> {
-    let wrapping_key = derive_key(password, &entry.kdf);
-    let wrapping_mac_key = derive_mac_key(&*wrapping_key);
+) -> Result<Option<Zeroizing<[u8; KEY_LEN]>>, CryptoError> {
+    let wrapping_key = derive_key(password, &entry.kdf)?;
+    let wrapping_mac_key = derive_mac_key(&*wrapping_key)?;
 
     let wrapped_bytes = entry.wrapped_vault_key_bytes();
     let expected_hmac = entry.wrapped_key_hmac_bytes();
 
     // Fast rejection: check HMAC before attempting decryption.
-    if !verify_hmac(&*wrapping_mac_key, &wrapped_bytes, &expected_hmac) {
-        return None;
+    if !verify_hmac(&*wrapping_mac_key, &wrapped_bytes, &expected_hmac)? {
+        return Ok(None);
     }
 
-    let decrypted = decrypt(&wrapped_bytes, &*wrapping_key).ok()?;
+    let decrypted = match decrypt(&wrapped_bytes, &*wrapping_key) {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
 
     if decrypted.len() != KEY_LEN {
-        return None;
+        return Ok(None);
     }
 
     let mut vault_key = Zeroizing::new([0u8; KEY_LEN]);
     vault_key.copy_from_slice(&decrypted);
-    Some(vault_key)
+    Ok(Some(vault_key))
 }
 
 // ---------------------------------------------------------------------------
@@ -148,26 +169,24 @@ pub fn decrypt(encrypted: &[u8], key: &[u8]) -> Result<Zeroizing<Vec<u8>>, &'sta
 // ---------------------------------------------------------------------------
 
 /// Compute HMAC-SHA256 over data.
-pub fn compute_hmac(mac_key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac =
-        HmacSha256::new_from_slice(mac_key).expect("HMAC key should be valid for any length");
+pub fn compute_hmac(mac_key: &[u8], data: &[u8]) -> Result<[u8; 32], CryptoError> {
+    let mut mac = HmacSha256::new_from_slice(mac_key).map_err(|_| CryptoError::HmacKey)?;
     mac.update(data);
     let result = mac.finalize();
     let mut output = [0u8; 32];
     output.copy_from_slice(&result.into_bytes());
-    output
+    Ok(output)
 }
 
 /// Verify HMAC-SHA256 over data (constant-time comparison).
-pub fn verify_hmac(mac_key: &[u8], data: &[u8], expected: &[u8]) -> bool {
+pub fn verify_hmac(mac_key: &[u8], data: &[u8], expected: &[u8]) -> Result<bool, CryptoError> {
     if expected.len() != 32 {
-        return false;
+        return Ok(false);
     }
 
-    let mut mac =
-        HmacSha256::new_from_slice(mac_key).expect("HMAC key should be valid for any length");
+    let mut mac = HmacSha256::new_from_slice(mac_key).map_err(|_| CryptoError::HmacKey)?;
     mac.update(data);
-    mac.verify_slice(expected).is_ok()
+    Ok(mac.verify_slice(expected).is_ok())
 }
 
 #[cfg(test)]
@@ -196,8 +215,8 @@ mod tests {
     fn hmac_verification_succeeds() {
         let mac_key = [0u8; 32];
         let data = b"test data";
-        let hmac = compute_hmac(&mac_key, data);
-        assert!(verify_hmac(&mac_key, data, &hmac));
+        let hmac = compute_hmac(&mac_key, data).unwrap();
+        assert!(verify_hmac(&mac_key, data, &hmac).unwrap());
     }
 
     #[test]
@@ -205,16 +224,16 @@ mod tests {
         let mac_key = [0u8; 32];
         let wrong_key = [1u8; 32];
         let data = b"test data";
-        let hmac = compute_hmac(&mac_key, data);
-        assert!(!verify_hmac(&wrong_key, data, &hmac));
+        let hmac = compute_hmac(&mac_key, data).unwrap();
+        assert!(!verify_hmac(&wrong_key, data, &hmac).unwrap());
     }
 
     #[test]
     fn hmac_verification_fails_with_tampered_data() {
         let mac_key = [0u8; 32];
         let data = b"test data";
-        let hmac = compute_hmac(&mac_key, data);
-        assert!(!verify_hmac(&mac_key, b"tampered", &hmac));
+        let hmac = compute_hmac(&mac_key, data).unwrap();
+        assert!(!verify_hmac(&mac_key, b"tampered", &hmac).unwrap());
     }
 
     #[test]
@@ -224,16 +243,25 @@ mod tests {
             iterations: 1000,
         };
         let password = b"password";
-        let key1 = derive_key(password, &kdf);
-        let key2 = derive_key(password, &kdf);
+        let key1 = derive_key(password, &kdf).unwrap();
+        let key2 = derive_key(password, &kdf).unwrap();
         assert_eq!(*key1, *key2);
+    }
+
+    #[test]
+    fn derive_key_rejects_invalid_salt() {
+        let kdf = KdfParams {
+            salt: "not-valid-base64!!!".to_string(),
+            iterations: 1000,
+        };
+        assert!(derive_key(b"password", &kdf).is_err());
     }
 
     #[test]
     fn derive_mac_key_produces_deterministic_result() {
         let enc_key = [0u8; 32];
-        let mac1 = derive_mac_key(&enc_key);
-        let mac2 = derive_mac_key(&enc_key);
+        let mac1 = derive_mac_key(&enc_key).unwrap();
+        let mac2 = derive_mac_key(&enc_key).unwrap();
         assert_eq!(*mac1, *mac2);
     }
 
@@ -242,8 +270,8 @@ mod tests {
         let vault_key = generate_vault_key();
         let password = b"test-password";
 
-        let entry = wrap_vault_key(&*vault_key, password, Some("test".to_string()));
-        let unwrapped = unwrap_vault_key(&entry, password);
+        let entry = wrap_vault_key(&*vault_key, password, Some("test".to_string())).unwrap();
+        let unwrapped = unwrap_vault_key(&entry, password).unwrap();
 
         assert!(unwrapped.is_some());
         assert_eq!(*unwrapped.unwrap(), *vault_key);
@@ -255,8 +283,8 @@ mod tests {
         let password = b"correct-password";
         let wrong = b"wrong-password";
 
-        let entry = wrap_vault_key(&*vault_key, password, None);
-        let unwrapped = unwrap_vault_key(&entry, wrong);
+        let entry = wrap_vault_key(&*vault_key, password, None).unwrap();
+        let unwrapped = unwrap_vault_key(&entry, wrong).unwrap();
 
         assert!(unwrapped.is_none());
     }
@@ -267,17 +295,17 @@ mod tests {
         let pw1 = b"password-one";
         let pw2 = b"password-two";
 
-        let entry1 = wrap_vault_key(&*vault_key, pw1, Some("master".to_string()));
-        let entry2 = wrap_vault_key(&*vault_key, pw2, Some("login".to_string()));
+        let entry1 = wrap_vault_key(&*vault_key, pw1, Some("master".to_string())).unwrap();
+        let entry2 = wrap_vault_key(&*vault_key, pw2, Some("login".to_string())).unwrap();
 
-        let unwrapped1 = unwrap_vault_key(&entry1, pw1).unwrap();
-        let unwrapped2 = unwrap_vault_key(&entry2, pw2).unwrap();
+        let unwrapped1 = unwrap_vault_key(&entry1, pw1).unwrap().unwrap();
+        let unwrapped2 = unwrap_vault_key(&entry2, pw2).unwrap().unwrap();
 
         assert_eq!(*unwrapped1, *vault_key);
         assert_eq!(*unwrapped2, *vault_key);
 
         // Cross-password should fail
-        assert!(unwrap_vault_key(&entry1, pw2).is_none());
-        assert!(unwrap_vault_key(&entry2, pw1).is_none());
+        assert!(unwrap_vault_key(&entry1, pw2).unwrap().is_none());
+        assert!(unwrap_vault_key(&entry2, pw1).unwrap().is_none());
     }
 }

@@ -43,9 +43,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         other => {
-            eprintln!("unknown command: {other}");
             print_help();
-            std::process::exit(1);
+            bail!("unknown command: {other}");
         }
     }
 }
@@ -278,6 +277,37 @@ fn cmd_backend_kinds() {
 
 async fn conn() -> Result<Connection> {
     Ok(Connection::session().await?)
+}
+
+/// Poll rosecd's `BackendList` until `id` appears (max 3 s, 200 ms intervals).
+///
+/// Returns `Some(proxy)` if the daemon is running and the backend appeared,
+/// `None` if the daemon isn't running or the backend didn't appear in time.
+async fn wait_for_daemon_reload(id: &str) -> Option<zbus::Proxy<'static>> {
+    let conn = conn().await.ok()?;
+    let proxy = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.secrets",
+        "/org/rosec/Daemon",
+        "org.rosec.Daemon",
+    )
+    .await
+    .ok()?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Ok(entries) = proxy
+            .call::<_, _, Vec<(String, String, String, bool)>>("BackendList", &())
+            .await
+            && entries.iter().any(|(bid, ..)| bid == id)
+        {
+            return Some(proxy);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 /// Generate a default password label: `user@hostname`.
@@ -798,9 +828,8 @@ async fn cmd_backend(args: &[String]) -> Result<()> {
             Ok(())
         }
         other => {
-            eprintln!("unknown backend subcommand: {other}");
             print_backend_help();
-            std::process::exit(1);
+            bail!("unknown backend subcommand: {other}");
         }
     }
 }
@@ -1037,49 +1066,16 @@ async fn cmd_backend_add(args: &[String]) -> Result<()> {
     // If rosecd is running, wait for it to hot-reload the new backend then
     // immediately kick off the auth flow so the user doesn't have to run
     // `rosec backend auth <id>` manually as a separate step.
-    if let Ok(conn) = conn().await {
-        if let Ok(proxy) = zbus::Proxy::new(
-            &conn,
-            "org.freedesktop.secrets",
-            "/org/rosec/Daemon",
-            "org.rosec.Daemon",
-        )
-        .await
-        {
-            // Poll BackendList until the new backend ID appears (hot-reload
-            // debounces at 500 ms) or we give up after 3 s.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            let appeared = loop {
-                if let Ok(entries) = proxy
-                    .call::<_, _, Vec<(String, String, String, bool)>>("BackendList", &())
-                    .await
-                    && entries.iter().any(|(bid, ..)| bid == &id)
-                {
-                    break true;
-                }
-                if std::time::Instant::now() >= deadline {
-                    break false;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            };
-
-            if appeared {
-                println!("rosecd picked up the new backend — starting authentication.");
-                let tty_fd = open_tty_owned_fd()?;
-                let _: () = proxy
-                    .call("AuthBackendWithTty", &(id.as_str(), tty_fd, false))
-                    .await?;
-                println!("Backend '{id}' authenticated.");
-            } else {
-                println!("rosecd will hot-reload the config automatically if it is running.");
-                println!("Run `rosec backend auth {id}` to authenticate.");
-            }
-        } else {
-            println!("rosecd will hot-reload the config automatically if it is running.");
-            println!("Run `rosec backend auth {id}` to authenticate.");
-        }
+    if let Some(proxy) = wait_for_daemon_reload(&id).await {
+        println!("rosecd picked up the new backend — starting authentication.");
+        let tty_fd = open_tty_owned_fd()?;
+        let _: () = proxy
+            .call("AuthBackendWithTty", &(id.as_str(), tty_fd, false))
+            .await?;
+        println!("Backend '{id}' authenticated.");
     } else {
-        println!("rosecd is not running — start it, then run `rosec backend auth {id}`.");
+        println!("rosecd will hot-reload the config automatically if it is running.");
+        println!("Run `rosec backend auth {id}` to authenticate.");
     }
 
     Ok(())
@@ -1202,9 +1198,8 @@ async fn cmd_vault(args: &[String]) -> Result<()> {
             Ok(())
         }
         other => {
-            eprintln!("unknown vault subcommand: {other}");
             print_vault_help();
-            std::process::exit(1);
+            bail!("unknown vault subcommand: {other}");
         }
     }
 }
@@ -1318,7 +1313,7 @@ async fn cmd_vault_create(args: &[String]) -> Result<()> {
                 );
             }
             a if a.starts_with("--id=") => {
-                custom_id = Some(a.trim_start_matches("--id=").to_string());
+                custom_id = Some(a.strip_prefix("--id=").unwrap_or(a).to_string());
             }
             "--path" => {
                 i += 1;
@@ -1329,7 +1324,7 @@ async fn cmd_vault_create(args: &[String]) -> Result<()> {
                 );
             }
             a if a.starts_with("--path=") => {
-                custom_path = Some(a.trim_start_matches("--path=").to_string());
+                custom_path = Some(a.strip_prefix("--path=").unwrap_or(a).to_string());
             }
             "--collection" => {
                 i += 1;
@@ -1340,7 +1335,7 @@ async fn cmd_vault_create(args: &[String]) -> Result<()> {
                 );
             }
             a if a.starts_with("--collection=") => {
-                collection = Some(a.trim_start_matches("--collection=").to_string());
+                collection = Some(a.strip_prefix("--collection=").unwrap_or(a).to_string());
             }
             "--help" | "-h" => {
                 print_vault_help();
@@ -1397,42 +1392,19 @@ async fn cmd_vault_create(args: &[String]) -> Result<()> {
     println!("Created vault '{id}' at {vault_path}");
     println!("Added to {}", cfg.display());
 
-    // If rosecd is running, wait for hot-reload then trigger auth.
-    if let Ok(conn) = conn().await
-        && let Ok(proxy) = zbus::Proxy::new(
-            &conn,
-            "org.freedesktop.secrets",
-            "/org/rosec/Daemon",
-            "org.rosec.Daemon",
-        )
-        .await
-    {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let appeared = loop {
-            if let Ok(entries) = proxy
-                .call::<_, _, Vec<(String, String, String, bool)>>("BackendList", &())
-                .await
-                && entries.iter().any(|(bid, ..)| bid == &id)
-            {
-                break true;
-            }
-            if std::time::Instant::now() >= deadline {
-                break false;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        };
-
-        if appeared {
-            println!("rosecd picked up the new vault — starting authentication.");
-            let tty_fd = open_tty_owned_fd()?;
-            let _: () = proxy
-                .call("AuthBackendWithTty", &(id.as_str(), tty_fd))
-                .await?;
-            println!("Vault '{id}' authenticated.");
-        } else {
-            println!("rosecd will hot-reload the config automatically if it is running.");
-            println!("Run `rosec vault auth {id}` to authenticate.");
-        }
+    // If rosecd is running, wait for it to hot-reload the new vault then
+    // immediately kick off the auth flow so the user doesn't have to run
+    // `rosec vault auth <id>` manually as a separate step.
+    if let Some(proxy) = wait_for_daemon_reload(&id).await {
+        println!("rosecd picked up the new vault — starting authentication.");
+        let tty_fd = open_tty_owned_fd()?;
+        let _: () = proxy
+            .call("AuthBackendWithTty", &(id.as_str(), tty_fd))
+            .await?;
+        println!("Vault '{id}' authenticated.");
+    } else {
+        println!("rosecd will hot-reload the config automatically if it is running.");
+        println!("Run `rosec vault auth {id}` to authenticate.");
     }
 
     Ok(())
@@ -1459,7 +1431,7 @@ async fn cmd_vault_attach(args: &[String]) -> Result<()> {
                 );
             }
             a if a.starts_with("--id=") => {
-                custom_id = Some(a.trim_start_matches("--id=").to_string());
+                custom_id = Some(a.strip_prefix("--id=").unwrap_or(a).to_string());
             }
             "--path" => {
                 i += 1;
@@ -1470,7 +1442,7 @@ async fn cmd_vault_attach(args: &[String]) -> Result<()> {
                 );
             }
             a if a.starts_with("--path=") => {
-                vault_path = Some(a.trim_start_matches("--path=").to_string());
+                vault_path = Some(a.strip_prefix("--path=").unwrap_or(a).to_string());
             }
             "--collection" => {
                 i += 1;
@@ -1481,7 +1453,7 @@ async fn cmd_vault_attach(args: &[String]) -> Result<()> {
                 );
             }
             a if a.starts_with("--collection=") => {
-                collection = Some(a.trim_start_matches("--collection=").to_string());
+                collection = Some(a.strip_prefix("--collection=").unwrap_or(a).to_string());
             }
             "--help" | "-h" => {
                 print_vault_help();
@@ -1596,7 +1568,7 @@ async fn cmd_vault_add_password(args: &[String]) -> Result<()> {
                 );
             }
             a if a.starts_with("--label=") => {
-                label = Some(a.trim_start_matches("--label=").to_string());
+                label = Some(a.strip_prefix("--label=").unwrap_or(a).to_string());
             }
             "--help" | "-h" => {
                 print_vault_help();
@@ -1907,7 +1879,7 @@ async fn cmd_sync() -> Result<()> {
                 // Daemon says this backend needs credentials first.
                 // Pass a TTY fd so the daemon can prompt in-process —
                 // credentials never appear in any D-Bus message.
-                let backend_id = detail.as_str().trim_start_matches("locked::");
+                let backend_id = detail.as_str().strip_prefix("locked::").unwrap_or("");
                 eprintln!(" locked");
                 let tty_fd = open_tty_owned_fd()?;
                 let _: () = proxy
@@ -2233,13 +2205,11 @@ async fn cmd_search(args: &[String]) -> Result<()> {
             match OutputFormat::parse(fmt_str) {
                 Some(f) => format = f,
                 None => {
-                    eprintln!("unknown format '{fmt_str}': use table, kv, or json");
-                    std::process::exit(1);
+                    bail!("unknown format '{fmt_str}': use table, kv, or json");
                 }
             }
         } else if arg == "--format" {
-            eprintln!("--format requires a value: --format=table|kv|json");
-            std::process::exit(1);
+            bail!("--format requires a value: --format=table|kv|json");
         } else if arg == "--show-path" {
             show_path = true;
         } else if arg == "--sync" || arg == "-s" {
@@ -2250,8 +2220,7 @@ async fn cmd_search(args: &[String]) -> Result<()> {
         } else if let Some((key, value)) = arg.split_once('=') {
             all_attrs.insert(key.to_string(), value.to_string());
         } else {
-            eprintln!("invalid argument: {arg}");
-            std::process::exit(1);
+            bail!("invalid argument: {arg}");
         }
     }
 
@@ -2724,7 +2693,7 @@ async fn cmd_get(args: &[String]) -> Result<()> {
                 );
             }
             a if a.starts_with("--attr=") => {
-                attr = Some(a.trim_start_matches("--attr=").to_string());
+                attr = Some(a.strip_prefix("--attr=").unwrap_or(a).to_string());
             }
             a if a.starts_with('-') => {
                 bail!("unknown flag: {a}  (try `rosec get --help`)");
@@ -2960,14 +2929,12 @@ async fn cmd_inspect(args: &[String]) -> Result<()> {
                 match OutputFormat::parse(fmt_str) {
                     Some(f) => format = f,
                     None => {
-                        eprintln!("unknown format '{fmt_str}': use human, kv, or json");
-                        std::process::exit(1);
+                        bail!("unknown format '{fmt_str}': use human, kv, or json");
                     }
                 }
             }
             "--format" => {
-                eprintln!("--format requires a value: --format=human|kv|json");
-                std::process::exit(1);
+                bail!("--format requires a value: --format=human|kv|json");
             }
             "--help" | "-h" => {
                 print_inspect_help();
@@ -2975,8 +2942,7 @@ async fn cmd_inspect(args: &[String]) -> Result<()> {
             }
             s if raw.is_none() => raw = Some(s),
             s => {
-                eprintln!("unexpected argument: {s}");
-                std::process::exit(1);
+                bail!("unexpected argument: {s}");
             }
         }
     }
@@ -3428,9 +3394,8 @@ fn cmd_config(args: &[String]) -> Result<()> {
             Ok(())
         }
         other => {
-            eprintln!("unknown config subcommand: {other}");
             print_config_help();
-            std::process::exit(1);
+            bail!("unknown config subcommand: {other}");
         }
     }
 }
@@ -3454,9 +3419,7 @@ fn cmd_config_show() -> Result<()> {
 fn cmd_config_get(key: &str) -> Result<()> {
     // Validate the key is in the supported list.
     if !CONFIG_KEYS.iter().any(|(k, _)| *k == key) {
-        eprintln!("unknown config key: {key}");
-        eprintln!("run `rosec config --help` to see supported keys");
-        std::process::exit(1);
+        bail!("unknown config key: {key}\nrun `rosec config --help` to see supported keys");
     }
 
     let cfg = load_config();
@@ -3527,9 +3490,7 @@ fn validate_config_value(key: &str, value: &str) -> Result<()> {
 fn cmd_config_set(key: &str, value: &str) -> Result<()> {
     // Validate the key is in the supported list.
     if !CONFIG_KEYS.iter().any(|(k, _)| *k == key) {
-        eprintln!("unknown config key: {key}");
-        eprintln!("run `rosec config --help` to see supported keys");
-        std::process::exit(1);
+        bail!("unknown config key: {key}\nrun `rosec config --help` to see supported keys");
     }
 
     // Validate the value before touching the file.

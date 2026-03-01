@@ -3586,7 +3586,6 @@ dependencies = [
  "num-bigint",
  "rand 0.10.0",
  "rosec-core",
- "rosec-vault",
  "serde",
  "serde_json",
  "sha2",

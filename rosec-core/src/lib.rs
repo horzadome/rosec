@@ -284,12 +284,6 @@ pub enum UnlockInput {
         /// `RegistrationInfo::fields`.
         registration_fields: HashMap<String, Zeroizing<String>>,
     },
-    ApiKey {
-        client_id: String,
-        client_secret: Zeroizing<String>,
-    },
-    SessionToken(Zeroizing<String>),
-    Otp(Zeroizing<String>),
 }
 
 impl std::fmt::Debug for UnlockInput {
@@ -301,13 +295,6 @@ impl std::fmt::Debug for UnlockInput {
                 .field("password", &"[redacted]")
                 .field("registration_fields", &"[redacted]")
                 .finish(),
-            Self::ApiKey { client_id, .. } => f
-                .debug_struct("ApiKey")
-                .field("client_id", client_id)
-                .field("client_secret", &"[redacted]")
-                .finish(),
-            Self::SessionToken(_) => f.debug_tuple("SessionToken").field(&"[redacted]").finish(),
-            Self::Otp(_) => f.debug_tuple("Otp").field(&"[redacted]").finish(),
         }
     }
 }
@@ -846,6 +833,44 @@ pub trait VaultBackend: Send + Sync {
         self.get_secret_attr(id, item_type.default_secret_attr())
             .await
     }
+
+    // -----------------------------------------------------------------------
+    // Key-wrapping / password management (vault-only)
+    // -----------------------------------------------------------------------
+
+    /// Add a password (wrapping entry) to this vault.
+    ///
+    /// The vault must be unlocked.  The new password wraps the same vault key
+    /// that the existing entries protect.
+    ///
+    /// Returns the wrapping entry ID on success.
+    /// Default: `NotSupported` (external backends do not have wrapping entries).
+    async fn vault_add_password(
+        &self,
+        _password: &[u8],
+        _label: String,
+    ) -> Result<String, BackendError> {
+        Err(BackendError::NotSupported)
+    }
+
+    /// Remove a password (wrapping entry) from this vault by entry ID.
+    ///
+    /// The vault must be unlocked and must have at least 2 wrapping entries
+    /// (the last entry cannot be removed).
+    ///
+    /// Default: `NotSupported`.
+    async fn vault_remove_password(&self, _entry_id: &str) -> Result<(), BackendError> {
+        Err(BackendError::NotSupported)
+    }
+
+    /// List all wrapping entries (passwords) for this vault.
+    ///
+    /// Returns `Vec<(entry_id, Option<label>)>`.  The vault must be unlocked.
+    ///
+    /// Default: `NotSupported`.
+    async fn vault_list_passwords(&self) -> Result<Vec<(String, Option<String>)>, BackendError> {
+        Err(BackendError::NotSupported)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -971,34 +996,6 @@ mod tests {
         assert!(!debug.contains("masterpass"));
         assert!(!debug.contains("user.abc"));
         assert!(!debug.contains("s3cr3t"));
-    }
-
-    #[test]
-    fn unlock_input_debug_redacts_api_key() {
-        let input = UnlockInput::ApiKey {
-            client_id: "my-client".to_string(),
-            client_secret: Zeroizing::new("my-secret".to_string()),
-        };
-        let debug = format!("{input:?}");
-        assert!(debug.contains("my-client"));
-        assert!(debug.contains("[redacted]"));
-        assert!(!debug.contains("my-secret"));
-    }
-
-    #[test]
-    fn unlock_input_debug_redacts_session_token() {
-        let input = UnlockInput::SessionToken(Zeroizing::new("tok".to_string()));
-        let debug = format!("{input:?}");
-        assert!(debug.contains("[redacted]"));
-        assert!(!debug.contains("tok"));
-    }
-
-    #[test]
-    fn unlock_input_debug_redacts_otp() {
-        let input = UnlockInput::Otp(Zeroizing::new("123456".to_string()));
-        let debug = format!("{input:?}");
-        assert!(debug.contains("[redacted]"));
-        assert!(!debug.contains("123456"));
     }
 
     #[test]

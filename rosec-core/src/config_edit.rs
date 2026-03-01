@@ -75,49 +75,7 @@ pub fn add_backend(
 pub fn remove_backend(config_path: &Path, id: &str) -> Result<()> {
     let raw = read_or_empty(config_path)?;
     let mut doc: DocumentMut = raw.parse().context("failed to parse config as TOML")?;
-
-    let backends = match doc
-        .get_mut("backend")
-        .and_then(|item| item.as_array_of_tables_mut())
-    {
-        Some(b) => b,
-        None => bail!("no backends configured in {}", config_path.display()),
-    };
-
-    let before = backends.len();
-    // toml_edit ArrayOfTables doesn't have retain(); rebuild by index.
-    let indices_to_remove: Vec<usize> = (0..backends.len())
-        .filter(|&i| {
-            backends
-                .get(i)
-                .and_then(|t| t.get("id"))
-                .and_then(|v| v.as_str())
-                == Some(id)
-        })
-        .collect();
-
-    if indices_to_remove.is_empty() {
-        bail!("backend '{id}' not found in {}", config_path.display());
-    }
-
-    // Remove in reverse order so earlier indices stay valid.
-    for i in indices_to_remove.into_iter().rev() {
-        backends.remove(i);
-    }
-
-    let after = backends.len();
-
-    // If the array is now empty, remove the key entirely so the file stays clean.
-    if after == 0 {
-        doc.remove("backend");
-    }
-
-    tracing::debug!(
-        removed = before - after,
-        config = %config_path.display(),
-        "removed backend '{id}' from config"
-    );
-
+    remove_array_entry(&mut doc, "backend", id, config_path)?;
     write_doc(config_path, &doc)
 }
 
@@ -269,48 +227,7 @@ pub fn add_vault(
 pub fn remove_vault(config_path: &Path, id: &str) -> Result<()> {
     let raw = read_or_empty(config_path)?;
     let mut doc: DocumentMut = raw.parse().context("failed to parse config as TOML")?;
-
-    let vaults = match doc
-        .get_mut("vault")
-        .and_then(|item| item.as_array_of_tables_mut())
-    {
-        Some(v) => v,
-        None => bail!("no vaults configured in {}", config_path.display()),
-    };
-
-    let before = vaults.len();
-    let indices_to_remove: Vec<usize> = (0..vaults.len())
-        .filter(|&i| {
-            vaults
-                .get(i)
-                .and_then(|t| t.get("id"))
-                .and_then(|v| v.as_str())
-                == Some(id)
-        })
-        .collect();
-
-    if indices_to_remove.is_empty() {
-        bail!("vault '{id}' not found in {}", config_path.display());
-    }
-
-    // Remove in reverse order so earlier indices stay valid.
-    for i in indices_to_remove.into_iter().rev() {
-        vaults.remove(i);
-    }
-
-    let after = vaults.len();
-
-    // If the array is now empty, remove the key entirely so the file stays clean.
-    if after == 0 {
-        doc.remove("vault");
-    }
-
-    tracing::debug!(
-        removed = before - after,
-        config = %config_path.display(),
-        "removed vault '{id}' from config"
-    );
-
+    remove_array_entry(&mut doc, "vault", id, config_path)?;
     write_doc(config_path, &doc)
 }
 
@@ -326,6 +243,63 @@ fn vault_ids(doc: &DocumentMut) -> impl Iterator<Item = &str> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Remove a `[[key]]` entry whose `id` field matches the given value.
+///
+/// Finds all matching entries, removes them in reverse index order (to keep
+/// earlier indices stable), and removes the top-level key entirely when the
+/// array becomes empty.
+fn remove_array_entry(
+    doc: &mut DocumentMut,
+    key: &str,
+    id: &str,
+    config_path: &Path,
+) -> Result<()> {
+    let array = match doc
+        .get_mut(key)
+        .and_then(|item| item.as_array_of_tables_mut())
+    {
+        Some(a) => a,
+        None => bail!("no {key}s configured in {}", config_path.display()),
+    };
+
+    let before = array.len();
+
+    // toml_edit ArrayOfTables doesn't have retain(); collect indices to remove.
+    let indices_to_remove: Vec<usize> = (0..array.len())
+        .filter(|&i| {
+            array
+                .get(i)
+                .and_then(|t| t.get("id"))
+                .and_then(|v| v.as_str())
+                == Some(id)
+        })
+        .collect();
+
+    if indices_to_remove.is_empty() {
+        bail!("{key} '{id}' not found in {}", config_path.display());
+    }
+
+    // Remove in reverse order so earlier indices stay valid.
+    for i in indices_to_remove.into_iter().rev() {
+        array.remove(i);
+    }
+
+    let after = array.len();
+
+    // If the array is now empty, remove the key entirely so the file stays clean.
+    if after == 0 {
+        doc.remove(key);
+    }
+
+    tracing::debug!(
+        removed = before - after,
+        config = %config_path.display(),
+        "removed {key} '{id}' from config"
+    );
+
+    Ok(())
+}
 
 fn read_or_empty(path: &Path) -> Result<String> {
     if path.exists() {
