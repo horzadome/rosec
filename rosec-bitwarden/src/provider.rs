@@ -3,9 +3,9 @@
 use std::time::SystemTime;
 
 use rosec_core::{
-    AttributeDescriptor, Attributes, AuthField, AuthFieldKind, Capability, ItemAttributes,
-    ItemMeta, Provider, ProviderCallbacks, ProviderError, ProviderStatus, RegistrationInfo,
-    SecretBytes, SshKeyMeta, SshPrivateKeyMaterial, UnlockInput,
+    ATTR_TYPE, AttributeDescriptor, Attributes, AuthField, AuthFieldKind, Capability,
+    ItemAttributes, ItemMeta, Provider, ProviderCallbacks, ProviderError, ProviderStatus,
+    RegistrationInfo, SecretBytes, SshKeyMeta, SshPrivateKeyMaterial, UnlockInput,
 };
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -36,7 +36,7 @@ static BITWARDEN_ATTRIBUTES: &[AttributeDescriptor] = &[
         description: "Item display name",
     },
     AttributeDescriptor {
-        name: "type",
+        name: ATTR_TYPE,
         sensitive: false,
         item_types: &[],
         description: "Item type (login, note, card, identity, sshkey)",
@@ -589,7 +589,7 @@ impl BitwardenProvider {
             _ => "org.freedesktop.Secret.Generic",
         };
         attrs.insert("xdg:schema".to_string(), schema.to_string());
-        attrs.insert("type".to_string(), dc.cipher_type.as_str().to_string());
+        attrs.insert(ATTR_TYPE.to_string(), dc.cipher_type.as_str().to_string());
 
         if let Some(folder) = &dc.folder_name {
             attrs.insert("folder".to_string(), folder.clone());
@@ -1713,7 +1713,7 @@ mod tests {
         assert_eq!(meta.provider_id, "test-backend");
         assert_eq!(meta.label, "Test Item");
         assert!(!meta.locked);
-        assert_eq!(meta.attributes.get("type"), Some(&"login".to_string()));
+        assert_eq!(meta.attributes.get(ATTR_TYPE), Some(&"login".to_string()));
         assert_eq!(meta.attributes.get("username"), Some(&"alice".to_string()));
         assert_eq!(
             meta.attributes.get("uri"),
@@ -1735,7 +1735,7 @@ mod tests {
             meta.attributes.get("xdg:schema"),
             Some(&"org.freedesktop.Secret.Note".to_string())
         );
-        assert_eq!(meta.attributes.get("type"), Some(&"note".to_string()));
+        assert_eq!(meta.attributes.get(ATTR_TYPE), Some(&"note".to_string()));
     }
 
     #[test]
@@ -1751,7 +1751,7 @@ mod tests {
         });
 
         let meta = BitwardenProvider::cipher_to_meta("test-backend", &dc);
-        assert_eq!(meta.attributes.get("type"), Some(&"card".to_string()));
+        assert_eq!(meta.attributes.get(ATTR_TYPE), Some(&"card".to_string()));
         // brand is public
         assert_eq!(meta.attributes.get("brand"), Some(&"Visa".to_string()));
         // cardholder is sensitive — NOT in public attributes
@@ -2039,7 +2039,7 @@ mod tests {
         let attrs = BitwardenProvider::build_item_attributes("bw", &dc);
 
         // Public attrs
-        assert_eq!(attrs.public.get("type"), Some(&"login".to_string()));
+        assert_eq!(attrs.public.get(ATTR_TYPE), Some(&"login".to_string()));
         assert_eq!(attrs.public.get("username"), Some(&"alice".to_string()));
         assert_eq!(
             attrs.public.get("uri"),
@@ -2070,7 +2070,7 @@ mod tests {
         });
 
         let attrs = BitwardenProvider::build_item_attributes("bw", &dc);
-        assert_eq!(attrs.public.get("type"), Some(&"login".to_string()));
+        assert_eq!(attrs.public.get(ATTR_TYPE), Some(&"login".to_string()));
         assert!(!attrs.public.contains_key("username"));
         assert!(!attrs.public.contains_key("uri"));
         assert!(attrs.secret_names.is_empty());
@@ -2207,7 +2207,7 @@ mod tests {
             attrs.public.get("xdg:schema"),
             Some(&"org.freedesktop.Secret.Note".to_string())
         );
-        assert_eq!(attrs.public.get("type"), Some(&"note".to_string()));
+        assert_eq!(attrs.public.get(ATTR_TYPE), Some(&"note".to_string()));
         assert!(!attrs.public.contains_key("notes"));
         assert!(attrs.secret_names.contains(&"notes".to_string()));
     }

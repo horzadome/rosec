@@ -8,8 +8,8 @@ use rosec_core::config::{Config, PromptConfig};
 use rosec_core::dedup::is_stale;
 use rosec_core::router::Router;
 use rosec_core::{
-    Attributes, AutoLockPolicy, Capability, ItemMeta, Provider, ProviderError, SecretBytes,
-    UnlockInput,
+    ATTR_PROVIDER, Attributes, AutoLockPolicy, Capability, ItemMeta, Provider, ProviderError,
+    SecretBytes, UnlockInput,
 };
 use tracing::{debug, info, warn};
 use zbus::Connection;
@@ -729,6 +729,8 @@ impl ServiceState {
         use std::io::BufRead as _;
         use std::process::Stdio;
 
+        tracing::debug!(%prompt_path, %provider_id, %label, "spawn_prompt called");
+
         let prompt_path = prompt_path.to_string();
         let provider_id_str = provider_id.to_string();
 
@@ -806,6 +808,11 @@ impl ServiceState {
         if has_display || has_tty {
             // Build the JSON request that rosec-prompt expects.
             let json = build_prompt_json(provider_id_str, label, &prompt_cfg);
+
+            tracing::debug!(
+                %program, has_display, has_tty,
+                "launching rosec-prompt"
+            );
 
             let mut cmd = std::process::Command::new(&program);
             cmd.stdin(Stdio::piped())
@@ -1631,7 +1638,7 @@ impl ServiceState {
                     // Stamp provider identity so clients can see where items
                     // came from and filter by provider in searches.
                     item.attributes
-                        .entry("rosec_provider".to_string())
+                        .entry(ATTR_PROVIDER.to_string())
                         .or_insert_with(|| item.provider_id.clone());
                     // Stamp collection label if configured and not already set
                     // by the provider itself.
@@ -2146,8 +2153,11 @@ mod tests {
 
         // Verify we got a valid secret tuple (session, params, value, content_type)
         let _path_str = path; // just ensure the path was resolved
-        // The value should be a struct with 4 fields
-        assert!(!format!("{value:?}").is_empty());
+        // The value should be a tuple with 4 fields
+        assert!(
+            !value.2.is_empty(),
+            "secret value bytes should not be empty"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rosec_core::{ItemMeta, NewItem, Provider, SecretBytes};
-use tracing::info;
+use tracing::{debug, info};
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
 use zvariant::OwnedObjectPath;
@@ -87,9 +87,10 @@ impl SecretCollection {
     async fn create_item(
         &self,
         properties: HashMap<String, zvariant::Value<'_>>,
-        secret: zvariant::Value<'_>,
+        secret: (OwnedObjectPath, Vec<u8>, Vec<u8>, String),
         replace: bool,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), SecretServiceError> {
+        debug!("CreateItem called (replace={replace})");
         let write_provider = self.state.service_state.write_provider().ok_or_else(|| {
             SecretServiceError::NotSupported("no write-capable provider available".to_string())
         })?;
@@ -104,7 +105,8 @@ impl SecretCollection {
             .and_then(|v| extract_attributes_dict(v))
             .unwrap_or_default();
 
-        let (session_path, parameters, secret_value, _content_type) = parse_secret_struct(&secret)?;
+        let (session_path, parameters, secret_value, _content_type) = secret;
+        let session_path = session_path.as_str().to_string();
 
         let aes_key = self
             .state
@@ -144,6 +146,7 @@ impl SecretCollection {
         };
 
         if is_locked {
+            debug!(provider = %provider_id, "write provider is locked, deferring CreateItem behind prompt");
             // Stash the operation and return a prompt path.
             let op = PendingOperation::CreateItem {
                 provider_id: provider_id.clone(),
@@ -232,50 +235,4 @@ fn extract_attributes_dict(value: &zvariant::Value<'_>) -> Option<HashMap<String
         }
     }
     Some(result)
-}
-
-fn parse_secret_struct(
-    secret: &zvariant::Value<'_>,
-) -> Result<(String, Vec<u8>, Vec<u8>, String), FdoError> {
-    let structure = secret
-        .downcast_ref::<zvariant::Structure>()
-        .map_err(|_| FdoError::Failed("secret is not a Structure".to_string()))?;
-
-    let fields = structure.fields();
-    if fields.len() != 4 {
-        return Err(FdoError::Failed(format!(
-            "secret struct has {} fields, expected 4",
-            fields.len()
-        )));
-    }
-
-    let session_path = fields[0]
-        .downcast_ref::<zvariant::ObjectPath>()
-        .map(|p| p.as_str().to_string())
-        .or_else(|_| fields[0].downcast_ref::<String>())
-        .map_err(|_| FdoError::Failed("session path is not an ObjectPath or String".to_string()))?;
-
-    let parameters = fields[1]
-        .downcast_ref::<zvariant::Array>()
-        .and_then(|arr| {
-            arr.iter()
-                .map(|v| v.downcast_ref::<u8>())
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|_| FdoError::Failed("parameters is not a byte array".to_string()))?;
-
-    let secret_value = fields[2]
-        .downcast_ref::<zvariant::Array>()
-        .and_then(|arr| {
-            arr.iter()
-                .map(|v| v.downcast_ref::<u8>())
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|_| FdoError::Failed("secret value is not a byte array".to_string()))?;
-
-    let content_type = fields[3]
-        .downcast_ref::<String>()
-        .map_err(|_| FdoError::Failed("content_type is not a String".to_string()))?;
-
-    Ok((session_path, parameters, secret_value, content_type))
 }

@@ -175,7 +175,7 @@ EXAMPLES:
     rosec search -s                                 sync first, then list all
     rosec search type=login                         only login items
     rosec search username=alice                     items with username 'alice'
-    rosec search rosec_provider=personal            items from 'personal' provider
+    rosec search rosec:provider=personal            items from 'personal' provider
     rosec search type=login username=alice          combine filters
     rosec search name=\"GitHub*\"                     glob on item name
     rosec search --format=json type=login           JSON output
@@ -2110,7 +2110,7 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
         .iter()
         .map(|i| {
             i.attrs
-                .get("type")
+                .get(rosec_core::ATTR_TYPE)
                 .map(String::len)
                 .unwrap_or(0)
                 .min(MAX_TYPE)
@@ -2122,7 +2122,7 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
         .iter()
         .map(|i| {
             i.attrs
-                .get("rosec_provider")
+                .get(rosec_core::ATTR_PROVIDER)
                 .map(String::len)
                 .unwrap_or(0)
                 .min(MAX_PROV)
@@ -2191,10 +2191,14 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
     println!("{}", "-".repeat(sep_w));
 
     for item in items {
-        let item_type = item.attrs.get("type").map(String::as_str).unwrap_or("");
+        let item_type = item
+            .attrs
+            .get(rosec_core::ATTR_TYPE)
+            .map(String::as_str)
+            .unwrap_or("");
         let provider = item
             .attrs
-            .get("rosec_provider")
+            .get(rosec_core::ATTR_PROVIDER)
             .map(String::as_str)
             .unwrap_or("");
         let username = item.attrs.get("username").map(String::as_str).unwrap_or("");

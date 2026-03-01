@@ -24,11 +24,56 @@ pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new((
 
 pub type Attributes = HashMap<String, String>;
 
-/// Reserved attribute names that cannot be set by users.
+// ---------------------------------------------------------------------------
+// Reserved & rosec-managed attribute keys
+// ---------------------------------------------------------------------------
+//
+// All attribute names that rosec manages internally live here as named
+// constants.  `RESERVED_ATTRIBUTES` is built from them so the validation
+// list can never get out of sync.
+//
+// Struct-field attributes (`id`, `label`, `created`, `modified`) correspond
+// to first-class fields on `ItemMeta` / `VaultItemData` and must not appear
+// as user-supplied attribute keys.
+//
+// The `rosec:` namespace attributes are stamped by providers or the service
+// layer and carry rosec-specific semantics.  The `rosec:` prefix follows
+// the `xdg:schema` convention from the Secret Service spec, keeping them
+// distinct from arbitrary client-supplied attributes.
+
+/// Item identifier (first-class struct field).
+pub const ATTR_ID: &str = "id";
+
+/// Item display label (first-class struct field).
+pub const ATTR_LABEL: &str = "label";
+
+/// Creation timestamp (first-class struct field).
+pub const ATTR_CREATED: &str = "created";
+
+/// Last-modified timestamp (first-class struct field).
+pub const ATTR_MODIFIED: &str = "modified";
+
+/// Which provider owns the item.  Stamped by the service layer and exposed
+/// as a public, searchable attribute on the D-Bus interface.
+pub const ATTR_PROVIDER: &str = "rosec:provider";
+
+/// Item type classification (e.g. "login", "note", "ssh-key").  Set by
+/// providers that have a concept of item types (Bitwarden, Bitwarden SM).
+/// Used by [`ItemType::from_attributes`] to determine the default secret
+/// attribute name.
+pub const ATTR_TYPE: &str = "rosec:type";
+
+/// Attribute names that cannot be set by users.
 ///
-/// These correspond to item fields that are managed by the provider or have
-/// special meaning (id, label, timestamps, type discriminator).
-pub const RESERVED_ATTRIBUTES: &[&str] = &["id", "label", "created", "modified", "type"];
+/// Built from the named constants above so the list stays in sync.
+pub const RESERVED_ATTRIBUTES: &[&str] = &[
+    ATTR_ID,
+    ATTR_LABEL,
+    ATTR_CREATED,
+    ATTR_MODIFIED,
+    ATTR_PROVIDER,
+    ATTR_TYPE,
+];
 
 // ---------------------------------------------------------------------------
 // Capability model
@@ -79,9 +124,9 @@ pub enum ItemType {
 }
 
 impl ItemType {
-    /// Derive from `attributes.type` or default to Generic.
+    /// Derive from the `rosec:type` attribute or default to Generic.
     pub fn from_attributes(attrs: &HashMap<String, String>) -> Self {
-        match attrs.get("type").map(|s| s.as_str()) {
+        match attrs.get(ATTR_TYPE).map(|s| s.as_str()) {
             Some("login") => Self::Login,
             Some("ssh-key") => Self::SshKey,
             _ => Self::Generic,

@@ -9,7 +9,7 @@ use zbus::interface;
 use zvariant::{ObjectPath, OwnedObjectPath};
 
 use crate::error::SecretServiceError;
-use crate::service::{build_secret_value, to_object_path};
+use crate::service::{SecretStruct, build_secret_value, to_object_path};
 use crate::session::SessionManager;
 use crate::state::{map_provider_error, map_provider_error_ss};
 
@@ -83,7 +83,7 @@ impl SecretItem {
     async fn get_secret(
         &self,
         session: ObjectPath<'_>,
-    ) -> Result<zvariant::Value<'static>, SecretServiceError> {
+    ) -> Result<SecretStruct, SecretServiceError> {
         use wildmatch::WildMatch;
 
         let session = session.as_str();
@@ -131,7 +131,7 @@ impl SecretItem {
         Ok(build_secret_value(session, &secret, aes_key.as_deref())?)
     }
 
-    fn set_secret(&self, _secret: zvariant::Value) -> Result<(), SecretServiceError> {
+    fn set_secret(&self, _secret: SecretStruct) -> Result<(), SecretServiceError> {
         if self.state.meta.locked {
             return Err(SecretServiceError::IsLocked("item is locked".to_string()));
         }

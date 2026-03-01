@@ -130,6 +130,18 @@ pub async fn register_objects_with_full_config(
     server
         .at(
             paths.collection_default.clone(),
+            SecretCollection::new(collection_state.clone()),
+        )
+        .await?;
+
+    // Register the same collection at the standard alias path.
+    // Per the Secret Service spec, /org/freedesktop/secrets/aliases/default
+    // must resolve to the default collection.  Most clients (including
+    // secret-tool from libsecret) access the default collection via this
+    // alias path rather than calling ReadAlias first.
+    server
+        .at(
+            "/org/freedesktop/secrets/aliases/default",
             SecretCollection::new(collection_state),
         )
         .await?;

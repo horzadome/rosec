@@ -654,7 +654,7 @@ stored locally — you will not need to enter it again.",
 
 fn secret_to_meta(secret: &DecryptedSecret, provider_id: &str) -> ItemMeta {
     let mut attributes = Attributes::new();
-    attributes.insert("type".to_string(), "secret".to_string());
+    attributes.insert(rosec_core::ATTR_TYPE.to_string(), "secret".to_string());
     attributes.insert("sm.key".to_string(), secret.key.clone());
     attributes.insert("sm.id".to_string(), secret.id.to_string());
     if let Some(pid) = secret.project_id {
@@ -994,7 +994,9 @@ mod tests {
         assert_eq!(meta.label, "MY_SECRET");
         assert_eq!(meta.provider_id, "provider-x");
         assert_eq!(
-            meta.attributes.get("type").map(String::as_str),
+            meta.attributes
+                .get(rosec_core::ATTR_TYPE)
+                .map(String::as_str),
             Some("secret")
         );
         assert!(meta.attributes.contains_key("sm.key"));

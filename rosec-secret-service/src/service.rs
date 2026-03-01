@@ -13,6 +13,12 @@ use crate::prompt::SecretPrompt;
 use crate::session_iface::SecretSession;
 use crate::state::{ServiceState, map_provider_error, map_zbus_error};
 
+/// The Secret Service spec `Secret` struct: `(oayays)` =
+/// `(ObjectPath, Array<Byte>, Array<Byte>, String)`.
+///
+/// Fields: `(session, parameters, value, content_type)`.
+pub(crate) type SecretStruct = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
+
 /// Log the D-Bus caller at debug level for a given method name.
 fn log_caller(method: &str, header: &Header<'_>) {
     let sender = header.sender().map(|s| s.as_str()).unwrap_or("<unknown>");
@@ -95,7 +101,7 @@ impl SecretService {
         items: Vec<OwnedObjectPath>,
         session: zvariant::ObjectPath<'_>,
         #[zbus(header)] header: Header<'_>,
-    ) -> Result<HashMap<OwnedObjectPath, zvariant::Value<'static>>, FdoError> {
+    ) -> Result<HashMap<OwnedObjectPath, SecretStruct>, FdoError> {
         log_caller("GetSecrets", &header);
         self.state.touch_activity();
         let session = session.as_str();
@@ -285,9 +291,11 @@ impl SecretService {
         match prompt_provider_opt {
             None => {
                 // All relevant providers unlocked — no prompt needed.
+                debug!("Unlock: all relevant providers already unlocked");
                 Ok((objects, to_object_path("/")))
             }
             Some(provider_id) => {
+                debug!(provider = %provider_id, "Unlock: allocating prompt for locked provider");
                 // Allocate a unique prompt path and register the object.
                 let prompt_path = self.state.allocate_prompt(&provider_id);
                 let prompt_obj =
@@ -332,8 +340,8 @@ pub(crate) fn build_secret_value(
     session_path: &str,
     secret: &SecretBytes,
     aes_key: Option<&[u8; 16]>,
-) -> Result<zvariant::Value<'static>, FdoError> {
-    let session = zvariant::OwnedObjectPath::try_from(session_path.to_string())
+) -> Result<SecretStruct, FdoError> {
+    let session = OwnedObjectPath::try_from(session_path.to_string())
         .map_err(|_| FdoError::Failed("invalid session path".to_string()))?;
 
     let (parameters, value) = if let Some(key) = aes_key {
@@ -346,7 +354,5 @@ pub(crate) fn build_secret_value(
         (Vec::new(), secret.as_slice().to_vec())
     };
 
-    let secret_tuple: (zvariant::OwnedObjectPath, Vec<u8>, Vec<u8>, String) =
-        (session, parameters, value, "text/plain".to_string());
-    Ok(zvariant::Value::from(secret_tuple))
+    Ok((session, parameters, value, "text/plain".to_string()))
 }

@@ -85,6 +85,12 @@ impl SecretPrompt {
         _window_id: &str,
         #[zbus(signal_emitter)] ctxt: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
+        tracing::debug!(
+            prompt_path = %self.path,
+            provider = %self.provider_id,
+            window_id = %_window_id,
+            "Prompt() called by client"
+        );
         let state = Arc::clone(&self.state);
         let prompt_path = self.path.clone();
         let provider_id = self.provider_id.clone();
@@ -151,6 +157,9 @@ async fn run_prompt_task(
     label: String,
     ctxt: SignalEmitter<'static>,
 ) {
+    /// Maximum number of unlock attempts before giving up.
+    const MAX_ATTEMPTS: u32 = 3;
+
     // Inline helper: emit Completed(dismissed=true).
     async fn emit_dismissed(ctxt: &SignalEmitter<'_>) {
         if let Err(e) =
@@ -160,112 +169,141 @@ async fn run_prompt_task(
         }
     }
 
-    // Collect credentials via spawn_blocking (blocks on subprocess I/O).
-    let state2 = Arc::clone(&state);
-    let prompt_path2 = prompt_path.clone();
-    let provider_id2 = provider_id.clone();
-    let label2 = label.clone();
+    let mut attempt = 0u32;
 
-    let password_result: Result<Zeroizing<String>, zbus::fdo::Error> =
-        match tokio::task::spawn_blocking(move || {
-            state2.spawn_prompt(&prompt_path2, &provider_id2, &label2)
-        })
-        .await
-        {
-            Ok(r) => r,
+    tracing::debug!(provider = %provider_id, %label, "run_prompt_task started");
+
+    loop {
+        attempt += 1;
+
+        // Collect credentials via spawn_blocking (blocks on subprocess I/O).
+        let state2 = Arc::clone(&state);
+        let prompt_path2 = prompt_path.clone();
+        let provider_id2 = provider_id.clone();
+        let label2 = if attempt == 1 {
+            label.clone()
+        } else {
+            format!("{label} (wrong password, attempt {attempt}/{MAX_ATTEMPTS})")
+        };
+
+        let password_result: Result<Zeroizing<String>, zbus::fdo::Error> =
+            match tokio::task::spawn_blocking(move || {
+                state2.spawn_prompt(&prompt_path2, &provider_id2, &label2)
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, "prompt task panicked");
+                    state.finish_prompt(&prompt_path);
+                    emit_dismissed(&ctxt).await;
+                    return;
+                }
+            };
+
+        let password = match password_result {
             Err(e) => {
-                tracing::warn!(error = %e, "prompt task panicked");
+                // User cancelled or prompt failed — stop immediately, no retry.
+                tracing::debug!(provider = %provider_id, error = %e, "prompt dismissed or failed");
                 state.finish_prompt(&prompt_path);
                 emit_dismissed(&ctxt).await;
                 return;
             }
+            Ok(pw) => pw,
         };
 
-    match password_result {
-        Err(e) => {
-            tracing::debug!(provider = %provider_id, error = %e, "prompt dismissed or failed");
+        // Perform the actual provider unlock — password never leaves this process.
+        let Some(provider) = state.provider_by_id(&provider_id) else {
+            tracing::warn!(provider = %provider_id, "provider not found after prompt");
             state.finish_prompt(&prompt_path);
             emit_dismissed(&ctxt).await;
-        }
-        Ok(password) => {
-            // Perform the actual provider unlock — password never leaves this process.
-            let Some(provider) = state.provider_by_id(&provider_id) else {
-                tracing::warn!(provider = %provider_id, "provider not found after prompt");
+            return;
+        };
+
+        let unlock_result = provider
+            .unlock(UnlockInput::Password(password))
+            .await
+            .map_err(map_provider_error);
+
+        match unlock_result {
+            Ok(()) => {
+                // Unlock succeeded — finish prompt and proceed.
                 state.finish_prompt(&prompt_path);
-                emit_dismissed(&ctxt).await;
+                state.mark_provider_unlocked(&provider_id);
+                state.touch_activity();
+
+                // Trigger a cache sync immediately so items are visible
+                // without waiting for the background poller.
+                let state3 = Arc::clone(&state);
+                let bid = provider_id.clone();
+                if let Err(e) = state3.sync_provider(&bid).await {
+                    tracing::debug!(provider = %bid, error = %e,
+                        "post-unlock sync failed (non-fatal)");
+                }
+
+                tracing::debug!(provider = %provider_id, "provider unlocked via Prompt");
+
+                // Execute any deferred operation that was stashed when the
+                // prompt was created (e.g. CreateItem on a locked collection).
+                let pending = state.take_pending_operation(&prompt_path);
+                let result_value = match pending {
+                    Some(PendingOperation::CreateItem {
+                        provider_id: pid,
+                        item,
+                        replace,
+                        items_cache,
+                    }) => execute_deferred_create(&state, &pid, item, replace, items_cache).await,
+                    Some(PendingOperation::DeleteItem {
+                        provider_id: pid,
+                        item_id,
+                        item_path,
+                        items_cache,
+                    }) => {
+                        execute_deferred_delete(&state, &pid, &item_id, &item_path, items_cache)
+                            .await
+                    }
+                    Some(PendingOperation::Unlock) | None => {
+                        // Plain unlock — return the collection path.
+                        Some(zvariant::Value::from(to_object_path(
+                            "/org/freedesktop/secrets/collection/default",
+                        )))
+                    }
+                };
+
+                match result_value {
+                    Some(val) => {
+                        if let Err(e) = SecretPrompt::completed(&ctxt, false, &val).await {
+                            tracing::warn!(error = %e,
+                                "failed to emit Completed(success)");
+                        }
+                    }
+                    None => {
+                        // Deferred operation failed after unlock — dismiss.
+                        emit_dismissed(&ctxt).await;
+                    }
+                }
                 return;
-            };
+            }
+            Err(e) => {
+                tracing::warn!(
+                    provider = %provider_id,
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    error = %e,
+                    "unlock failed after prompt (wrong password?)"
+                );
 
-            let unlock_result = provider
-                .unlock(UnlockInput::Password(password))
-                .await
-                .map_err(map_provider_error);
-
-            state.finish_prompt(&prompt_path);
-
-            match unlock_result {
-                Ok(()) => {
-                    state.mark_provider_unlocked(&provider_id);
-                    state.touch_activity();
-
-                    // Trigger a cache sync immediately so items are visible
-                    // without waiting for the background poller.
-                    let state3 = Arc::clone(&state);
-                    let bid = provider_id.clone();
-                    if let Err(e) = state3.sync_provider(&bid).await {
-                        tracing::debug!(provider = %bid, error = %e,
-                            "post-unlock sync failed (non-fatal)");
-                    }
-
-                    tracing::debug!(provider = %provider_id, "provider unlocked via Prompt");
-
-                    // Execute any deferred operation that was stashed when the
-                    // prompt was created (e.g. CreateItem on a locked collection).
-                    let pending = state.take_pending_operation(&prompt_path);
-                    let result_value = match pending {
-                        Some(PendingOperation::CreateItem {
-                            provider_id: pid,
-                            item,
-                            replace,
-                            items_cache,
-                        }) => {
-                            execute_deferred_create(&state, &pid, item, replace, items_cache).await
-                        }
-                        Some(PendingOperation::DeleteItem {
-                            provider_id: pid,
-                            item_id,
-                            item_path,
-                            items_cache,
-                        }) => {
-                            execute_deferred_delete(&state, &pid, &item_id, &item_path, items_cache)
-                                .await
-                        }
-                        Some(PendingOperation::Unlock) | None => {
-                            // Plain unlock — return the collection path.
-                            Some(zvariant::Value::from(to_object_path(
-                                "/org/freedesktop/secrets/collection/default",
-                            )))
-                        }
-                    };
-
-                    match result_value {
-                        Some(val) => {
-                            if let Err(e) = SecretPrompt::completed(&ctxt, false, &val).await {
-                                tracing::warn!(error = %e,
-                                    "failed to emit Completed(success)");
-                            }
-                        }
-                        None => {
-                            // Deferred operation failed after unlock — dismiss.
-                            emit_dismissed(&ctxt).await;
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(provider = %provider_id, error = %e,
-                        "unlock failed after prompt");
+                if attempt >= MAX_ATTEMPTS {
+                    tracing::warn!(
+                        provider = %provider_id,
+                        "max unlock attempts reached, giving up"
+                    );
+                    state.finish_prompt(&prompt_path);
                     emit_dismissed(&ctxt).await;
+                    return;
                 }
+
+                // Loop around and re-prompt with a "wrong password" hint.
             }
         }
     }
