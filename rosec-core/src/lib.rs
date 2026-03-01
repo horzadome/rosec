@@ -633,6 +633,37 @@ pub trait VaultBackend: Send + Sync {
     async fn unlock(&self, input: UnlockInput) -> Result<(), BackendError>;
     async fn lock(&self) -> Result<(), BackendError>;
 
+    /// Change the unlock password for this backend.
+    ///
+    /// Semantics vary by backend type:
+    ///
+    /// - **Local vault**: finds the wrapping entry that `old_password` unlocks,
+    ///   adds a new wrapping entry for `new_password`, then removes the old one.
+    ///   The vault key itself is unchanged — only the key-wrapping layer is
+    ///   rotated.  The vault must be unlocked.
+    ///
+    /// - **SM backend**: decrypts the stored access token with the old-password-
+    ///   derived storage key, re-encrypts it with the new-password-derived key,
+    ///   and persists the result.  The backend must be unlocked (so the access
+    ///   token is available in memory for verification).
+    ///
+    /// Returns `BackendError::AuthFailed` if `old_password` is incorrect.
+    /// Returns `BackendError::NotSupported` for backends that do not support
+    /// password changes (the default).
+    ///
+    /// # Security
+    ///
+    /// Both passwords are held in `Zeroizing<String>` and scrubbed on drop.
+    /// Implementations must not persist `old_password` or `new_password` in
+    /// plaintext at any point.
+    async fn change_password(
+        &self,
+        _old_password: Zeroizing<String>,
+        _new_password: Zeroizing<String>,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::NotSupported)
+    }
+
     /// Pull fresh data from the remote source and update the in-memory vault.
     ///
     /// Returns `Ok(())` on success, `BackendError::Locked` if the backend is

@@ -236,13 +236,16 @@ USAGE:
 SUBCOMMANDS:
     list                      List backends and their lock state
     kinds                     List available backend kinds
-    auth <id>                 Authenticate/unlock a backend
+    auth <id> [--force]       Authenticate/unlock a backend
     add <kind> [options]      Add a backend to config.toml
     remove <id>               Remove a backend from config.toml
+    change-password <id>      Change the unlock password for a backend
 
 NOTE:
     Device registration (Bitwarden) and first-time token setup (SM) are handled
-    automatically during 'auth' when the backend requires them.
+    automatically during 'auth' when the backend requires them.  Use --force
+    to re-run registration even when stored credentials already exist (e.g. to
+    replace a rotated SM access token or re-register a Bitwarden device).
 
 OPTIONS for 'add':
     --id <id>                 Override auto-generated ID (default: derived from email/org)
@@ -511,6 +514,36 @@ fn open_tty_owned_fd() -> Result<zvariant::OwnedFd> {
     Ok(zvariant::OwnedFd::from(std_owned))
 }
 
+/// Write a password to the write end of a pipe and return the read end as an
+/// `OwnedFd` suitable for D-Bus fd-passing.
+///
+/// The write end is closed after the password is written so the daemon sees
+/// EOF when it reads.  The password bytes are never visible in any D-Bus
+/// message payload — only the fd number travels over the bus.
+fn password_to_pipe_fd(password: &[u8]) -> Result<zvariant::OwnedFd> {
+    use std::io::Write as _;
+    use std::os::unix::io::FromRawFd as _;
+
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe() writes two valid fds into the array.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        bail!("pipe() failed: {}", std::io::Error::last_os_error());
+    }
+    let read_fd = fds[0];
+    let write_fd = fds[1];
+
+    {
+        // SAFETY: write_fd is a valid fd from pipe() above.
+        let mut write_file: std::fs::File = unsafe { std::fs::File::from_raw_fd(write_fd) };
+        write_file.write_all(password)?;
+        // write_file dropped here → write end closed → daemon sees EOF on read
+    }
+
+    // SAFETY: read_fd is a valid fd from pipe() above.
+    let std_owned: std::os::fd::OwnedFd = unsafe { std::os::fd::OwnedFd::from_raw_fd(read_fd) };
+    Ok(zvariant::OwnedFd::from(std_owned))
+}
+
 /// Read one line from `fd` with terminal echo disabled.
 ///
 /// Flushes any stale input (via `TCSAFLUSH`), saves the current `termios`,
@@ -755,6 +788,7 @@ async fn cmd_backend(args: &[String]) -> Result<()> {
         "auth" => cmd_backend_auth(&args[1..]).await,
         "add" => cmd_backend_add(&args[1..]).await,
         "remove" | "rm" => cmd_backend_remove(&args[1..]).await,
+        "change-password" => cmd_backend_change_password(&args[1..]).await,
         "kinds" => {
             cmd_backend_kinds();
             Ok(())
@@ -831,9 +865,18 @@ async fn cmd_backend_list() -> Result<()> {
 /// All credential prompting happens inside the daemon — credentials never
 /// appear in any D-Bus message payload.
 async fn cmd_backend_auth(args: &[String]) -> Result<()> {
-    let backend_id = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec backend auth <backend-id>"))?;
+    let mut backend_id: Option<&str> = None;
+    let mut force = false;
+    for arg in args {
+        match arg.as_str() {
+            "--force" | "-f" => force = true,
+            s if s.starts_with('-') => bail!("unknown option: {s}"),
+            _ if backend_id.is_none() => backend_id = Some(arg.as_str()),
+            _ => bail!("unexpected argument: {arg}"),
+        }
+    }
+    let backend_id = backend_id
+        .ok_or_else(|| anyhow::anyhow!("usage: rosec backend auth <backend-id> [--force]"))?;
 
     let conn = conn().await?;
     let proxy = zbus::Proxy::new(
@@ -846,10 +889,61 @@ async fn cmd_backend_auth(args: &[String]) -> Result<()> {
 
     let tty_fd = open_tty_owned_fd()?;
     let _: () = proxy
-        .call("AuthBackendWithTty", &(backend_id.as_str(), tty_fd))
+        .call("AuthBackendWithTty", &(backend_id, tty_fd, force))
         .await?;
 
     println!("Backend '{backend_id}' authenticated.");
+    Ok(())
+}
+
+/// `rosec backend change-password <id>` — change the unlock password.
+///
+/// Prompts for the current password, then the new password (with confirmation).
+/// Passes both passwords to the daemon via pipe fd-passing — credentials never
+/// appear in any D-Bus message payload.
+///
+/// Works for local vaults (rotates the key-wrapping entry) and SM backends
+/// (re-encrypts the stored access token with the new password).
+async fn cmd_backend_change_password(args: &[String]) -> Result<()> {
+    let backend_id = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: rosec backend change-password <backend-id>"))?;
+
+    let old_pw = prompt_field("Current password", "", "password").await?;
+    if old_pw.is_empty() {
+        bail!("current password cannot be empty");
+    }
+
+    let new_pw = prompt_field("New password", "", "password").await?;
+    if new_pw.is_empty() {
+        bail!("new password cannot be empty");
+    }
+
+    let confirm_pw = prompt_field("Confirm new password", "", "password").await?;
+    if new_pw.as_str() != confirm_pw.as_str() {
+        bail!("passwords do not match");
+    }
+
+    let old_fd = password_to_pipe_fd(old_pw.as_bytes())?;
+    let new_fd = password_to_pipe_fd(new_pw.as_bytes())?;
+
+    let conn = conn().await?;
+    let proxy = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.secrets",
+        "/org/rosec/Daemon",
+        "org.rosec.Daemon",
+    )
+    .await?;
+
+    let _: () = proxy
+        .call(
+            "ChangeBackendPassword",
+            &(backend_id.as_str(), old_fd, new_fd),
+        )
+        .await?;
+
+    println!("Password changed for backend '{backend_id}'.");
     Ok(())
 }
 
@@ -973,7 +1067,7 @@ async fn cmd_backend_add(args: &[String]) -> Result<()> {
                 println!("rosecd picked up the new backend — starting authentication.");
                 let tty_fd = open_tty_owned_fd()?;
                 let _: () = proxy
-                    .call("AuthBackendWithTty", &(id.as_str(), tty_fd))
+                    .call("AuthBackendWithTty", &(id.as_str(), tty_fd, false))
                     .await?;
                 println!("Backend '{id}' authenticated.");
             } else {
@@ -1060,6 +1154,7 @@ SUBCOMMANDS:
     add-password <id> [--label <l>]   Add a new unlock password to a vault
     remove-password <id> <entry-id>   Remove a password from a vault
     list-passwords <id>               List unlock passwords for a vault
+    change-password <id>              Change the unlock password for a vault
     auth <id>                         Authenticate/unlock a vault
 
 OPTIONS:
@@ -1082,6 +1177,7 @@ EXAMPLES:
     rosec vault auth personal
     rosec vault add-password personal --label pam
     rosec vault list-passwords personal
+    rosec vault change-password personal
     rosec vault remove-password personal a1b2c3d4
     rosec vault detach work
     rosec vault destroy old-vault"
@@ -1099,6 +1195,7 @@ async fn cmd_vault(args: &[String]) -> Result<()> {
         "add-password" => cmd_vault_add_password(&args[1..]).await,
         "remove-password" => cmd_vault_remove_password(&args[1..]).await,
         "list-passwords" => cmd_vault_list_passwords(&args[1..]).await,
+        "change-password" => cmd_vault_change_password(&args[1..]).await,
         "auth" => cmd_vault_auth(&args[1..]).await,
         "help" | "--help" | "-h" => {
             print_vault_help();
@@ -1590,6 +1687,54 @@ async fn cmd_vault_list_passwords(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `rosec vault change-password <vault-id>`
+///
+/// Change the unlock password for a vault.  Prompts for the current password,
+/// new password, and confirmation.  The wrapping entry matched by the old
+/// password is atomically replaced with a new one for the new password.
+async fn cmd_vault_change_password(args: &[String]) -> Result<()> {
+    let vault_id = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: rosec vault change-password <vault-id>"))?;
+
+    let old_pw = prompt_field("Current password", "", "password").await?;
+    if old_pw.is_empty() {
+        bail!("current password cannot be empty");
+    }
+
+    let new_pw = prompt_field("New password", "", "password").await?;
+    if new_pw.is_empty() {
+        bail!("new password cannot be empty");
+    }
+
+    let confirm_pw = prompt_field("Confirm new password", "", "password").await?;
+    if new_pw.as_str() != confirm_pw.as_str() {
+        bail!("passwords do not match");
+    }
+
+    let old_fd = password_to_pipe_fd(old_pw.as_bytes())?;
+    let new_fd = password_to_pipe_fd(new_pw.as_bytes())?;
+
+    let conn = conn().await?;
+    let proxy = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.secrets",
+        "/org/rosec/Daemon",
+        "org.rosec.Daemon",
+    )
+    .await?;
+
+    let _: () = proxy
+        .call(
+            "ChangeBackendPassword",
+            &(vault_id.as_str(), old_fd, new_fd),
+        )
+        .await?;
+
+    println!("Password changed for vault '{vault_id}'.");
+    Ok(())
+}
+
 /// `rosec vault remove-password <vault-id> <entry-id>`
 ///
 /// Remove an unlock password from a vault. The vault must be unlocked and must
@@ -1660,7 +1805,7 @@ async fn cmd_vault_auth(args: &[String]) -> Result<()> {
 
     let tty_fd = open_tty_owned_fd()?;
     let _: () = proxy
-        .call("AuthBackendWithTty", &(vault_id.as_str(), tty_fd))
+        .call("AuthBackendWithTty", &(vault_id.as_str(), tty_fd, false))
         .await?;
 
     println!("Vault '{vault_id}' authenticated.");

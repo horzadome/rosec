@@ -65,7 +65,8 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
         let backend = &locked[0];
         let id = backend.id().to_string();
         let fields = backend_auth_fields(backend.as_ref());
-        let _password = auth_backend_with_tty_inner(&state, tty_fd, &id, &fields, None).await?;
+        let _password =
+            auth_backend_with_tty_inner(&state, tty_fd, &id, &fields, None, false).await?;
         results.push(UnlockResult {
             backend_id: id.clone(),
             success: true,
@@ -152,7 +153,7 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
             backend_auth_fields(b.as_ref())
         };
         let _password =
-            auth_backend_with_tty_inner(&state, tty_fd, &id, &fields, Some(prefill)).await?;
+            auth_backend_with_tty_inner(&state, tty_fd, &id, &fields, Some(prefill), false).await?;
         results.push(UnlockResult {
             backend_id: id.clone(),
             success: true,
@@ -171,7 +172,8 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
                 .ok_or_else(|| anyhow!("backend '{id}' not found"))?;
             backend_auth_fields(b.as_ref())
         };
-        let _password = auth_backend_with_tty_inner(&state, tty_fd, &id, &fields, None).await?;
+        let _password =
+            auth_backend_with_tty_inner(&state, tty_fd, &id, &fields, None, false).await?;
         results.push(UnlockResult {
             backend_id: id.clone(),
             success: true,
@@ -193,10 +195,16 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
 ///
 /// This is the `AuthBackendWithTty` D-Bus method implementation.
 /// Must be called from a Tokio task context.
+///
+/// When `force` is `true`, the normal unlock attempt is skipped and the
+/// registration flow is entered unconditionally.  This allows re-registering
+/// backend credentials (e.g. rotating a Bitwarden SM access token or
+/// re-registering a Bitwarden PM device) without deleting stored state first.
 pub async fn auth_backend_with_tty(
     state: Arc<ServiceState>,
     tty_fd: RawFd,
     backend_id: &str,
+    force: bool,
 ) -> Result<()> {
     let fields = {
         let b = state
@@ -204,7 +212,8 @@ pub async fn auth_backend_with_tty(
             .ok_or_else(|| anyhow!("backend '{backend_id}' not found"))?;
         backend_auth_fields(b.as_ref())
     };
-    let password = auth_backend_with_tty_inner(&state, tty_fd, backend_id, &fields, None).await?;
+    let password =
+        auth_backend_with_tty_inner(&state, tty_fd, backend_id, &fields, None, force).await?;
     // auth_backend_inner (called by auth_backend_with_tty_inner) already
     // called mark_backend_unlocked + touch_activity.
     // Sync immediately so on_sync_succeeded callbacks fire (e.g. SSH rebuild).
@@ -239,6 +248,11 @@ pub async fn auth_backend_with_tty(
 /// the user is asked to confirm their password once (to guard against typos on
 /// first-time setup), then registration-specific fields are collected.
 ///
+/// When `force` is `true`, the initial `auth_backend_inner()` call is skipped
+/// and the function proceeds directly to the registration flow.  This is used
+/// by `rosec backend auth --force` to re-register even when stored credentials
+/// already exist (e.g. to replace a rotated SM access token).
+///
 /// On success, returns the password value used for the unlock so the caller
 /// can pass it to `opportunistic_sweep` if desired.
 async fn auth_backend_with_tty_inner(
@@ -247,6 +261,7 @@ async fn auth_backend_with_tty_inner(
     backend_id: &str,
     fields: &[TtyField],
     prefill: Option<HashMap<String, Zeroizing<String>>>,
+    force: bool,
 ) -> Result<Zeroizing<String>> {
     let is_token_auth = {
         let b = state
@@ -254,6 +269,19 @@ async fn auth_backend_with_tty_inner(
             .ok_or_else(|| anyhow!("backend '{backend_id}' not found"))?;
         b.kind().ends_with("-sm")
     };
+
+    // When force is set, verify the backend actually supports registration
+    // before we collect any credentials.
+    if force {
+        let b = state
+            .backend_by_id(backend_id)
+            .ok_or_else(|| anyhow!("backend '{backend_id}' not found"))?;
+        if b.registration_info().is_none() {
+            return Err(anyhow!(
+                "backend '{backend_id}' does not support registration; --force is not applicable"
+            ));
+        }
+    }
 
     let mut cred_map: HashMap<String, Zeroizing<String>> = if let Some(existing) = prefill {
         // Credentials already collected — skip the main prompt and go directly
@@ -282,13 +310,21 @@ async fn auth_backend_with_tty_inner(
         collect_tty_on_fd(tty_fd, fields).await?
     };
 
-    // Pass the Zeroizing<String> map directly — no plain String intermediary.
-    let result = state.auth_backend_inner(backend_id, cred_map.clone()).await;
+    // When force is true, skip the normal auth attempt and go straight to
+    // registration.  Otherwise, try normal auth first and only fall through
+    // to registration if the backend reports it is required.
+    let auth_result = if force {
+        None
+    } else {
+        // Pass the Zeroizing<String> map directly — no plain String intermediary.
+        Some(state.auth_backend_inner(backend_id, cred_map.clone()).await)
+    };
 
-    let needs_registration = matches!(
-        &result,
-        Err(FdoError::Failed(msg)) if msg == "registration_required"
-    );
+    let needs_registration = match &auth_result {
+        None => true, // force — skip straight to registration
+        Some(Err(FdoError::Failed(msg))) if msg == "registration_required" => true,
+        _ => false,
+    };
 
     if needs_registration {
         // Registration required — get the instructions and extra fields.
@@ -358,7 +394,7 @@ async fn auth_backend_with_tty_inner(
             .auth_backend_inner(backend_id, cred_map.clone())
             .await
             .map_err(|e| anyhow!("registration failed for '{backend_id}': {e}"))?;
-    } else {
+    } else if let Some(result) = auth_result {
         result.map_err(|e| anyhow!("auth failed for '{backend_id}': {e}"))?;
     }
 

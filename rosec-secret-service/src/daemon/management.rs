@@ -343,6 +343,7 @@ impl RosecManagement {
         &self,
         backend_id: String,
         tty_fd: OwnedFd,
+        force: bool,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(), FdoError> {
         log_caller("AuthBackendWithTty", &header);
@@ -359,7 +360,7 @@ impl RosecManagement {
         let state = Arc::clone(&self.state);
         self.state
             .run_on_tokio(async move {
-                let res = auth_backend_with_tty(state, raw, &backend_id).await;
+                let res = auth_backend_with_tty(state, raw, &backend_id, force).await;
                 unsafe { libc::close(raw) };
                 res
             })
@@ -661,6 +662,96 @@ impl RosecManagement {
             .unwrap_or(false);
         self.state.cancel_prompt(prompt_path);
         Ok(existed)
+    }
+
+    /// Change the unlock password for a backend.
+    ///
+    /// The caller creates two pipes:
+    /// - `old_password_fd`: write end has the current password, read end passed here
+    /// - `new_password_fd`: write end has the new password, read end passed here
+    ///
+    /// Both fds are passed via D-Bus fd-passing (SCM_RIGHTS, type signature `h`).
+    /// `dbus-monitor` sees only fd numbers — never any credential.
+    ///
+    /// Works for any backend that implements `change_password()` (local vaults
+    /// and SM backends).  Returns a D-Bus error if the backend doesn't support
+    /// password changes, the old password is wrong, or the backend is locked.
+    async fn change_backend_password(
+        &self,
+        backend_id: String,
+        old_password_fd: OwnedFd,
+        new_password_fd: OwnedFd,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), FdoError> {
+        log_caller("ChangeBackendPassword", &header);
+
+        use std::os::unix::io::AsRawFd as _;
+        let old_raw: libc::c_int = unsafe { libc::dup(old_password_fd.as_raw_fd()) };
+        if old_raw < 0 {
+            return Err(FdoError::Failed(format!(
+                "dup(old_password_fd) failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let new_raw: libc::c_int = unsafe { libc::dup(new_password_fd.as_raw_fd()) };
+        if new_raw < 0 {
+            unsafe { libc::close(old_raw) };
+            return Err(FdoError::Failed(format!(
+                "dup(new_password_fd) failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let state = Arc::clone(&self.state);
+        self.state
+            .run_on_tokio(async move {
+                // Helper: read a password from a pipe fd into Zeroizing<String>.
+                let read_pipe_password =
+                    |raw_fd: libc::c_int,
+                     name: &str|
+                     -> Result<zeroize::Zeroizing<String>, FdoError> {
+                        use std::io::Read as _;
+                        let file: std::fs::File =
+                            unsafe { std::os::unix::io::FromRawFd::from_raw_fd(raw_fd) };
+                        let mut file = file;
+                        let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(256));
+                        file.read_to_end(&mut buf).map_err(|e| {
+                            FdoError::Failed(format!("read from {name} pipe failed: {e}"))
+                        })?;
+                        // file dropped here → fd closed
+
+                        // Strip trailing null byte (pam_exec null-terminates).
+                        if buf.last() == Some(&0) {
+                            buf.pop();
+                        }
+                        // Strip trailing newline.
+                        if buf.last() == Some(&b'\n') {
+                            buf.pop();
+                        }
+
+                        if buf.is_empty() {
+                            return Err(FdoError::Failed(format!("{name} password is empty")));
+                        }
+
+                        let s = String::from_utf8(std::mem::take(&mut *buf)).map_err(|_| {
+                            FdoError::Failed(format!("{name} password is not valid UTF-8"))
+                        })?;
+                        Ok(zeroize::Zeroizing::new(s))
+                    };
+
+                let old_password = read_pipe_password(old_raw, "old")?;
+                let new_password = read_pipe_password(new_raw, "new")?;
+
+                let backend = state
+                    .backend_by_id(&backend_id)
+                    .ok_or_else(|| FdoError::Failed(format!("backend '{backend_id}' not found")))?;
+
+                backend
+                    .change_password(old_password, new_password)
+                    .await
+                    .map_err(|e| FdoError::Failed(format!("change_password failed: {e}")))
+            })
+            .await?
     }
 }
 

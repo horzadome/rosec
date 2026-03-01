@@ -417,6 +417,49 @@ impl VaultBackend for LocalVault {
         Ok(())
     }
 
+    /// Change the unlock password for this vault.
+    ///
+    /// Finds the wrapping entry that `old_password` successfully unwraps, adds
+    /// a new wrapping entry for `new_password` (inheriting the old entry's
+    /// label), then removes the old entry.  The vault key itself is unchanged —
+    /// only the key-wrapping layer is rotated.
+    ///
+    /// Returns `BackendError::AuthFailed` if `old_password` doesn't match any
+    /// wrapping entry.  Returns `BackendError::Locked` if the vault is locked.
+    async fn change_password(
+        &self,
+        old_password: Zeroizing<String>,
+        new_password: Zeroizing<String>,
+    ) -> Result<(), BackendError> {
+        let mut guard = self.state.write().await;
+        let state = guard.as_mut().ok_or(BackendError::Locked)?;
+
+        // Find the wrapping entry that the old password unlocks.
+        let old_entry_idx = state
+            .wrapping_entries
+            .iter()
+            .position(|entry| crypto::unwrap_vault_key(entry, old_password.as_bytes()).is_some())
+            .ok_or(BackendError::AuthFailed)?;
+
+        // Inherit the label from the old entry.
+        let label = state.wrapping_entries[old_entry_idx].label.clone();
+
+        // Create a new wrapping entry for the new password with the same vault key.
+        let new_entry = crypto::wrap_vault_key(&state.vault_key, new_password.as_bytes(), label);
+
+        // Replace atomically: add new entry, then remove old.
+        let old_entry_id = state.wrapping_entries[old_entry_idx].id.clone();
+        state.wrapping_entries.push(new_entry);
+        state.wrapping_entries.retain(|e| e.id != old_entry_id);
+        state.dirty = true;
+
+        drop(guard);
+        self.save().await?;
+
+        info!("vault password changed");
+        Ok(())
+    }
+
     async fn list_items(&self) -> Result<Vec<VaultItemMeta>, BackendError> {
         let guard = self.state.read().await;
         let state = guard.as_ref().ok_or(BackendError::Locked)?;
@@ -1140,6 +1183,166 @@ mod tests {
         // Try wrong password
         let result = backend
             .unlock(UnlockInput::Password(Zeroizing::new("wrong".to_string())))
+            .await;
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // change_password tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn change_password_happy_path() {
+        let (backend, _temp) = create_test_backend();
+        backend
+            .unlock(UnlockInput::Password(Zeroizing::new(
+                "old-pass".to_string(),
+            )))
+            .await
+            .unwrap();
+
+        backend
+            .change_password(
+                Zeroizing::new("old-pass".to_string()),
+                Zeroizing::new("new-pass".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // Lock and unlock with new password.
+        backend.lock().await.unwrap();
+        let result = backend
+            .unlock(UnlockInput::Password(Zeroizing::new(
+                "new-pass".to_string(),
+            )))
+            .await;
+        assert!(result.is_ok());
+
+        // Old password should no longer work.
+        backend.lock().await.unwrap();
+        let result = backend
+            .unlock(UnlockInput::Password(Zeroizing::new(
+                "old-pass".to_string(),
+            )))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn change_password_wrong_old_password() {
+        let (backend, _temp) = create_test_backend();
+        backend
+            .unlock(UnlockInput::Password(Zeroizing::new(
+                "real-pass".to_string(),
+            )))
+            .await
+            .unwrap();
+
+        let result = backend
+            .change_password(
+                Zeroizing::new("wrong-pass".to_string()),
+                Zeroizing::new("new-pass".to_string()),
+            )
+            .await;
+        assert!(matches!(result, Err(BackendError::AuthFailed)));
+    }
+
+    #[tokio::test]
+    async fn change_password_when_locked() {
+        let (backend, _temp) = create_test_backend();
+        let result = backend
+            .change_password(
+                Zeroizing::new("old".to_string()),
+                Zeroizing::new("new".to_string()),
+            )
+            .await;
+        assert!(matches!(result, Err(BackendError::Locked)));
+    }
+
+    #[tokio::test]
+    async fn change_password_preserves_label() {
+        let (backend, _temp) = create_test_backend();
+        backend
+            .unlock(UnlockInput::Password(Zeroizing::new(
+                "master-pw".to_string(),
+            )))
+            .await
+            .unwrap();
+
+        // The first wrapping entry has the label "master" by convention.
+        let entries_before = backend.list_passwords().await.unwrap();
+        assert_eq!(entries_before.len(), 1);
+        assert_eq!(entries_before[0].1, Some("master".to_string()));
+
+        // Change password — the new entry should inherit "master" label.
+        backend
+            .change_password(
+                Zeroizing::new("master-pw".to_string()),
+                Zeroizing::new("rotated-pw".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let entries_after = backend.list_passwords().await.unwrap();
+        assert_eq!(entries_after.len(), 1);
+        assert_eq!(entries_after[0].1, Some("master".to_string()));
+
+        // ID should have changed (new entry, not same entry).
+        assert_ne!(entries_before[0].0, entries_after[0].0);
+    }
+
+    #[tokio::test]
+    async fn change_password_only_affects_matched_entry() {
+        let (backend, _temp) = create_test_backend();
+        backend
+            .unlock(UnlockInput::Password(Zeroizing::new(
+                "master-pw".to_string(),
+            )))
+            .await
+            .unwrap();
+
+        // Add a second password.
+        backend
+            .add_password(b"second-pw", "login".to_string())
+            .await
+            .unwrap();
+
+        // Change only the master password.
+        backend
+            .change_password(
+                Zeroizing::new("master-pw".to_string()),
+                Zeroizing::new("rotated-master".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // Should still have 2 entries.
+        let entries = backend.list_passwords().await.unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Lock and verify both passwords work.
+        backend.lock().await.unwrap();
+        let result = backend
+            .unlock(UnlockInput::Password(Zeroizing::new(
+                "rotated-master".to_string(),
+            )))
+            .await;
+        assert!(result.is_ok());
+
+        backend.lock().await.unwrap();
+        let result = backend
+            .unlock(UnlockInput::Password(Zeroizing::new(
+                "second-pw".to_string(),
+            )))
+            .await;
+        assert!(result.is_ok());
+
+        // Old master should fail.
+        backend.lock().await.unwrap();
+        let result = backend
+            .unlock(UnlockInput::Password(Zeroizing::new(
+                "master-pw".to_string(),
+            )))
             .await;
         assert!(result.is_err());
     }

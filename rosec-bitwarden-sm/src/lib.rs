@@ -393,6 +393,60 @@ stored locally — you will not need to enter it again.",
         Ok(())
     }
 
+    /// Change the unlock password that protects the encrypted access token.
+    ///
+    /// Decrypts the stored token using the old-password-derived storage key,
+    /// then re-encrypts it with the new-password-derived key and persists the
+    /// result.  The backend must be unlocked so we can verify the old password
+    /// against the in-memory token (defence-in-depth: even if the MAC passes,
+    /// the decrypted token must match what we hold in memory).
+    ///
+    /// Returns `BackendError::AuthFailed` if `old_password` is wrong.
+    /// Returns `BackendError::Locked` if the backend is not unlocked.
+    async fn change_password(
+        &self,
+        old_password: Zeroizing<String>,
+        new_password: Zeroizing<String>,
+    ) -> Result<(), BackendError> {
+        // Verify the backend is unlocked and snapshot the in-memory token.
+        let in_memory_token = {
+            let guard = self.access_token.lock().await;
+            guard
+                .as_deref()
+                .map(|t| Zeroizing::new(t.to_string()))
+                .ok_or(BackendError::Locked)?
+        };
+
+        // Derive old storage key and decrypt the stored token.
+        let old_key = self.derive_storage_key(old_password.as_str())?;
+        let stored_token = match rosec_core::credential::load_and_decrypt(&self.config.id, &old_key)
+        {
+            Ok(Some(cred)) => cred.client_secret,
+            Ok(None) => return Err(BackendError::AuthFailed),
+            Err(_) => return Err(BackendError::AuthFailed),
+        };
+
+        // Defence-in-depth: the decrypted token must match what we hold in
+        // memory.  A MAC-passing but semantically wrong token would mean the
+        // on-disk credential was replaced out-of-band.
+        if *stored_token != *in_memory_token {
+            return Err(BackendError::AuthFailed);
+        }
+
+        // Derive new storage key and re-encrypt.
+        let new_key = self.derive_storage_key(new_password.as_str())?;
+        rosec_core::credential::encrypt_and_save(
+            &self.config.id,
+            &new_key,
+            "access_token",
+            stored_token.as_str(),
+        )
+        .map_err(|e| BackendError::Unavailable(format!("failed to re-encrypt SM token: {e}")))?;
+
+        info!(backend = %self.config.id, "SM unlock password changed");
+        Ok(())
+    }
+
     /// Re-fetch all secrets from the Bitwarden SM API using the in-memory token.
     ///
     /// Requires the backend to be unlocked — the access token is held in memory
@@ -644,10 +698,14 @@ pub use SmConfig as BitwardenSmConfig;
 mod tests {
     use super::*;
 
+    /// Mutex that serialises tests which manipulate process-wide env vars.
+    /// Without this, parallel test threads race on `XDG_DATA_HOME`, causing
+    /// `credential_path()` to resolve against the wrong temp directory.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// RAII guard that sets an env var for the duration of a test and restores
-    /// (or removes) it on drop.  Tests that manipulate env vars must be run
-    /// single-threaded (`cargo test -- --test-threads=1`) or use separate temp
-    /// dirs per test to avoid interference.
+    /// (or removes) it on drop.  All callers must hold `ENV_MUTEX` for the
+    /// duration of the guard's lifetime to prevent races.
     struct ScopedEnv {
         key: &'static str,
         previous: Option<String>,
@@ -656,7 +714,7 @@ mod tests {
     fn scoped_env(key: &'static str, value: &str) -> ScopedEnv {
         let previous = std::env::var(key).ok();
         // SAFETY: tests are the only callers; env mutation is inherently
-        // unsafe in multi-threaded contexts — run with --test-threads=1.
+        // unsafe in multi-threaded contexts — callers hold ENV_MUTEX.
         unsafe { std::env::set_var(key, value) };
         ScopedEnv { key, previous }
     }
@@ -715,6 +773,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlock_without_stored_token_returns_registration_required() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Normal unlock with no token on disk → RegistrationRequired (first-time setup).
         let tmp = std::env::temp_dir().join(format!("rosec-sm-test-{}-noreg", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -732,6 +791,7 @@ mod tests {
 
     #[tokio::test]
     async fn unlock_with_wrong_password_returns_auth_failed() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Store a token encrypted with one password, then try to unlock with a
         // different password.  The MAC check should fail and return AuthFailed
         // (not RegistrationRequired) so the user gets re-prompted.
@@ -975,5 +1035,111 @@ mod tests {
         let mut query = Attributes::new();
         query.insert("sm.key".to_string(), "DOES_NOT_EXIST".to_string());
         assert!(b.search(&query).await.unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // change_password tests
+    // -----------------------------------------------------------------------
+
+    /// Fake access token used in change_password tests.
+    const FAKE_TOKEN: &str =
+        "0.00000000-0000-0000-0000-000000000000.fake-secret:AAAAAAAAAAAAAAAAAAAAAA==";
+
+    /// Store a token encrypted with `password` on disk, inject it into memory,
+    /// and inject auth state so the backend appears unlocked.
+    async fn setup_unlocked_with_token(b: &SmBackend, password: &str) {
+        let storage_key = b.derive_storage_key(password).unwrap_or_else(|e| {
+            panic!("derive_storage_key failed in test setup: {e}");
+        });
+        rosec_core::credential::encrypt_and_save(
+            &b.config.id,
+            &storage_key,
+            "access_token",
+            FAKE_TOKEN,
+        )
+        .unwrap_or_else(|e| {
+            panic!("encrypt_and_save failed in test setup: {e}");
+        });
+
+        // Inject access_token in memory (mimics what unlock() does).
+        {
+            let mut guard = b.access_token.lock().await;
+            *guard = Some(Zeroizing::new(FAKE_TOKEN.to_string()));
+        }
+        inject_state(&b, Vec::new()).await;
+    }
+
+    #[tokio::test]
+    async fn change_password_happy_path() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp =
+            std::env::temp_dir().join(format!("rosec-sm-test-{}-chpw-ok", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let result = {
+            let _env = scoped_env("XDG_DATA_HOME", tmp.to_str().unwrap());
+            let b = make_backend();
+            setup_unlocked_with_token(&b, "old-password").await;
+
+            let res = b
+                .change_password(
+                    Zeroizing::new("old-password".to_string()),
+                    Zeroizing::new("new-password".to_string()),
+                )
+                .await;
+
+            // Verify: old password can no longer decrypt, new password can.
+            if res.is_ok() {
+                let old_key = b.derive_storage_key("old-password").unwrap();
+                let old_load = rosec_core::credential::load_and_decrypt(&b.config.id, &old_key);
+                assert!(
+                    old_load.is_err() || matches!(old_load, Ok(None)),
+                    "old password should no longer decrypt the stored token"
+                );
+
+                let new_key = b.derive_storage_key("new-password").unwrap();
+                let new_load = rosec_core::credential::load_and_decrypt(&b.config.id, &new_key);
+                assert!(
+                    matches!(&new_load, Ok(Some(cred)) if cred.client_secret.as_str() == FAKE_TOKEN),
+                    "new password should decrypt to the original token"
+                );
+            }
+            res
+        };
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn change_password_wrong_old_password() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp =
+            std::env::temp_dir().join(format!("rosec-sm-test-{}-chpw-wrong", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let result = {
+            let _env = scoped_env("XDG_DATA_HOME", tmp.to_str().unwrap());
+            let b = make_backend();
+            setup_unlocked_with_token(&b, "real-password").await;
+
+            b.change_password(
+                Zeroizing::new("wrong-password".to_string()),
+                Zeroizing::new("new-password".to_string()),
+            )
+            .await
+        };
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(matches!(result, Err(BackendError::AuthFailed)));
+    }
+
+    #[tokio::test]
+    async fn change_password_when_locked() {
+        let b = make_backend();
+        // Backend is locked (default state) — no access_token in memory.
+        let result = b
+            .change_password(
+                Zeroizing::new("old".to_string()),
+                Zeroizing::new("new".to_string()),
+            )
+            .await;
+        assert!(matches!(result, Err(BackendError::Locked)));
     }
 }
