@@ -8,9 +8,11 @@ use zbus::interface;
 use zvariant::OwnedObjectPath;
 
 use crate::crypto::aes128_cbc_decrypt;
+use crate::error::SecretServiceError;
+use crate::prompt::{PendingOperation, SecretPrompt};
 use crate::service::to_object_path;
 use crate::session::SessionManager;
-use crate::state::{ServiceState, map_provider_error};
+use crate::state::{ServiceState, map_provider_error, map_provider_error_ss, map_zbus_error};
 
 #[derive(Clone)]
 pub struct CollectionState {
@@ -87,9 +89,9 @@ impl SecretCollection {
         properties: HashMap<String, zvariant::Value<'_>>,
         secret: zvariant::Value<'_>,
         replace: bool,
-    ) -> Result<(OwnedObjectPath, OwnedObjectPath), FdoError> {
+    ) -> Result<(OwnedObjectPath, OwnedObjectPath), SecretServiceError> {
         let write_provider = self.state.service_state.write_provider().ok_or_else(|| {
-            FdoError::NotSupported("no write-capable provider available".to_string())
+            SecretServiceError::NotSupported("no write-capable provider available".to_string())
         })?;
 
         let label = properties
@@ -127,16 +129,58 @@ impl SecretCollection {
             secrets,
         };
 
+        // Check if the write provider is locked — if so, defer the operation
+        // behind a prompt so the client can unlock first.
+        let provider_id = write_provider.id().to_string();
+        let is_locked = {
+            let p = Arc::clone(&write_provider);
+            self.state
+                .tokio_handle
+                .spawn(async move { p.status().await })
+                .await
+                .map_err(|e| SecretServiceError::Failed(format!("tokio task panicked: {e}")))?
+                .map_err(map_provider_error)?
+                .locked
+        };
+
+        if is_locked {
+            // Stash the operation and return a prompt path.
+            let op = PendingOperation::CreateItem {
+                provider_id: provider_id.clone(),
+                item,
+                replace,
+                items_cache: Arc::clone(&self.state.items),
+            };
+            let prompt_path = self
+                .state
+                .service_state
+                .allocate_prompt_with_operation(&provider_id, op);
+            let prompt_obj = SecretPrompt::new(
+                prompt_path.clone(),
+                provider_id,
+                Arc::clone(&self.state.service_state),
+            );
+            self.state
+                .service_state
+                .conn
+                .object_server()
+                .at(prompt_path.clone(), prompt_obj)
+                .await
+                .map_err(map_zbus_error)?;
+            // Return "/" for item path and the prompt path — client must
+            // complete the prompt before the item is created.
+            return Ok((to_object_path("/"), to_object_path(&prompt_path)));
+        }
+
         let provider = Arc::clone(&write_provider);
-        let provider_id = provider.id().to_string();
         let item_clone = item.clone();
         let id = self
             .state
             .tokio_handle
             .spawn(async move { provider.create_item(item_clone, replace).await })
             .await
-            .map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")))?
-            .map_err(map_provider_error)?;
+            .map_err(|e| SecretServiceError::Failed(format!("tokio task panicked: {e}")))?
+            .map_err(map_provider_error_ss)?;
 
         info!(item_id = %id, provider = %provider_id, "created item via D-Bus");
 

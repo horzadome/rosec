@@ -208,28 +208,83 @@ impl SecretService {
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), FdoError> {
         log_caller("Unlock", &header);
 
-        // Iterate providers in order.  All providers require interactive unlock.
-        // Return the first locked provider so the client allocates a Prompt and
-        // calls Prompt.Prompt(); if all are unlocked, return "/" immediately.
+        // Determine which providers are relevant based on the `objects` list.
+        //
+        // The Secret Service spec says Unlock() operates on the *requested*
+        // objects.  We must only prompt for providers that own those objects,
+        // not blindly iterate every provider.
+        //
+        // Object paths are either:
+        //   - Collection: /org/freedesktop/secrets/collection/<name>
+        //   - Item:       /org/freedesktop/secrets/item/<provider_id>/<item_id>
+        //
+        // When a collection path is passed, "unlocking" means making the
+        // collection usable — which succeeds as soon as *any* provider is
+        // unlocked (matching the Collection.Locked property semantics).
+
         let state = Arc::clone(&self.state);
+        let objects_for_task = objects.clone();
         let state2 = Arc::clone(&state);
-        let prompt_path_opt: Option<String> = state
+
+        let prompt_provider_opt: Option<String> = state
             .run_on_tokio(async move {
-                let mut first_locked: Option<String> = None;
-                for provider in state2.providers_ordered() {
-                    let status = provider.status().await.map_err(map_provider_error)?;
-                    if status.locked {
-                        first_locked = Some(provider.id().to_string());
-                        break;
+                // Collect the set of provider IDs referenced by item paths.
+                let mut item_provider_ids: Vec<String> = Vec::new();
+
+                for obj in &objects_for_task {
+                    let path = obj.as_str();
+                    if path.starts_with("/org/freedesktop/secrets/item/") {
+                        // Extract provider_id from the item path.
+                        if let Some(rest) = path.strip_prefix("/org/freedesktop/secrets/item/")
+                            && let Some(pid) = rest.split('/').next()
+                            && !item_provider_ids.contains(&pid.to_string())
+                        {
+                            item_provider_ids.push(pid.to_string());
+                        }
                     }
+                    // Collection paths and unknown paths are handled by the
+                    // fallback below (item_provider_ids stays empty).
                 }
-                Ok::<Option<String>, FdoError>(first_locked)
+
+                // If no objects were passed or only collection paths, check
+                // whether any provider is already unlocked.  If so, the
+                // collection is usable — return success immediately.
+                if item_provider_ids.is_empty() {
+                    // Collection-level unlock (or empty objects list).
+                    let mut first_locked: Option<String> = None;
+                    for provider in state2.providers_ordered() {
+                        let status = provider.status().await.map_err(map_provider_error)?;
+                        if !status.locked {
+                            // At least one provider is already unlocked — the
+                            // collection is usable.  No prompt needed.
+                            return Ok::<Option<String>, FdoError>(None);
+                        }
+                        if first_locked.is_none() {
+                            first_locked = Some(provider.id().to_string());
+                        }
+                    }
+                    // All providers locked — prompt for the first one.
+                    Ok(first_locked)
+                } else {
+                    // Item-level unlock — only prompt for providers that own
+                    // the requested items and are actually locked.
+                    for pid in &item_provider_ids {
+                        if let Some(provider) = state2.provider_by_id(pid) {
+                            let status = provider.status().await.map_err(map_provider_error)?;
+                            if status.locked {
+                                return Ok(Some(pid.clone()));
+                            }
+                        }
+                    }
+                    // All relevant providers are unlocked.
+                    Ok(None)
+                }
             })
             .await??;
 
-        match prompt_path_opt {
+        match prompt_provider_opt {
             None => {
-                // All providers unlocked — no prompt needed.
+                // All relevant providers unlocked — no prompt needed.
                 Ok((objects, to_object_path("/")))
             }
             Some(provider_id) => {

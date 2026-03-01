@@ -1,6 +1,7 @@
 pub mod collection;
 pub mod crypto;
 pub mod daemon;
+pub mod error;
 pub mod item;
 pub mod prompt;
 pub mod server;

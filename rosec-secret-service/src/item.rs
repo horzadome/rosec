@@ -8,9 +8,10 @@ use zbus::fdo::Error as FdoError;
 use zbus::interface;
 use zvariant::{ObjectPath, OwnedObjectPath};
 
+use crate::error::SecretServiceError;
 use crate::service::{build_secret_value, to_object_path};
 use crate::session::SessionManager;
-use crate::state::map_provider_error;
+use crate::state::{map_provider_error, map_provider_error_ss};
 
 #[derive(Clone)]
 pub struct ItemState {
@@ -24,8 +25,10 @@ pub struct ItemState {
     /// Tokio runtime handle — required to bridge zbus's async-io executor with
     /// provider futures that depend on the Tokio reactor (e.g. reqwest).
     pub tokio_handle: tokio::runtime::Handle,
-    /// Reference to service state for cache updates.
+    /// Reference to service state for cache updates and prompt allocation.
     pub items_cache: Arc<std::sync::Mutex<HashMap<String, ItemMeta>>>,
+    /// Service state — needed for prompt allocation on locked-provider operations.
+    pub service_state: Arc<crate::state::ServiceState>,
 }
 
 pub struct SecretItem {
@@ -80,13 +83,13 @@ impl SecretItem {
     async fn get_secret(
         &self,
         session: ObjectPath<'_>,
-    ) -> Result<zvariant::Value<'static>, FdoError> {
+    ) -> Result<zvariant::Value<'static>, SecretServiceError> {
         use wildmatch::WildMatch;
 
         let session = session.as_str();
         ensure_session(&self.state.sessions, session)?;
         if self.state.meta.locked {
-            return Err(FdoError::Failed("locked".to_string()));
+            return Err(SecretServiceError::IsLocked("item is locked".to_string()));
         }
         let aes_key = self
             .state
@@ -123,27 +126,63 @@ impl SecretItem {
             })
             .await
             .map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")))?
-            .map_err(map_provider_error)?;
+            .map_err(map_provider_error_ss)?;
 
-        build_secret_value(session, &secret, aes_key.as_deref())
+        Ok(build_secret_value(session, &secret, aes_key.as_deref())?)
     }
 
-    fn set_secret(&self, _secret: zvariant::Value) -> Result<(), FdoError> {
-        Err(FdoError::NotSupported(
+    fn set_secret(&self, _secret: zvariant::Value) -> Result<(), SecretServiceError> {
+        if self.state.meta.locked {
+            return Err(SecretServiceError::IsLocked("item is locked".to_string()));
+        }
+        Err(SecretServiceError::NotSupported(
             "use CreateItem with replace=true".to_string(),
         ))
     }
 
-    async fn delete(&self) -> Result<OwnedObjectPath, FdoError> {
+    async fn delete(&self) -> Result<OwnedObjectPath, SecretServiceError> {
         if !self
             .state
             .provider
             .capabilities()
             .contains(&Capability::Write)
         {
-            return Err(FdoError::NotSupported(
+            return Err(SecretServiceError::NotSupported(
                 "provider does not support write operations".to_string(),
             ));
+        }
+
+        // Check if the provider is locked — if so, return a prompt path so the
+        // client can trigger unlock before retrying.
+        if self.state.meta.locked {
+            let provider_id = self.state.provider.id().to_string();
+            let item_id = self.state.meta.id.clone();
+            let item_path = self.state.path.clone();
+            let items_cache = Arc::clone(&self.state.items_cache);
+
+            let prompt_path = self.state.service_state.allocate_prompt_with_operation(
+                &provider_id,
+                crate::prompt::PendingOperation::DeleteItem {
+                    provider_id: provider_id.clone(),
+                    item_id,
+                    item_path,
+                    items_cache,
+                },
+            );
+            let prompt_obj = crate::prompt::SecretPrompt::new(
+                prompt_path.clone(),
+                provider_id,
+                Arc::clone(&self.state.service_state),
+            );
+            let _: bool = self
+                .state
+                .service_state
+                .conn
+                .object_server()
+                .at(prompt_path.clone(), prompt_obj)
+                .await
+                .map_err(crate::state::map_zbus_error)?;
+            return Ok(to_object_path(&prompt_path));
         }
 
         let item_id = self.state.meta.id.clone();
@@ -157,8 +196,8 @@ impl SecretItem {
             .tokio_handle
             .spawn(async move { provider.delete_item(&item_id).await })
             .await
-            .map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")))?
-            .map_err(map_provider_error)?;
+            .map_err(|e| SecretServiceError::Failed(format!("tokio task panicked: {e}")))?
+            .map_err(map_provider_error_ss)?;
 
         info!(item_id = %item_id_for_log, provider = %provider_id, "deleted item via D-Bus");
 
@@ -259,11 +298,32 @@ mod tests {
         }
     }
 
+    async fn test_service_state(provider: Arc<dyn Provider>) -> Arc<crate::state::ServiceState> {
+        let router = Arc::new(rosec_core::router::Router::new(
+            rosec_core::router::RouterConfig {
+                dedup_strategy: rosec_core::DedupStrategy::Newest,
+                dedup_time_fallback: rosec_core::DedupTimeFallback::Created,
+            },
+        ));
+        let sessions = Arc::new(SessionManager::new());
+        let conn = zbus::Connection::session()
+            .await
+            .expect("test requires session bus");
+        Arc::new(crate::state::ServiceState::new(
+            vec![provider],
+            router,
+            sessions,
+            conn,
+            tokio::runtime::Handle::current(),
+        ))
+    }
+
     #[tokio::test]
     async fn get_secret_requires_valid_session() {
         let sessions = Arc::new(SessionManager::new());
-        let provider = Arc::new(MockProvider);
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider);
         let items_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let service_state = test_service_state(Arc::clone(&provider)).await;
         let state = ItemState {
             meta: meta(false),
             path: "/org/freedesktop/secrets/item/mock/one".to_string(),
@@ -272,6 +332,7 @@ mod tests {
             return_attr_patterns: vec![],
             tokio_handle: tokio::runtime::Handle::current(),
             items_cache,
+            service_state,
         };
         let item = SecretItem::new(state);
 
@@ -293,8 +354,9 @@ mod tests {
     #[tokio::test]
     async fn get_secret_fails_when_locked() {
         let sessions = Arc::new(SessionManager::new());
-        let provider = Arc::new(MockProvider);
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider);
         let items_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let service_state = test_service_state(Arc::clone(&provider)).await;
         let state = ItemState {
             meta: meta(true),
             path: "/org/freedesktop/secrets/item/mock/two".to_string(),
@@ -303,6 +365,7 @@ mod tests {
             return_attr_patterns: vec![],
             tokio_handle: tokio::runtime::Handle::current(),
             items_cache,
+            service_state,
         };
         let item = SecretItem::new(state);
 

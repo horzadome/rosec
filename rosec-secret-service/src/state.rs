@@ -135,6 +135,11 @@ pub struct ServiceState {
     /// `child_pid` is `Some` while a prompt subprocess is running; `None` for
     /// prompts that have already completed or been dismissed.
     pub active_prompts: Mutex<HashMap<String, (String, Option<u32>)>>,
+    /// Deferred operations to execute after a prompt (unlock) succeeds.
+    ///
+    /// Key: prompt D-Bus path.  Populated by `allocate_prompt_with_operation()`
+    /// and consumed by `take_pending_operation()` in `run_prompt_task` after unlock.
+    pending_operations: Mutex<HashMap<String, crate::prompt::PendingOperation>>,
     /// Prompt program configuration (binary path, theme, etc.).
     /// Behind a `RwLock` so it can be updated by the config hot-reload watcher
     /// without restarting the daemon.
@@ -242,6 +247,7 @@ impl ServiceState {
             prompt_counter: AtomicU32::new(0),
             metadata_cache: Arc::new(Mutex::new(HashMap::new())),
             active_prompts: Mutex::new(HashMap::new()),
+            pending_operations: Mutex::new(HashMap::new()),
             prompt_config: RwLock::new(prompt_config),
             live_config: Arc::new(RwLock::new(initial_config)),
         }
@@ -488,6 +494,38 @@ impl ServiceState {
             map.insert(path.clone(), (provider_id.to_string(), None));
         }
         path
+    }
+
+    /// Like [`allocate_prompt`](Self::allocate_prompt) but also stashes a
+    /// [`PendingOperation`](crate::prompt::PendingOperation) to execute after the
+    /// prompt (unlock) succeeds.
+    ///
+    /// Used by `CreateItem` / `Item.Delete` when the write provider is locked:
+    /// the D-Bus method returns the prompt path, and after the user completes
+    /// the unlock the deferred operation runs automatically.
+    pub fn allocate_prompt_with_operation(
+        &self,
+        provider_id: &str,
+        op: crate::prompt::PendingOperation,
+    ) -> String {
+        let path = self.allocate_prompt(provider_id);
+        if let Ok(mut map) = self.pending_operations.lock() {
+            map.insert(path.clone(), op);
+        }
+        path
+    }
+
+    /// Retrieve and remove the pending operation for a completed prompt.
+    ///
+    /// Returns `None` for plain unlock prompts (no deferred work).
+    pub fn take_pending_operation(
+        &self,
+        prompt_path: &str,
+    ) -> Option<crate::prompt::PendingOperation> {
+        self.pending_operations
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(prompt_path))
     }
 
     /// Store the child PID for an active prompt (called once the subprocess starts).
@@ -1463,7 +1501,9 @@ impl ServiceState {
             .map_err(|e| FdoError::Failed(format!("cache rebuild task panicked: {e}")))?
     }
 
-    pub(crate) async fn ensure_cache_inner(&self) -> Result<Vec<(String, ItemMeta)>, FdoError> {
+    pub(crate) async fn ensure_cache_inner(
+        self: &Arc<Self>,
+    ) -> Result<Vec<(String, ItemMeta)>, FdoError> {
         let has_items = self
             .items
             .lock()
@@ -1506,7 +1546,9 @@ impl ServiceState {
         Ok(entries)
     }
 
-    pub(crate) async fn rebuild_cache_inner(&self) -> Result<Vec<(String, ItemMeta)>, FdoError> {
+    pub(crate) async fn rebuild_cache_inner(
+        self: &Arc<Self>,
+    ) -> Result<Vec<(String, ItemMeta)>, FdoError> {
         let entries = self.fetch_entries().await?;
         self.register_items(&entries).await?;
 
@@ -1644,7 +1686,7 @@ impl ServiceState {
     }
 
     pub(crate) async fn register_items(
-        &self,
+        self: &Arc<Self>,
         entries: &[(String, ItemMeta)],
     ) -> Result<(), FdoError> {
         let server = self.conn.object_server();
@@ -1687,6 +1729,7 @@ impl ServiceState {
                 return_attr_patterns,
                 tokio_handle: self.tokio_handle.clone(),
                 items_cache: Arc::clone(&self.items),
+                service_state: Arc::clone(self),
             };
             server
                 .at(path.clone(), SecretItem::new(state))
@@ -1801,6 +1844,22 @@ pub(crate) fn map_provider_error(err: ProviderError) -> FdoError {
             warn!(error = %err, "internal provider error");
             FdoError::Failed("provider error".to_string())
         }
+    }
+}
+
+/// Map `ProviderError` to `SecretServiceError` with spec-correct `IsLocked`.
+///
+/// Use this instead of [`map_provider_error`] in D-Bus interface methods on
+/// `Item` and `Collection` where the Secret Service spec requires the
+/// `org.freedesktop.Secret.Error.IsLocked` error type.
+pub(crate) fn map_provider_error_ss(err: ProviderError) -> crate::error::SecretServiceError {
+    use crate::error::SecretServiceError;
+    match err {
+        ProviderError::Locked => SecretServiceError::IsLocked("item is locked".to_string()),
+        ProviderError::NotSupported => {
+            SecretServiceError::NotSupported("not supported".to_string())
+        }
+        other => SecretServiceError::from(map_provider_error(other)),
     }
 }
 
