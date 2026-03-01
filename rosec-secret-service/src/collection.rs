@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rosec_core::{ItemMeta, NewItem, Provider, SecretBytes};
+use rosec_core::{ATTR_PROVIDER, ItemMeta, NewItem, Provider, SecretBytes};
 use tracing::{debug, info};
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
@@ -12,7 +12,9 @@ use crate::error::SecretServiceError;
 use crate::prompt::{PendingOperation, SecretPrompt};
 use crate::service::to_object_path;
 use crate::session::SessionManager;
-use crate::state::{ServiceState, map_provider_error, map_provider_error_ss, map_zbus_error};
+use crate::state::{
+    ServiceState, make_item_path, map_provider_error, map_provider_error_ss, map_zbus_error,
+};
 
 #[derive(Clone)]
 pub struct CollectionState {
@@ -152,7 +154,6 @@ impl SecretCollection {
                 provider_id: provider_id.clone(),
                 item,
                 replace,
-                items_cache: Arc::clone(&self.state.items),
             };
             let prompt_path = self
                 .state
@@ -187,21 +188,28 @@ impl SecretCollection {
 
         info!(item_id = %id, provider = %provider_id, "created item via D-Bus");
 
-        let item_path = format!("/org/freedesktop/secrets/item/{}/{}", provider_id, id);
+        let item_path = make_item_path(&provider_id, &id);
 
-        let meta = rosec_core::ItemMeta {
+        let mut attrs = item.attributes.clone();
+        attrs
+            .entry(ATTR_PROVIDER.to_string())
+            .or_insert_with(|| provider_id.clone());
+
+        let meta = ItemMeta {
             id: id.clone(),
             provider_id: provider_id.clone(),
             label: item.label.clone(),
-            attributes: item.attributes.clone(),
+            attributes: attrs,
             created: Some(std::time::SystemTime::now()),
             modified: Some(std::time::SystemTime::now()),
             locked: false,
         };
 
-        if let Ok(mut items) = self.state.items.lock() {
-            items.insert(item_path.clone(), meta);
-        }
+        self.state
+            .service_state
+            .insert_created_item(&item_path, meta)
+            .await
+            .map_err(|e| SecretServiceError::Failed(format!("cache update failed: {e}")))?;
 
         Ok((to_object_path(&item_path), to_object_path("/")))
     }

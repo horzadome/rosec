@@ -83,7 +83,7 @@ impl SecretItem {
     async fn get_secret(
         &self,
         session: ObjectPath<'_>,
-    ) -> Result<SecretStruct, SecretServiceError> {
+    ) -> Result<(SecretStruct,), SecretServiceError> {
         use wildmatch::WildMatch;
 
         let session = session.as_str();
@@ -128,7 +128,7 @@ impl SecretItem {
             .map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")))?
             .map_err(map_provider_error_ss)?;
 
-        Ok(build_secret_value(session, &secret, aes_key.as_deref())?)
+        Ok((build_secret_value(session, &secret, aes_key.as_deref())?,))
     }
 
     fn set_secret(&self, _secret: SecretStruct) -> Result<(), SecretServiceError> {
@@ -158,7 +158,6 @@ impl SecretItem {
             let provider_id = self.state.provider.id().to_string();
             let item_id = self.state.meta.id.clone();
             let item_path = self.state.path.clone();
-            let items_cache = Arc::clone(&self.state.items_cache);
 
             let prompt_path = self.state.service_state.allocate_prompt_with_operation(
                 &provider_id,
@@ -166,7 +165,6 @@ impl SecretItem {
                     provider_id: provider_id.clone(),
                     item_id,
                     item_path,
-                    items_cache,
                 },
             );
             let prompt_obj = crate::prompt::SecretPrompt::new(
@@ -188,7 +186,6 @@ impl SecretItem {
         let item_id = self.state.meta.id.clone();
         let item_path = self.state.path.clone();
         let provider = Arc::clone(&self.state.provider);
-        let items_cache = Arc::clone(&self.state.items_cache);
         let provider_id = provider.id().to_string();
         let item_id_for_log = item_id.clone();
 
@@ -201,9 +198,7 @@ impl SecretItem {
 
         info!(item_id = %item_id_for_log, provider = %provider_id, "deleted item via D-Bus");
 
-        if let Ok(mut items) = items_cache.lock() {
-            items.remove(&item_path);
-        }
+        self.state.service_state.remove_deleted_item(&item_path);
 
         // No prompt needed — return "/" per the spec.
         Ok(to_object_path("/"))

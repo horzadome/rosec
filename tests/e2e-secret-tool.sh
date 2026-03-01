@@ -41,8 +41,8 @@ ATTR_VAL="e2e-$$"  # PID-scoped to avoid collisions across parallel runs
 pass=0
 fail=0
 
-pass() { ((pass++)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }
-fail() { ((fail++)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
+pass() { pass=$((pass + 1)); printf "  \033[32mPASS\033[0m %s\n" "$1"; }
+fail() { fail=$((fail + 1)); printf "  \033[31mFAIL\033[0m %s\n" "$1"; }
 
 cleanup() {
     # Best-effort removal of test items.
@@ -225,7 +225,7 @@ fi
 
 # Verify item is gone from rosec search too.
 rosec_kv=$("$ROSEC" search --format=kv "$ATTR_KEY"="$ATTR_VAL" 2>&1 || true)
-if [[ -z "$rosec_kv" ]]; then
+if [[ -z "$rosec_kv" || "$rosec_kv" == "No items found." ]]; then
     pass "item gone from rosec search"
 else
     fail "clear: item still visible in rosec search:\n$rosec_kv"

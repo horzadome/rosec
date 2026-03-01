@@ -1307,6 +1307,59 @@ impl ServiceState {
         Ok(partition_by_glob(cache.iter(), attrs))
     }
 
+    /// Insert a newly created item into both the `items` and `metadata_cache`
+    /// caches, and register the corresponding D-Bus object so that the item
+    /// is immediately visible to `SearchItems` / `GetSecret` without waiting
+    /// for the next background cache rebuild.
+    pub(crate) async fn insert_created_item(
+        self: &Arc<Self>,
+        path: &str,
+        meta: ItemMeta,
+    ) -> Result<(), FdoError> {
+        // 1. Insert into the items cache (Collection.Items, Collection.SearchItems).
+        if let Ok(mut items) = self.items.lock() {
+            items.insert(path.to_string(), meta.clone());
+        }
+        // 2. Insert into the persistent metadata cache (Service.SearchItems).
+        if let Ok(mut cache) = self.metadata_cache.lock() {
+            cache.insert(path.to_string(), meta.clone());
+        }
+        // 3. If a D-Bus object already exists at this path (replace/update
+        //    path), remove it so register_items will create a fresh one with
+        //    updated metadata (label, attributes, etc.).
+        let already_registered = self
+            .registered_items
+            .lock()
+            .map(|r| r.contains(path))
+            .unwrap_or(false);
+        if already_registered {
+            let server = self.conn.object_server();
+            // Ignore errors — the object might already be gone.
+            let _ = server.remove::<SecretItem, _>(path).await;
+            if let Ok(mut registered) = self.registered_items.lock() {
+                registered.remove(path);
+            }
+        }
+        // 4. Register the D-Bus object so GetSecret works on the new path.
+        self.register_items(&[(path.to_string(), meta)]).await?;
+        Ok(())
+    }
+
+    /// Remove a deleted item from both the `items` and `metadata_cache`
+    /// caches so it disappears from `SearchItems` immediately.
+    pub(crate) fn remove_deleted_item(&self, path: &str) {
+        if let Ok(mut items) = self.items.lock() {
+            items.remove(path);
+        }
+        if let Ok(mut cache) = self.metadata_cache.lock() {
+            cache.remove(path);
+        }
+        // Note: we do NOT deregister the D-Bus object here. zbus keeps
+        // it registered but it will fail with NotFound on GetSecret
+        // because the provider no longer has the item. The next cache
+        // rebuild will skip registering it again (already registered).
+    }
+
     /// Mark all items belonging to a specific provider as locked in the
     /// persistent metadata cache.
     ///

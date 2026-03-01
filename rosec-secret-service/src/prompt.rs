@@ -8,16 +8,15 @@
 //!
 //! This keeps credentials entirely inside rosecd — nothing crosses D-Bus.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use rosec_core::{ItemMeta, NewItem};
+use rosec_core::{ATTR_PROVIDER, ItemMeta, NewItem};
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
 use zeroize::Zeroizing;
 
 use crate::service::to_object_path;
-use crate::state::{ServiceState, map_provider_error};
+use crate::state::{ServiceState, make_item_path, map_provider_error};
 use rosec_core::UnlockInput;
 
 /// A deferred operation to execute after a successful unlock prompt.
@@ -36,7 +35,6 @@ pub enum PendingOperation {
         provider_id: String,
         item: NewItem,
         replace: bool,
-        items_cache: Arc<std::sync::Mutex<HashMap<String, ItemMeta>>>,
     },
 
     /// Deferred `Item.Delete`: execute `provider.delete_item()` after unlock.
@@ -44,7 +42,6 @@ pub enum PendingOperation {
         provider_id: String,
         item_id: String,
         item_path: String,
-        items_cache: Arc<std::sync::Mutex<HashMap<String, ItemMeta>>>,
     },
 }
 
@@ -251,17 +248,12 @@ async fn run_prompt_task(
                         provider_id: pid,
                         item,
                         replace,
-                        items_cache,
-                    }) => execute_deferred_create(&state, &pid, item, replace, items_cache).await,
+                    }) => execute_deferred_create(&state, &pid, item, replace).await,
                     Some(PendingOperation::DeleteItem {
                         provider_id: pid,
                         item_id,
                         item_path,
-                        items_cache,
-                    }) => {
-                        execute_deferred_delete(&state, &pid, &item_id, &item_path, items_cache)
-                            .await
-                    }
+                    }) => execute_deferred_delete(&state, &pid, &item_id, &item_path).await,
                     Some(PendingOperation::Unlock) | None => {
                         // Plain unlock — return the collection path.
                         Some(zvariant::Value::from(to_object_path(
@@ -323,7 +315,6 @@ async fn execute_deferred_create(
     provider_id: &str,
     item: NewItem,
     replace: bool,
-    items_cache: Arc<std::sync::Mutex<HashMap<String, ItemMeta>>>,
 ) -> Option<zvariant::Value<'static>> {
     let provider = state.provider_by_id(provider_id)?;
     let provider_for_spawn = Arc::clone(&provider);
@@ -347,20 +338,25 @@ async fn execute_deferred_create(
     tracing::info!(item_id = %id, provider = %provider_id,
         "created item via deferred Prompt");
 
-    let item_path = format!("/org/freedesktop/secrets/item/{provider_id}/{id}");
+    let item_path = make_item_path(provider_id, &id);
+
+    let mut attrs = item.attributes;
+    attrs
+        .entry(ATTR_PROVIDER.to_string())
+        .or_insert_with(|| provider_id.to_string());
 
     let meta = ItemMeta {
         id,
         provider_id: provider_id.to_string(),
         label: item.label,
-        attributes: item.attributes,
+        attributes: attrs,
         created: Some(std::time::SystemTime::now()),
         modified: Some(std::time::SystemTime::now()),
         locked: false,
     };
 
-    if let Ok(mut items) = items_cache.lock() {
-        items.insert(item_path.clone(), meta);
+    if let Err(e) = state.insert_created_item(&item_path, meta).await {
+        tracing::warn!(error = %e, "failed to register deferred item in cache");
     }
 
     Some(zvariant::Value::from(to_object_path(&item_path)))
@@ -374,7 +370,6 @@ async fn execute_deferred_delete(
     provider_id: &str,
     item_id: &str,
     item_path: &str,
-    items_cache: Arc<std::sync::Mutex<HashMap<String, ItemMeta>>>,
 ) -> Option<zvariant::Value<'static>> {
     let provider = state.provider_by_id(provider_id)?;
     let id = item_id.to_string();
@@ -398,9 +393,7 @@ async fn execute_deferred_delete(
     tracing::info!(item_id = %item_id, provider = %provider_id,
         "deleted item via deferred Prompt");
 
-    if let Ok(mut items) = items_cache.lock() {
-        items.remove(item_path);
-    }
+    state.remove_deleted_item(item_path);
 
     Some(zvariant::Value::from(to_object_path("/")))
 }
