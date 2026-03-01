@@ -26,7 +26,7 @@ pub type Attributes = HashMap<String, String>;
 
 /// Reserved attribute names that cannot be set by users.
 ///
-/// These correspond to item fields that are managed by the backend or have
+/// These correspond to item fields that are managed by the provider or have
 /// special meaning (id, label, timestamps, type discriminator).
 pub const RESERVED_ATTRIBUTES: &[&str] = &["id", "label", "created", "modified", "type"];
 
@@ -220,7 +220,7 @@ impl<'de> Deserialize<'de> for SecretBytes {
     }
 }
 
-/// The kind of input a backend field expects.
+/// The kind of input a provider field expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthFieldKind {
     /// Visible free-text (e.g. email address, organisation UUID).
@@ -279,8 +279,8 @@ pub struct RegistrationInfo {
 /// accidentally written to logs, D-Bus responses, or disk.
 #[derive(Clone)]
 pub enum UnlockInput {
-    /// Standard password-only unlock (master password for PM backends, or a
-    /// locally-derived key for token-based backends that use local encryption).
+    /// Standard password-only unlock (master password for PM providers, or a
+    /// locally-derived key for token-based providers that use local encryption).
     Password(Zeroizing<String>),
     /// Password + registration credentials, supplied when the provider previously
     /// returned `ProviderError::RegistrationRequired`.
@@ -459,7 +459,7 @@ impl std::fmt::Debug for SshPrivateKeyMaterial {
 }
 
 // ---------------------------------------------------------------------------
-// Backend event callbacks
+// Provider event callbacks
 // ---------------------------------------------------------------------------
 
 /// Callback type alias: a cheaply-cloneable, send-safe, zero-argument closure.

@@ -39,7 +39,7 @@ impl RosecSearch {
     /// any spec-compliant method afterwards.
     ///
     /// Reads from the persistent metadata cache which survives lock/unlock
-    /// cycles: items from locked backends are returned in the `locked` list
+    /// cycles: items from locked providers are returned in the `locked` list
     /// rather than causing an error.
     async fn search_items_glob(
         &self,

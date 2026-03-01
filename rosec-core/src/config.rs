@@ -27,8 +27,8 @@ pub struct ServiceConfig {
     /// Provider ID for write operations (create_item, update_item, delete_item).
     /// If not set, defaults to the first provider that supports writes.
     #[serde(default)]
-    pub write_backend: Option<String>,
-    /// Allowed executable paths for `AuthBackendFromPipe` callers.
+    pub write_provider: Option<String>,
+    /// Allowed executable paths for `AuthProviderFromPipe` callers.
     ///
     /// The daemon resolves the caller's PID via D-Bus `GetConnectionCredentials`
     /// and checks `/proc/<pid>/exe` against this list.  If the caller's binary
@@ -47,7 +47,7 @@ impl Default for ServiceConfig {
             dedup_strategy: default_dedup_strategy(),
             dedup_time_fallback: default_dedup_time_fallback(),
             refresh_interval_secs: None,
-            write_backend: None,
+            write_provider: None,
             pam_helper_paths: default_pam_helper_paths(),
         }
     }
@@ -128,7 +128,7 @@ impl Default for PromptTheme {
 
 /// A unified provider configuration entry.
 ///
-/// Covers both local vaults (`kind = "local"`) and external backends
+/// Covers both local vaults (`kind = "local"`) and external providers
 /// (`kind = "bitwarden"`, `"bitwarden-sm"`, etc.).
 ///
 /// `Debug` is manually implemented to redact known sensitive option keys
@@ -148,7 +148,7 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Backend-specific options (e.g. `email`, `base_url`, `organization_id`).
+    /// Provider-specific options (e.g. `email`, `base_url`, `organization_id`).
     ///
     /// Not used by `kind = "local"` providers.
     #[serde(default)]

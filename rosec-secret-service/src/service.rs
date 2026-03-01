@@ -11,7 +11,7 @@ use zvariant::OwnedObjectPath;
 use crate::crypto::aes128_cbc_encrypt;
 use crate::prompt::SecretPrompt;
 use crate::session_iface::SecretSession;
-use crate::state::{ServiceState, map_backend_error, map_zbus_error};
+use crate::state::{ServiceState, map_provider_error, map_zbus_error};
 
 /// Log the D-Bus caller at debug level for a given method name.
 fn log_caller(method: &str, header: &Header<'_>) {
@@ -59,7 +59,7 @@ impl SecretService {
             .state
             .sessions
             .open_session(algorithm, &input)
-            .map_err(map_backend_error)?;
+            .map_err(map_provider_error)?;
 
         // Register the org.freedesktop.Secret.Session object at the session path
         let session_obj = SecretSession::new(path.clone(), Arc::clone(&self.state.sessions));
@@ -80,8 +80,8 @@ impl SecretService {
         log_caller("SearchItems", &header);
         self.state.touch_activity();
         // Per the Secret Service spec, SearchItems is a metadata-only operation
-        // that MUST never error when backends are locked.  Items from locked
-        // backends are returned in the `locked` list.  Read from the persistent
+        // that MUST never error when providers are locked.  Items from locked
+        // providers are returned in the `locked` list.  Read from the persistent
         // metadata_cache which survives lock/unlock cycles.
         let (unlocked, locked) = self.state.search_metadata_cache(&attributes)?;
         Ok((
@@ -104,7 +104,7 @@ impl SecretService {
             .state
             .sessions
             .get_session_key(session)
-            .map_err(map_backend_error)?;
+            .map_err(map_provider_error)?;
         let item_paths: Vec<String> = items.iter().map(|p| p.as_str().to_string()).collect();
         let resolved = self.state.resolve_items(None, Some(&item_paths)).await?;
         let mut secrets = HashMap::new();
@@ -112,10 +112,10 @@ impl SecretService {
             if item.locked {
                 continue;
             }
-            let backend = self
+            let provider = self
                 .state
-                .backend_by_id(&item.provider_id)
-                .or_else(|| self.state.backends_ordered().into_iter().next())
+                .provider_by_id(&item.provider_id)
+                .or_else(|| self.state.providers_ordered().into_iter().next())
                 .ok_or_else(|| {
                     FdoError::Failed(format!(
                         "no provider for item provider_id '{}'",
@@ -126,7 +126,7 @@ impl SecretService {
             let state = Arc::clone(&self.state);
             let secret_result = self
                 .state
-                .run_on_tokio(async move { state.resolve_primary_secret(backend, &item_id).await })
+                .run_on_tokio(async move { state.resolve_primary_secret(provider, &item_id).await })
                 .await?;
             // Skip items that have no primary secret (e.g. login without
             // password, empty secure note) rather than failing the entire
@@ -137,7 +137,7 @@ impl SecretService {
                 Err(ProviderError::Other(_)) => continue,
                 Err(ProviderError::NotFound) => continue,
                 Err(ProviderError::Locked) => continue,
-                Err(e) => return Err(map_backend_error(e)),
+                Err(e) => return Err(map_provider_error(e)),
             };
             let value = build_secret_value(session, &secret, aes_key.as_deref())?;
             secrets.insert(to_object_path(&path), value);
@@ -154,7 +154,7 @@ impl SecretService {
         self.state
             .sessions
             .close_session(session.as_str())
-            .map_err(map_backend_error)
+            .map_err(map_provider_error)
     }
 
     fn read_alias(
@@ -188,13 +188,13 @@ impl SecretService {
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), FdoError> {
         log_caller("Lock", &header);
-        for backend in self.state.backends_ordered() {
-            let bid = backend.id().to_string();
+        for provider in self.state.providers_ordered() {
+            let pid = provider.id().to_string();
             self.state
-                .run_on_tokio(async move { backend.lock().await })
+                .run_on_tokio(async move { provider.lock().await })
                 .await?
-                .map_err(map_backend_error)?;
-            self.state.mark_backend_locked_in_cache(&bid);
+                .map_err(map_provider_error)?;
+            self.state.mark_provider_locked_in_cache(&pid);
         }
         self.state.mark_locked();
         // Return the requested objects as "locked" and no prompt needed
@@ -208,18 +208,18 @@ impl SecretService {
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), FdoError> {
         log_caller("Unlock", &header);
 
-        // Iterate backends in order.  All backends require interactive unlock.
-        // Return the first locked backend so the client allocates a Prompt and
+        // Iterate providers in order.  All providers require interactive unlock.
+        // Return the first locked provider so the client allocates a Prompt and
         // calls Prompt.Prompt(); if all are unlocked, return "/" immediately.
         let state = Arc::clone(&self.state);
         let state2 = Arc::clone(&state);
         let prompt_path_opt: Option<String> = state
             .run_on_tokio(async move {
                 let mut first_locked: Option<String> = None;
-                for backend in state2.backends_ordered() {
-                    let status = backend.status().await.map_err(map_backend_error)?;
+                for provider in state2.providers_ordered() {
+                    let status = provider.status().await.map_err(map_provider_error)?;
                     if status.locked {
-                        first_locked = Some(backend.id().to_string());
+                        first_locked = Some(provider.id().to_string());
                         break;
                     }
                 }
@@ -229,14 +229,14 @@ impl SecretService {
 
         match prompt_path_opt {
             None => {
-                // All backends unlocked — no prompt needed.
+                // All providers unlocked — no prompt needed.
                 Ok((objects, to_object_path("/")))
             }
-            Some(backend_id) => {
+            Some(provider_id) => {
                 // Allocate a unique prompt path and register the object.
-                let prompt_path = self.state.allocate_prompt(&backend_id);
+                let prompt_path = self.state.allocate_prompt(&provider_id);
                 let prompt_obj =
-                    SecretPrompt::new(prompt_path.clone(), backend_id, Arc::clone(&self.state));
+                    SecretPrompt::new(prompt_path.clone(), provider_id, Arc::clone(&self.state));
                 self.state
                     .conn
                     .object_server()
@@ -284,7 +284,7 @@ pub(crate) fn build_secret_value(
     let (parameters, value) = if let Some(key) = aes_key {
         // DH-encrypted session: AES-128-CBC with random IV
         let (iv, ciphertext) =
-            aes128_cbc_encrypt(key, secret.as_slice()).map_err(map_backend_error)?;
+            aes128_cbc_encrypt(key, secret.as_slice()).map_err(map_provider_error)?;
         (iv, ciphertext)
     } else {
         // Plain session: no parameters, raw plaintext value

@@ -38,7 +38,7 @@ async fn run() -> Result<()> {
 
     // Security hardening: disable core dumps, lock memory pages.
     // Called immediately after logging is initialised so warnings are visible,
-    // but before any backends are constructed or secrets are touched.
+    // but before any providers are constructed or secrets are touched.
     bootstrap::secure_bootstrap();
 
     let config_path = parse_config_path();
@@ -142,7 +142,7 @@ async fn run() -> Result<()> {
 
     tracing::info!("rosecd ready on session bus");
 
-    // Config file watcher — hot-reload backends when config.toml changes.
+    // Config file watcher — hot-reload providers when config.toml changes.
     {
         let watch_state = Arc::clone(&state);
         let watch_path = config_path.clone();
@@ -202,7 +202,7 @@ async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
 
         let mut did_any_work = false;
 
-        for provider in state.backends_ordered() {
+        for provider in state.providers_ordered() {
             let provider_id = provider.id().to_string();
             let locked = match provider.status().await {
                 Ok(s) => s.locked,
@@ -220,7 +220,7 @@ async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
             match provider.check_remote_changed().await {
                 Ok(true) => {
                     tracing::debug!(provider = %provider_id, "background: remote changed, syncing");
-                    match state.try_sync_backend(&provider_id).await {
+                    match state.try_sync_provider(&provider_id).await {
                         Ok(true) => {
                             tracing::debug!(provider = %provider_id, "background: sync ok");
                             did_any_work = true;
@@ -281,7 +281,7 @@ async fn autolock_loop(
 
         let mut any_locked = false;
 
-        for provider in state.backends_ordered() {
+        for provider in state.providers_ordered() {
             let provider_id = provider.id().to_string();
             let policy = state.effective_autolock_policy(&provider_id);
 
@@ -295,7 +295,7 @@ async fn autolock_loop(
                     idle_minutes = idle_min,
                     "idle timeout expired, locking provider"
                 );
-                if let Err(e) = state.auto_lock_backend(&provider_id).await {
+                if let Err(e) = state.auto_lock_provider(&provider_id).await {
                     tracing::warn!(provider = %provider_id, "auto-lock failed: {e}");
                 } else {
                     any_locked = true;
@@ -306,14 +306,14 @@ async fn autolock_loop(
             // Check max-unlocked timeout (0 means disabled).
             if let Some(max_min) = policy.max_unlocked_minutes
                 && max_min != 0
-                && state.is_backend_max_unlocked_expired(&provider_id, max_min)
+                && state.is_provider_max_unlocked_expired(&provider_id, max_min)
             {
                 tracing::info!(
                     provider = %provider_id,
                     max_minutes = max_min,
                     "max-unlocked timeout expired, locking provider"
                 );
-                if let Err(e) = state.auto_lock_backend(&provider_id).await {
+                if let Err(e) = state.auto_lock_provider(&provider_id).await {
                     tracing::warn!(provider = %provider_id, "auto-lock failed: {e}");
                 } else {
                     any_locked = true;
@@ -321,7 +321,7 @@ async fn autolock_loop(
             }
         }
 
-        if any_locked && state.all_backends_locked() {
+        if any_locked && state.all_providers_locked() {
             if let Some(ref sm) = ssh_manager {
                 sm.clear();
             }
@@ -555,7 +555,7 @@ async fn logind_watcher(
                             if session_id.as_deref() == Some(&removed_id) {
                                 // Check per-provider on_logout policies.
                                 let mut any_locked = false;
-                                for provider in state.backends_ordered() {
+                                for provider in state.providers_ordered() {
                                     let pid = provider.id().to_string();
                                     let policy = state.effective_autolock_policy(&pid);
                                     if policy.on_logout {
@@ -564,14 +564,14 @@ async fn logind_watcher(
                                             provider = %pid,
                                             "logind: our session removed — locking provider"
                                         );
-                                        if let Err(e) = state.auto_lock_backend(&pid).await {
+                                        if let Err(e) = state.auto_lock_provider(&pid).await {
                                             tracing::warn!(provider = %pid, "auto-lock on logout failed: {e}");
                                         } else {
                                             any_locked = true;
                                         }
                                     }
                                 }
-                                if any_locked && state.all_backends_locked() {
+                                if any_locked && state.all_providers_locked() {
                                     if let Some(ref sm) = ssh_manager {
                                         sm.clear();
                                     }
@@ -593,7 +593,7 @@ async fn logind_watcher(
                     Some(Ok(_)) => {
                         // Check per-provider on_session_lock policies.
                         let mut any_locked = false;
-                        for provider in state.backends_ordered() {
+                        for provider in state.providers_ordered() {
                             let pid = provider.id().to_string();
                             let policy = state.effective_autolock_policy(&pid);
                             if policy.on_session_lock {
@@ -601,14 +601,14 @@ async fn logind_watcher(
                                     provider = %pid,
                                     "logind: session Lock signal — locking provider"
                                 );
-                                if let Err(e) = state.auto_lock_backend(&pid).await {
+                                if let Err(e) = state.auto_lock_provider(&pid).await {
                                     tracing::warn!(provider = %pid, "auto-lock on session lock failed: {e}");
                                 } else {
                                     any_locked = true;
                                 }
                             }
                         }
-                        if any_locked && state.all_backends_locked() {
+                        if any_locked && state.all_providers_locked() {
                             if let Some(ref sm) = ssh_manager {
                                 sm.clear();
                             }
@@ -655,7 +655,7 @@ fn wire_provider_callbacks(
 ) {
     use rosec_core::ProviderCallbacks;
 
-    for provider in state.backends_ordered() {
+    for provider in state.providers_ordered() {
         let provider_id = provider.id().to_string();
 
         // --- Lifecycle event callbacks (all providers via trait) ---
@@ -684,7 +684,7 @@ fn wire_provider_callbacks(
                 let s = Arc::clone(&providers_for_unlock);
                 tokio::spawn(async move {
                     if let Some(ref sm) = sm {
-                        let providers = s.backends_ordered();
+                        let providers = s.providers_ordered();
                         sm.rebuild(&providers).await;
                     }
                 });
@@ -704,7 +704,7 @@ fn wire_provider_callbacks(
                 let id = synced_id.clone();
                 tokio::spawn(async move {
                     if let Some(ref sm) = sm {
-                        let providers = s.backends_ordered();
+                        let providers = s.providers_ordered();
                         tracing::debug!(provider = %id, "sync changed vault — rebuilding SSH keys");
                         sm.rebuild(&providers).await;
                     }
@@ -717,7 +717,7 @@ fn wire_provider_callbacks(
                 let s = Arc::clone(&sync_state);
                 let id = nudge_sync_id.clone();
                 tokio::spawn(async move {
-                    match s.try_sync_backend(&id).await {
+                    match s.try_sync_provider(&id).await {
                         Ok(true) => tracing::debug!(provider = %id, "remote nudge: sync triggered"),
                         Ok(false) => {
                             tracing::debug!(provider = %id, "remote nudge: sync already in progress")
@@ -922,7 +922,7 @@ async fn config_watcher(
 
     // Ensure the config directory exists so the watcher can be set up even
     // when rosecd starts before any config file has been written (e.g. on
-    // first run before `rosec backend add` has been called).
+    // first run before `rosec provider add` has been called).
     std::fs::create_dir_all(watch_dir).map_err(|e| {
         anyhow::anyhow!(
             "cannot create config directory {}: {e}",
@@ -986,7 +986,7 @@ async fn config_watcher(
 
         let known_ids: HashSet<&str> = known.iter().map(|(id, _)| id.as_str()).collect();
 
-        // Remove backends that are gone or changed (changed = remove + re-add).
+        // Remove providers that are gone or changed (changed = remove + re-add).
         let known_map: std::collections::HashMap<&str, &str> = known
             .iter()
             .map(|(id, fp)| (id.as_str(), fp.as_str()))
@@ -1000,7 +1000,7 @@ async fn config_watcher(
             let changed = new_map
                 .get(id)
                 .is_none_or(|new_fp| known_map.get(id) != Some(new_fp));
-            if changed && state.hotreload_remove_backend(id).await {
+            if changed && state.hotreload_remove_provider(id).await {
                 tracing::info!(provider_id = id, "hot-reload: removed provider");
                 // Evict this provider's SSH keys immediately.
                 if let Some(ref sm) = ssh_manager {
@@ -1022,13 +1022,13 @@ async fn config_watcher(
                 match entry.kind.as_str() {
                     "local" => {
                         let provider = build_vault_provider(entry);
-                        state.hotreload_add_backend(provider);
+                        state.hotreload_add_provider(provider);
                         tracing::info!(vault_id = id, "hot-reload: added vault");
                         added_any = true;
                     }
                     _ => match build_single_provider(entry).await {
                         Ok(provider) => {
-                            state.hotreload_add_backend(provider);
+                            state.hotreload_add_provider(provider);
                             tracing::info!(provider_id = id, "hot-reload: added provider");
                             added_any = true;
                         }
@@ -1097,7 +1097,7 @@ async fn config_watcher(
         known = new_fingerprints;
         tracing::info!(
             "hot-reload complete ({} providers active)",
-            state.backend_count()
+            state.provider_count()
         );
     }
 
@@ -1109,7 +1109,7 @@ async fn config_watcher(
 /// Extracted from `build_providers` so the hot-reload watcher can reuse it
 /// without re-parsing the whole config.
 ///
-/// All providers are returned locked; the daemon unlocks them via `AuthBackend`
+/// All providers are returned locked; the daemon unlocks them via `AuthProvider`
 /// D-Bus calls once the user supplies credentials interactively.
 async fn build_single_provider(
     entry: &rosec_core::config::ProviderEntry,

@@ -10,13 +10,13 @@ use zvariant::OwnedObjectPath;
 use crate::crypto::aes128_cbc_decrypt;
 use crate::service::to_object_path;
 use crate::session::SessionManager;
-use crate::state::{ServiceState, map_backend_error};
+use crate::state::{ServiceState, map_provider_error};
 
 #[derive(Clone)]
 pub struct CollectionState {
     pub label: String,
     pub items: Arc<Mutex<HashMap<String, ItemMeta>>>,
-    pub backends: Vec<Arc<dyn Provider>>,
+    pub providers: Vec<Arc<dyn Provider>>,
     pub service_state: Arc<ServiceState>,
     pub sessions: Arc<SessionManager>,
     pub tokio_handle: tokio::runtime::Handle,
@@ -41,8 +41,8 @@ impl SecretCollection {
 
     #[zbus(property)]
     async fn locked(&self) -> bool {
-        for backend in &self.state.backends {
-            match backend.status().await {
+        for provider in &self.state.providers {
+            match provider.status().await {
                 Ok(s) if !s.locked => return false,
                 _ => {}
             }
@@ -88,8 +88,8 @@ impl SecretCollection {
         secret: zvariant::Value<'_>,
         replace: bool,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), FdoError> {
-        let write_backend = self.state.service_state.write_backend().ok_or_else(|| {
-            FdoError::NotSupported("no write-capable backend available".to_string())
+        let write_provider = self.state.service_state.write_provider().ok_or_else(|| {
+            FdoError::NotSupported("no write-capable provider available".to_string())
         })?;
 
         let label = properties
@@ -108,11 +108,11 @@ impl SecretCollection {
             .state
             .sessions
             .get_session_key(&session_path)
-            .map_err(map_backend_error)?;
+            .map_err(map_provider_error)?;
 
         let plaintext: Vec<u8> = if let Some(key) = aes_key.as_deref() {
             aes128_cbc_decrypt(key, &parameters, &secret_value)
-                .map_err(map_backend_error)?
+                .map_err(map_provider_error)?
                 .to_vec()
         } else {
             secret_value
@@ -127,24 +127,24 @@ impl SecretCollection {
             secrets,
         };
 
-        let backend = Arc::clone(&write_backend);
-        let backend_id = backend.id().to_string();
+        let provider = Arc::clone(&write_provider);
+        let provider_id = provider.id().to_string();
         let item_clone = item.clone();
         let id = self
             .state
             .tokio_handle
-            .spawn(async move { backend.create_item(item_clone, replace).await })
+            .spawn(async move { provider.create_item(item_clone, replace).await })
             .await
             .map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")))?
-            .map_err(map_backend_error)?;
+            .map_err(map_provider_error)?;
 
-        info!(item_id = %id, backend = %backend_id, "created item via D-Bus");
+        info!(item_id = %id, provider = %provider_id, "created item via D-Bus");
 
-        let item_path = format!("/org/freedesktop/secrets/item/{}/{}", backend_id, id);
+        let item_path = format!("/org/freedesktop/secrets/item/{}/{}", provider_id, id);
 
         let meta = rosec_core::ItemMeta {
             id: id.clone(),
-            provider_id: backend_id.clone(),
+            provider_id: provider_id.clone(),
             label: item.label.clone(),
             attributes: item.attributes.clone(),
             created: Some(std::time::SystemTime::now()),

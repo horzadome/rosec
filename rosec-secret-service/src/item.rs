@@ -10,13 +10,13 @@ use zvariant::{ObjectPath, OwnedObjectPath};
 
 use crate::service::{build_secret_value, to_object_path};
 use crate::session::SessionManager;
-use crate::state::map_backend_error;
+use crate::state::map_provider_error;
 
 #[derive(Clone)]
 pub struct ItemState {
     pub meta: ItemMeta,
     pub path: String,
-    pub backend: Arc<dyn Provider>,
+    pub provider: Arc<dyn Provider>,
     pub sessions: Arc<SessionManager>,
     /// Ordered glob patterns for selecting which sensitive attribute to return
     /// from `GetSecret`.  Derived from the provider's `return_attr` config.
@@ -92,9 +92,9 @@ impl SecretItem {
             .state
             .sessions
             .get_session_key(session)
-            .map_err(map_backend_error)?;
+            .map_err(map_provider_error)?;
 
-        let backend = Arc::clone(&self.state.backend);
+        let provider = Arc::clone(&self.state.provider);
         let item_id = self.state.meta.id.clone();
         let patterns = self.state.return_attr_patterns.clone();
 
@@ -103,12 +103,12 @@ impl SecretItem {
             .tokio_handle
             .spawn(async move {
                 // Try return_attr resolution first.
-                match backend.get_item_attributes(&item_id).await {
+                match provider.get_item_attributes(&item_id).await {
                     Ok(ia) => {
                         for pattern in &patterns {
                             let wm = WildMatch::new(pattern);
                             if let Some(matched) = ia.secret_names.iter().find(|n| wm.matches(n)) {
-                                match backend.get_secret_attr(&item_id, matched).await {
+                                match provider.get_secret_attr(&item_id, matched).await {
                                     Ok(s) => return Ok(s),
                                     Err(ProviderError::NotFound) => continue,
                                     Err(e) => return Err(e),
@@ -116,14 +116,14 @@ impl SecretItem {
                             }
                         }
                         // No pattern matched — fall back to primary_secret.
-                        rosec_core::primary_secret(&*backend, &item_id).await
+                        rosec_core::primary_secret(&*provider, &item_id).await
                     }
                     Err(e) => Err(e),
                 }
             })
             .await
             .map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")))?
-            .map_err(map_backend_error)?;
+            .map_err(map_provider_error)?;
 
         build_secret_value(session, &secret, aes_key.as_deref())
     }
@@ -137,7 +137,7 @@ impl SecretItem {
     async fn delete(&self) -> Result<OwnedObjectPath, FdoError> {
         if !self
             .state
-            .backend
+            .provider
             .capabilities()
             .contains(&Capability::Write)
         {
@@ -148,19 +148,19 @@ impl SecretItem {
 
         let item_id = self.state.meta.id.clone();
         let item_path = self.state.path.clone();
-        let backend = Arc::clone(&self.state.backend);
+        let provider = Arc::clone(&self.state.provider);
         let items_cache = Arc::clone(&self.state.items_cache);
-        let backend_id = backend.id().to_string();
+        let provider_id = provider.id().to_string();
         let item_id_for_log = item_id.clone();
 
         self.state
             .tokio_handle
-            .spawn(async move { backend.delete_item(&item_id).await })
+            .spawn(async move { provider.delete_item(&item_id).await })
             .await
             .map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")))?
-            .map_err(map_backend_error)?;
+            .map_err(map_provider_error)?;
 
-        info!(item_id = %item_id_for_log, backend = %backend_id, "deleted item via D-Bus");
+        info!(item_id = %item_id_for_log, provider = %provider_id, "deleted item via D-Bus");
 
         if let Ok(mut items) = items_cache.lock() {
             items.remove(&item_path);
@@ -172,7 +172,7 @@ impl SecretItem {
 }
 
 fn ensure_session(sessions: &SessionManager, session: &str) -> Result<(), FdoError> {
-    sessions.validate(session).map_err(map_backend_error)
+    sessions.validate(session).map_err(map_provider_error)
 }
 
 #[cfg(test)]
@@ -184,10 +184,10 @@ mod tests {
     };
 
     #[derive(Debug)]
-    struct MockBackend;
+    struct MockProvider;
 
     #[async_trait::async_trait]
-    impl Provider for MockBackend {
+    impl Provider for MockProvider {
         fn id(&self) -> &str {
             "mock"
         }
@@ -262,12 +262,12 @@ mod tests {
     #[tokio::test]
     async fn get_secret_requires_valid_session() {
         let sessions = Arc::new(SessionManager::new());
-        let backend = Arc::new(MockBackend);
+        let provider = Arc::new(MockProvider);
         let items_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let state = ItemState {
             meta: meta(false),
             path: "/org/freedesktop/secrets/item/mock/one".to_string(),
-            backend,
+            provider,
             sessions: sessions.clone(),
             return_attr_patterns: vec![],
             tokio_handle: tokio::runtime::Handle::current(),
@@ -293,12 +293,12 @@ mod tests {
     #[tokio::test]
     async fn get_secret_fails_when_locked() {
         let sessions = Arc::new(SessionManager::new());
-        let backend = Arc::new(MockBackend);
+        let provider = Arc::new(MockProvider);
         let items_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let state = ItemState {
             meta: meta(true),
             path: "/org/freedesktop/secrets/item/mock/two".to_string(),
-            backend,
+            provider,
             sessions: sessions.clone(),
             return_attr_patterns: vec![],
             tokio_handle: tokio::runtime::Handle::current(),

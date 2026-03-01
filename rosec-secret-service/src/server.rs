@@ -35,11 +35,11 @@ impl Default for ObjectPaths {
 
 pub async fn register_objects(
     conn: &Connection,
-    backends: Vec<Arc<dyn Provider>>,
+    providers: Vec<Arc<dyn Provider>>,
     router: Arc<Router>,
     sessions: Arc<SessionManager>,
 ) -> zbus::Result<Arc<ServiceState>> {
-    register_objects_with_config(conn, backends, router, sessions, HashMap::new()).await
+    register_objects_with_config(conn, providers, router, sessions, HashMap::new()).await
 }
 
 /// Like `register_objects`, but also accepts per-provider `return_attr` patterns
@@ -48,14 +48,14 @@ pub async fn register_objects(
 /// Providers not present in the map fall back to the service-level default.
 pub async fn register_objects_with_config(
     conn: &Connection,
-    backends: Vec<Arc<dyn Provider>>,
+    providers: Vec<Arc<dyn Provider>>,
     router: Arc<Router>,
     sessions: Arc<SessionManager>,
     return_attr_map: HashMap<String, Vec<String>>,
 ) -> zbus::Result<Arc<ServiceState>> {
     register_objects_with_full_config(
         conn,
-        backends,
+        providers,
         router,
         sessions,
         return_attr_map,
@@ -71,7 +71,7 @@ pub async fn register_objects_with_config(
 #[allow(clippy::too_many_arguments)]
 pub async fn register_objects_with_full_config(
     conn: &Connection,
-    backends: Vec<Arc<dyn Provider>>,
+    providers: Vec<Arc<dyn Provider>>,
     router: Arc<Router>,
     sessions: Arc<SessionManager>,
     return_attr_map: HashMap<String, Vec<String>>,
@@ -80,13 +80,14 @@ pub async fn register_objects_with_full_config(
     initial_config: Config,
 ) -> zbus::Result<Arc<ServiceState>> {
     let paths = ObjectPaths::new();
-    // Keep a reference to all backends for the CollectionState before consuming `backends`
-    let backends_for_collection: Vec<Arc<dyn Provider>> = backends.iter().map(Arc::clone).collect();
+    // Keep a reference to all providers for the CollectionState before consuming `providers`
+    let providers_for_collection: Vec<Arc<dyn Provider>> =
+        providers.iter().map(Arc::clone).collect();
     let tokio_handle = tokio::runtime::Handle::current();
     let sessions_clone = Arc::clone(&sessions);
     let tokio_handle_clone = tokio_handle.clone();
     let state = Arc::new(ServiceState::new_with_config(
-        backends,
+        providers,
         router,
         sessions,
         conn.clone(),
@@ -121,7 +122,7 @@ pub async fn register_objects_with_full_config(
     let collection_state = CollectionState {
         label: "default".to_string(),
         items: shared_items,
-        backends: backends_for_collection,
+        providers: providers_for_collection,
         service_state: Arc::clone(&state),
         sessions: sessions_clone,
         tokio_handle: tokio_handle_clone,

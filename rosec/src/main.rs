@@ -161,7 +161,7 @@ USAGE:
     rosec search [flags] [key=value]...
 
 FLAGS:
-    -s, --sync          Sync backends before searching; also unlocks if needed
+    -s, --sync          Sync providers before searching; also unlocks if needed
     --format=<fmt>      Output format: table (default), kv, json
     --show-path         Include the full D-Bus object path in output
     --help, -h          Show this help
@@ -198,7 +198,7 @@ ARGUMENTS:
 FLAGS:
     -a, --all-attrs     Also fetch and display sensitive attributes (password, totp,
                         notes, card number, custom fields, etc.)
-    -s, --sync          Sync backends before inspecting; also unlocks if the item is
+    -s, --sync          Sync providers before inspecting; also unlocks if the item is
                         not yet in the cache (e.g. after a fresh daemon start)
     --format=<fmt>      Output format: human (default), kv, json
     --help, -h          Show this help
@@ -287,7 +287,7 @@ async fn conn() -> Result<Connection> {
     Ok(Connection::session().await?)
 }
 
-/// Poll rosecd's `BackendList` until `id` appears (max 3 s, 200 ms intervals).
+/// Poll rosecd's `ProviderList` until `id` appears (max 3 s, 200 ms intervals).
 ///
 /// Returns `Some(proxy)` if the daemon is running and the provider appeared,
 /// `None` if the daemon isn't running or the provider didn't appear in time.
@@ -305,7 +305,7 @@ async fn wait_for_daemon_reload(id: &str) -> Option<zbus::Proxy<'static>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
         if let Ok(entries) = proxy
-            .call::<_, _, Vec<(String, String, String, bool)>>("BackendList", &())
+            .call::<_, _, Vec<(String, String, String, bool)>>("ProviderList", &())
             .await
             && entries.iter().any(|(bid, ..)| bid == id)
         {
@@ -376,22 +376,22 @@ fn load_config() -> Config {
 // Prompt helpers (local config-value collection only — not credentials)
 // ---------------------------------------------------------------------------
 //
-// These functions are used by `cmd_backend_add` to collect non-secret
+// These functions are used by `cmd_provider_add` to collect non-secret
 // configuration values (email address, region, base_url, etc.) that go into
 // config.toml.  Credential prompting (passwords, tokens) is handled entirely
-// inside `rosecd` via `UnlockWithTty` / `AuthBackendWithTty` — the TTY fd is
+// inside `rosecd` via `UnlockWithTty` / `AuthProviderWithTty` — the TTY fd is
 // passed via D-Bus fd-passing so credentials never appear in any D-Bus message.
 
 // ---------------------------------------------------------------------------
-// Lazy-unlock: detect "locked::<backend_id>" D-Bus errors and prompt
+// Lazy-unlock: detect "locked::<provider_id>" D-Bus errors and prompt
 // ---------------------------------------------------------------------------
 
-/// Extract a `"locked::<backend_id>"` backend ID from a `zbus::Error`, if present.
+/// Extract a `"locked::<provider_id>"` provider ID from a `zbus::Error`, if present.
 ///
 /// The daemon returns `org.freedesktop.DBus.Error.Failed("locked::<id>")` when
-/// a backend needs interactive authentication.  This helper parses that sentinel
-/// and returns `Some(backend_id)` or `None`.
-fn extract_locked_backend(err: &zbus::Error) -> Option<String> {
+/// a provider needs interactive authentication.  This helper parses that sentinel
+/// and returns `Some(provider_id)` or `None`.
+fn extract_locked_provider(err: &zbus::Error) -> Option<String> {
     if let zbus::Error::MethodError(_, Some(detail), _) = err {
         let msg = detail.as_str();
         if let Some(id) = msg.strip_prefix("locked::") {
@@ -401,7 +401,7 @@ fn extract_locked_backend(err: &zbus::Error) -> Option<String> {
     None
 }
 
-/// Attempt to interactively unlock a backend after receiving a `"locked::<id>"`
+/// Attempt to interactively unlock a provider after receiving a `"locked::<id>"`
 /// D-Bus error.
 ///
 /// This function implements the Secret Service spec Prompt flow:
@@ -413,12 +413,12 @@ fn extract_locked_backend(err: &zbus::Error) -> Option<String> {
 ///
 /// Credentials never cross D-Bus — the daemon handles everything internally.
 ///
-/// Returns `Ok(true)` if the backend was successfully unlocked (caller should
+/// Returns `Ok(true)` if the provider was successfully unlocked (caller should
 /// retry the original operation).  Returns `Ok(false)` if the error was not a
 /// locked sentinel (caller should propagate the original error).
 async fn try_lazy_unlock(conn: &Connection, err: &zbus::Error) -> Result<bool> {
     // Only trigger for the locked sentinel — not for generic errors.
-    if extract_locked_backend(err).is_none() {
+    if extract_locked_provider(err).is_none() {
         return Ok(false);
     }
 
@@ -447,7 +447,7 @@ async fn trigger_unlock(conn: &Connection) -> Result<()> {
     .await?;
 
     // Call Unlock([default_collection]).  Returns (unlocked_list, prompt_path).
-    // prompt_path == "/" means everything was already unlocked (auto-unlock backends).
+    // prompt_path == "/" means everything was already unlocked (auto-unlock providers).
     let collection_path =
         OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/default".to_string())?;
     let (_, prompt_path): (Vec<OwnedObjectPath>, OwnedObjectPath) = service_proxy
@@ -456,7 +456,7 @@ async fn trigger_unlock(conn: &Connection) -> Result<()> {
     let prompt_path = prompt_path.to_string();
 
     if prompt_path == "/" {
-        // Already unlocked (auto-unlock backends recovered silently).
+        // Already unlocked (auto-unlock providers recovered silently).
         return Ok(());
     }
 
@@ -516,7 +516,7 @@ async fn trigger_unlock(conn: &Connection) -> Result<()> {
     }
 
     // Unlock succeeded.  Trigger a cache sync so the retry finds items.
-    // Use the daemon proxy for SyncBackend; need to look up which backend unlocked.
+    // Use the daemon proxy for SyncProvider; need to look up which provider unlocked.
     // Use "all" shorthand: call Refresh which rebuilds the cache from in-memory state.
     let daemon_proxy = zbus::Proxy::new(
         conn,
@@ -537,7 +537,7 @@ async fn trigger_unlock(conn: &Connection) -> Result<()> {
 /// Open `/dev/tty` and return it as a `zvariant::OwnedFd` for D-Bus fd-passing.
 ///
 /// The returned `OwnedFd` can be passed directly to `UnlockWithTty` /
-/// `AuthBackendWithTty`.  `dbus-monitor` sees only the fd number, never the
+/// `AuthProviderWithTty`.  `dbus-monitor` sees only the fd number, never the
 /// terminal contents.
 fn open_tty_owned_fd() -> Result<zvariant::OwnedFd> {
     use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
@@ -861,7 +861,7 @@ async fn cmd_provider_list() -> Result<()> {
         )
         .await
         && let Ok(entries) = proxy
-            .call::<_, _, Vec<(String, String, String, bool)>>("BackendList", &())
+            .call::<_, _, Vec<(String, String, String, bool)>>("ProviderList", &())
             .await
     {
         if entries.is_empty() {
@@ -968,7 +968,7 @@ async fn cmd_provider_auth(args: &[String]) -> Result<()> {
 
     let tty_fd = open_tty_owned_fd()?;
     let _: () = proxy
-        .call("AuthBackendWithTty", &(provider_id, tty_fd, force))
+        .call("AuthProviderWithTty", &(provider_id, tty_fd, force))
         .await?;
 
     println!("Provider '{provider_id}' authenticated.");
@@ -1069,7 +1069,7 @@ async fn cmd_provider_add(args: &[String]) -> Result<()> {
         println!("rosecd picked up the new provider — starting authentication.");
         let tty_fd = open_tty_owned_fd()?;
         let _: () = proxy
-            .call("AuthBackendWithTty", &(id.as_str(), tty_fd, false))
+            .call("AuthProviderWithTty", &(id.as_str(), tty_fd, false))
             .await?;
         println!("Provider '{id}' authenticated.");
     } else {
@@ -1233,7 +1233,7 @@ async fn cmd_provider_create(args: &[String]) -> Result<()> {
         println!("rosecd picked up the new vault — starting authentication.");
         let tty_fd = open_tty_owned_fd()?;
         let _: () = proxy
-            .call("AuthBackendWithTty", &(id.as_str(), tty_fd))
+            .call("AuthProviderWithTty", &(id.as_str(), tty_fd))
             .await?;
         println!("Vault '{id}' authenticated.");
     } else {
@@ -1542,7 +1542,7 @@ async fn cmd_provider_change_password(args: &[String]) -> Result<()> {
 
     let _: () = proxy
         .call(
-            "ChangeBackendPassword",
+            "ChangeProviderPassword",
             &(vault_id.as_str(), old_fd, new_fd),
         )
         .await?;
@@ -1650,14 +1650,14 @@ async fn cmd_status() -> Result<()> {
     )
     .await?;
 
-    let (_, _, _, cache_size, last_sync_epoch, sessions): (String, String, u32, u32, u64, u32) =
+    let (cache_size, last_sync_epoch, sessions): (u32, u64, u32) =
         proxy.call("Status", &()).await?;
 
-    // Fetch all backends with type and lock state.
-    let backends: Vec<(String, String, String, bool)> = proxy.call("BackendList", &()).await?;
+    // Fetch all providers with type and lock state.
+    let providers: Vec<(String, String, String, bool)> = proxy.call("ProviderList", &()).await?;
 
-    println!("Backends:");
-    for (id, name, kind, locked) in &backends {
+    println!("Providers:");
+    for (id, name, kind, locked) in &providers {
         let lock_indicator = if *locked { "locked" } else { "unlocked" };
         println!("  {name} ({id})  [{kind}, {lock_indicator}]");
     }
@@ -1682,30 +1682,30 @@ async fn cmd_sync() -> Result<()> {
     )
     .await?;
 
-    // Fetch the list of backends so we know which ones to sync.
-    let backends: Vec<(String, String, String, bool)> = proxy.call("BackendList", &()).await?;
+    // Fetch the list of providers so we know which ones to sync.
+    let providers: Vec<(String, String, String, bool)> = proxy.call("ProviderList", &()).await?;
 
-    for (id, _name, _kind, _locked) in &backends {
+    for (id, _name, _kind, _locked) in &providers {
         eprint!("Syncing '{id}'...");
-        match proxy.call::<_, _, u32>("SyncBackend", &(id,)).await {
+        match proxy.call::<_, _, u32>("SyncProvider", &(id,)).await {
             Ok(count) => {
                 println!(" {count} items");
             }
             Err(zbus::Error::MethodError(_, Some(detail), _))
                 if detail.as_str().starts_with("locked::") =>
             {
-                // Daemon says this backend needs credentials first.
+                // Daemon says this provider needs credentials first.
                 // Pass a TTY fd so the daemon can prompt in-process —
                 // credentials never appear in any D-Bus message.
-                let backend_id = detail.as_str().strip_prefix("locked::").unwrap_or("");
+                let provider_id = detail.as_str().strip_prefix("locked::").unwrap_or("");
                 eprintln!(" locked");
                 let tty_fd = open_tty_owned_fd()?;
                 let _: () = proxy
-                    .call("AuthBackendWithTty", &(backend_id, tty_fd))
+                    .call("AuthProviderWithTty", &(provider_id, tty_fd))
                     .await?;
-                // Retry sync now that the backend is unlocked.
+                // Retry sync now that the provider is unlocked.
                 eprint!("Syncing '{id}' (retrying)...");
-                match proxy.call::<_, _, u32>("SyncBackend", &(id,)).await {
+                match proxy.call::<_, _, u32>("SyncProvider", &(id,)).await {
                     Ok(count) => println!(" {count} items"),
                     Err(e) => eprintln!(" failed: {e}"),
                 }
@@ -1717,15 +1717,15 @@ async fn cmd_sync() -> Result<()> {
     Ok(())
 }
 
-/// Ensure the daemon's cache is fresh by syncing backends in parallel.
+/// Ensure the daemon's cache is fresh by syncing providers in parallel.
 ///
 /// Checks `DaemonStatus.last_sync_epoch` — if the last sync was more than
 /// 60 seconds ago (matching the daemon's internal staleness threshold), calls
-/// `SyncBackend` for each unlocked backend concurrently.  If the cache is
+/// `SyncProvider` for each unlocked provider concurrently.  If the cache is
 /// already fresh, this is a single cheap D-Bus call with no network I/O.
 ///
-/// Locked backends are skipped — the caller handles unlock via the Prompt flow
-/// and can call this again afterwards to sync the newly-unlocked backends.
+/// Locked providers are skipped — the caller handles unlock via the Prompt flow
+/// and can call this again afterwards to sync the newly-unlocked providers.
 async fn preemptive_sync(conn: &Connection) -> Result<()> {
     let proxy = zbus::Proxy::new(
         conn,
@@ -1736,8 +1736,8 @@ async fn preemptive_sync(conn: &Connection) -> Result<()> {
     .await?;
 
     // Check global staleness: if last_sync_epoch is within 60 s, skip.
-    let status: (String, String, u32, u32, u64, u32) = proxy.call("Status", &()).await?;
-    let last_sync_epoch = status.4;
+    let status: (u32, u64, u32) = proxy.call("Status", &()).await?;
+    let last_sync_epoch = status.1;
 
     if last_sync_epoch > 0 {
         let now_epoch = std::time::SystemTime::now()
@@ -1749,10 +1749,10 @@ async fn preemptive_sync(conn: &Connection) -> Result<()> {
         }
     }
 
-    // Stale or never synced — sync each unlocked backend in parallel.
-    let backends: Vec<(String, String, String, bool)> = proxy.call("BackendList", &()).await?;
+    // Stale or never synced — sync each unlocked provider in parallel.
+    let providers: Vec<(String, String, String, bool)> = proxy.call("ProviderList", &()).await?;
 
-    let futures: Vec<_> = backends
+    let futures: Vec<_> = providers
         .into_iter()
         .filter(|(_, _, _, locked)| !locked)
         .map(|(id, _, _, _)| {
@@ -1767,7 +1767,7 @@ async fn preemptive_sync(conn: &Connection) -> Result<()> {
                 .await;
                 match p {
                     Ok(p) => {
-                        if let Err(e) = p.call::<_, _, u32>("SyncBackend", &(&id,)).await {
+                        if let Err(e) = p.call::<_, _, u32>("SyncProvider", &(&id,)).await {
                             eprintln!("sync {id}: {e}");
                         }
                     }
@@ -1782,12 +1782,12 @@ async fn preemptive_sync(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Returns `true` if the daemon reports at least one locked backend.
+/// Returns `true` if the daemon reports at least one locked provider.
 ///
 /// Used by `cmd_search` with `--sync` to distinguish "genuinely no results"
 /// from "empty because the metadata cache was never populated" (cold start with
-/// all backends locked).
-async fn any_backends_locked(conn: &Connection) -> Result<bool> {
+/// all providers locked).
+async fn any_providers_locked(conn: &Connection) -> Result<bool> {
     let proxy = zbus::Proxy::new(
         conn,
         "org.freedesktop.secrets",
@@ -1795,8 +1795,8 @@ async fn any_backends_locked(conn: &Connection) -> Result<bool> {
         "org.rosec.Daemon",
     )
     .await?;
-    let backends: Vec<(String, String, String, bool)> = proxy.call("BackendList", &()).await?;
-    Ok(backends.iter().any(|(_, _, _, locked)| *locked))
+    let providers: Vec<(String, String, String, bool)> = proxy.call("ProviderList", &()).await?;
+    Ok(providers.iter().any(|(_, _, _, locked)| *locked))
 }
 
 /// Output format for `rosec search`.
@@ -1831,9 +1831,9 @@ struct ItemSummary {
 impl ItemSummary {
     /// The 16-char hex hash that uniquely identifies this item.
     ///
-    /// Path segment format: `{backend}_{uuid_sanitised}_{hash:016x}`
+    /// Path segment format: `{provider}_{uuid_sanitised}_{hash:016x}`
     /// The hash is the last `_`-delimited token — always exactly 16 hex chars.
-    /// It is derived from `sha256("{backend_id}:{item_id}")[0..8]` so it is
+    /// It is derived from `sha256("{provider_id}:{item_id}")[0..8]` so it is
     /// stable across restarts and toolchain upgrades, and collision probability
     /// is ~1 in 2^64 across all items in a vault.
     ///
@@ -1903,10 +1903,10 @@ async fn is_rosecd(conn: &Connection) -> bool {
     proxy.call::<_, _, String>("Introspect", &()).await.is_ok()
 }
 
-/// If rosecd is running with no configured backends, print a warning to stderr
+/// If rosecd is running with no configured providers, print a warning to stderr
 /// and suggest next steps.  Non-fatal — the caller continues normally (an empty
-/// backend list returns empty results, which is correct behaviour).
-async fn warn_if_no_backends(conn: &Connection) {
+/// provider list returns empty results, which is correct behaviour).
+async fn warn_if_no_providers(conn: &Connection) {
     let Ok(proxy) = zbus::Proxy::new(
         conn,
         "org.freedesktop.secrets",
@@ -1918,14 +1918,14 @@ async fn warn_if_no_backends(conn: &Connection) {
         return;
     };
     let Ok(entries) = proxy
-        .call::<_, _, Vec<(String, String, String, bool)>>("BackendList", &())
+        .call::<_, _, Vec<(String, String, String, bool)>>("ProviderList", &())
         .await
     else {
         return;
     };
     if entries.is_empty() {
-        eprintln!("warning: rosecd is running with no configured backends.");
-        eprintln!("         Run `rosec backend add <kind>` to add a real backend.");
+        eprintln!("warning: rosecd is running with no configured providers.");
+        eprintln!("         Run `rosec provider add <kind>` to add a real provider.");
     }
 }
 
@@ -2045,7 +2045,7 @@ async fn cmd_search(args: &[String]) -> Result<()> {
     let conn = conn().await?;
     let rosecd = is_rosecd(&conn).await;
     if rosecd {
-        warn_if_no_backends(&conn).await;
+        warn_if_no_providers(&conn).await;
     }
 
     // If --sync was requested, ensure the daemon has fresh data first.
@@ -2075,7 +2075,7 @@ async fn cmd_search(args: &[String]) -> Result<()> {
     let (unlocked, locked) = match do_search(&conn).await {
         Ok(result) => result,
         Err(e) if sync => {
-            // Search failed (e.g. all backends locked) — unlock then retry.
+            // Search failed (e.g. all providers locked) — unlock then retry.
             trigger_unlock(&conn).await?;
             preemptive_sync(&conn).await?;
             do_search(&conn).await.map_err(|_| e)?
@@ -2085,12 +2085,12 @@ async fn cmd_search(args: &[String]) -> Result<()> {
 
     // With --sync, trigger unlock and retry when:
     //   (a) results are all locked (items exist but collection is locked), OR
-    //   (b) both lists are empty AND the daemon has locked backends — the
-    //       metadata cache is cold (never synced) because all backends started
+    //   (b) both lists are empty AND the daemon has locked providers — the
+    //       metadata cache is cold (never synced) because all providers started
     //       locked and preemptive_sync skipped them.
     let needs_unlock = sync
         && ((!locked.is_empty() && unlocked.is_empty())
-            || (unlocked.is_empty() && locked.is_empty() && any_backends_locked(&conn).await?));
+            || (unlocked.is_empty() && locked.is_empty() && any_providers_locked(&conn).await?));
     let (unlocked, locked) = if needs_unlock {
         trigger_unlock(&conn).await?;
         preemptive_sync(&conn).await?;
@@ -2319,7 +2319,7 @@ fn print_search_kv(items: &[ItemSummary], show_path: bool) {
         sorted_attrs.sort_by_key(|(k, _)| k.as_str());
         for (k, v) in &sorted_attrs {
             // Skip internal/redundant attrs in kv mode.
-            if matches!(k.as_str(), "backend_id" | "xdg:schema") {
+            if matches!(k.as_str(), "provider_id" | "xdg:schema") {
                 continue;
             }
             println!("{k}={v}");
@@ -2540,7 +2540,7 @@ async fn cmd_get(args: &[String]) -> Result<()> {
 
     // Determine the item path and whether unlock is needed.
     // With --sync, if the item wasn't found at all we attempt unlock + re-sync
-    // before giving up — the item may live in a backend that hasn't been
+    // before giving up — the item may live in a provider that hasn't been
     // unlocked yet (so the metadata cache has no knowledge of it).
     let (path, is_locked) = match resolve_result {
         Ok(result) => result,
@@ -2557,14 +2557,14 @@ async fn cmd_get(args: &[String]) -> Result<()> {
     // flow before attempting to fetch the secret.
     if is_locked {
         trigger_unlock(&conn).await?;
-        // Re-sync the just-unlocked backends so the freshly-available items
+        // Re-sync the just-unlocked providers so the freshly-available items
         // are pulled from the remote and the metadata cache is populated.
         if sync {
             preemptive_sync(&conn).await?;
         }
     }
 
-    // Try once; if backend is locked, prompt for credentials and retry.
+    // Try once; if provider is locked, prompt for credentials and retry.
     match cmd_get_inner(&conn, &path, attr.as_deref()).await {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -2598,7 +2598,7 @@ ARGUMENTS:
                     Exactly one item must match.
 
 FLAGS:
-    -s, --sync      Sync backends before fetching if the cache is stale (>60 s).
+    -s, --sync      Sync providers before fetching if the cache is stale (>60 s).
                     Skips the network call when data is already fresh.
     --attr <name>   Print the named public attribute instead of the primary secret
                     (e.g. username, uri, folder, sm.project).
@@ -3024,7 +3024,7 @@ async fn cmd_inspect_inner(
 async fn cmd_lock() -> Result<()> {
     let conn = conn().await?;
 
-    // Count unlocked backends before locking so we can report how many were locked.
+    // Count unlocked providers before locking so we can report how many were locked.
     let mgmt_proxy = zbus::Proxy::new(
         &conn,
         "org.freedesktop.secrets",
@@ -3032,8 +3032,9 @@ async fn cmd_lock() -> Result<()> {
         "org.rosec.Daemon",
     )
     .await?;
-    let backends: Vec<(String, String, String, bool)> = mgmt_proxy.call("BackendList", &()).await?;
-    let unlocked_count = backends.iter().filter(|(_, _, _, locked)| !locked).count();
+    let providers: Vec<(String, String, String, bool)> =
+        mgmt_proxy.call("ProviderList", &()).await?;
+    let unlocked_count = providers.iter().filter(|(_, _, _, locked)| !locked).count();
 
     let proxy = zbus::Proxy::new(
         &conn,
@@ -3050,9 +3051,9 @@ async fn cmd_lock() -> Result<()> {
         .await?;
 
     match unlocked_count {
-        0 => println!("Nothing to lock — all backends already locked."),
+        0 => println!("Nothing to lock — all providers already locked."),
         n => println!(
-            "Locked: 1 collection, {} backend{}.",
+            "Locked: 1 collection, {} provider{}.",
             n,
             if n == 1 { "" } else { "s" }
         ),
@@ -3071,16 +3072,16 @@ async fn cmd_unlock() -> Result<()> {
     )
     .await?;
 
-    let backends: Vec<(String, String, String, bool)> = proxy.call("BackendList", &()).await?;
+    let providers: Vec<(String, String, String, bool)> = proxy.call("ProviderList", &()).await?;
 
-    if backends.is_empty() {
-        println!("No backends configured. Run `rosec backend add <kind>` to add one.");
+    if providers.is_empty() {
+        println!("No providers configured. Run `rosec provider add <kind>` to add one.");
         return Ok(());
     }
 
-    // Report already-unlocked backends.
-    let any_locked = backends.iter().any(|(_, _, _, locked)| *locked);
-    for (id, _, _, is_locked) in &backends {
+    // Report already-unlocked providers.
+    let any_locked = providers.iter().any(|(_, _, _, locked)| *locked);
+    for (id, _, _, is_locked) in &providers {
         if !is_locked {
             println!("'{id}' is already unlocked.");
         }
@@ -3100,7 +3101,7 @@ async fn cmd_unlock() -> Result<()> {
     // the cursor in the wrong position.
     let tty_fd = open_tty_owned_fd()?;
     eprintln!("Unlocking…");
-    type ResultEntry = (String, bool, String); // (backend_id, success, message)
+    type ResultEntry = (String, bool, String); // (provider_id, success, message)
     let results: Vec<ResultEntry> = proxy.call("UnlockWithTty", &(tty_fd,)).await?;
 
     for (id, success, message) in &results {

@@ -4,14 +4,14 @@
 //! ```text
 //! $XDG_DATA_HOME/rosec/machine-key   (default: ~/.local/share/rosec/machine-key)
 //! ```
-//! The file is created with mode `0600`.  It is used to derive backend-specific
-//! encryption keys so that credentials stored by token-based backends (e.g.
+//! The file is created with mode `0600`.  It is used to derive provider-specific
+//! encryption keys so that credentials stored by token-based providers (e.g.
 //! Bitwarden Secrets Manager) can be decrypted without any user interaction.
 //!
 //! # Security model
 //!
 //! This key protects stored credentials with the same level of security as the
-//! user's home directory.  It is appropriate for backends that already store a
+//! user's home directory.  It is appropriate for providers that already store a
 //! machine account credential (not a user master password) — if an attacker can
 //! read `~/.local/share/rosec/`, they already have access to the encrypted token
 //! file, and both are protected only by filesystem permissions.

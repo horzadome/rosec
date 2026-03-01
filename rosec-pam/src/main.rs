@@ -6,7 +6,7 @@
 //!
 //! It connects to the D-Bus session bus, enumerates locked vault providers,
 //! and attempts to unlock each one using the login password via the
-//! `AuthBackendFromPipe` method on `org.rosec.Daemon`.  The password is
+//! `AuthProviderFromPipe` method on `org.rosec.Daemon`.  The password is
 //! passed through a pipe fd (SCM_RIGHTS), never as a D-Bus message payload,
 //! so it is invisible to `dbus-monitor`.
 //!
@@ -143,12 +143,12 @@ async fn unlock_vaults_async(password: &[u8]) -> Result<(), ()> {
     .await
     .map_err(|_| ())?;
 
-    // BackendList returns Vec<(id, name, kind, locked)>.
-    let backends: Vec<(String, String, String, bool)> =
-        proxy.call("BackendList", &()).await.map_err(|_| ())?;
+    // ProviderList returns Vec<(id, name, kind, locked)>.
+    let providers: Vec<(String, String, String, bool)> =
+        proxy.call("ProviderList", &()).await.map_err(|_| ())?;
 
     let mut any_unlocked = false;
-    for (id, _name, kind, locked) in &backends {
+    for (id, _name, kind, locked) in &providers {
         if kind != "vault" || !locked {
             continue;
         }
@@ -157,10 +157,10 @@ async fn unlock_vaults_async(password: &[u8]) -> Result<(), ()> {
         // consumed (read + closed) by the daemon, so we cannot reuse them.
         let pipe_fd = make_password_pipe(password).map_err(|_| ())?;
 
-        // AuthBackendFromPipe(backend_id, pipe_fd) — password travels via
+        // AuthProviderFromPipe(provider_id, pipe_fd) — password travels via
         // the pipe fd, never as a D-Bus message string.
         let result: Result<bool, zbus::Error> = proxy
-            .call("AuthBackendFromPipe", &(id.as_str(), pipe_fd))
+            .call("AuthProviderFromPipe", &(id.as_str(), pipe_fd))
             .await;
         if result.is_ok() {
             any_unlocked = true;

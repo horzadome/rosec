@@ -19,7 +19,7 @@ pub struct DedupResult {
 pub fn dedup(
     mut items: Vec<ItemMeta>,
     config: DedupConfig,
-    backend_priority: &HashMap<String, usize>,
+    provider_priority: &HashMap<String, usize>,
 ) -> DedupResult {
     if items.is_empty() {
         return DedupResult { items };
@@ -40,9 +40,9 @@ pub fn dedup(
     let mut result = Vec::new();
     for (_key, candidates) in by_key {
         let winner = match config.strategy {
-            DedupStrategy::Priority => select_by_priority(&candidates, backend_priority),
+            DedupStrategy::Priority => select_by_priority(&candidates, provider_priority),
             DedupStrategy::Newest => {
-                select_by_newest(&candidates, config.time_fallback, backend_priority)
+                select_by_newest(&candidates, config.time_fallback, provider_priority)
             }
         };
         result.push(winner);
@@ -53,7 +53,7 @@ pub fn dedup(
 
 fn select_by_priority(
     candidates: &[ItemMeta],
-    backend_priority: &HashMap<String, usize>,
+    provider_priority: &HashMap<String, usize>,
 ) -> ItemMeta {
     // Callers always pass non-empty slices (grouped from a non-empty HashMap entry).
     // We use `unwrap_or_else` with the first element as a safe fallback rather than
@@ -63,7 +63,7 @@ fn select_by_priority(
     candidates
         .iter()
         .min_by_key(|item| {
-            backend_priority
+            provider_priority
                 .get(&item.provider_id)
                 .copied()
                 .unwrap_or(usize::MAX)
@@ -75,7 +75,7 @@ fn select_by_priority(
 fn select_by_newest(
     candidates: &[ItemMeta],
     fallback: DedupTimeFallback,
-    backend_priority: &HashMap<String, usize>,
+    provider_priority: &HashMap<String, usize>,
 ) -> ItemMeta {
     // Callers always pass non-empty slices (grouped from a non-empty HashMap entry).
     debug_assert!(!candidates.is_empty(), "candidates must be non-empty");
@@ -105,11 +105,11 @@ fn select_by_newest(
             continue;
         }
         if candidate_time == winner_time {
-            let candidate_priority = backend_priority
+            let candidate_priority = provider_priority
                 .get(&candidate.provider_id)
                 .copied()
                 .unwrap_or(usize::MAX);
-            let winner_priority = backend_priority
+            let winner_priority = provider_priority
                 .get(&winner.provider_id)
                 .copied()
                 .unwrap_or(usize::MAX);
@@ -131,7 +131,7 @@ fn timestamp(item: &ItemMeta, fallback: DedupTimeFallback) -> SystemTime {
     }
 }
 
-pub fn backend_priority_map<I>(ids: I) -> HashMap<String, usize>
+pub fn provider_priority_map<I>(ids: I) -> HashMap<String, usize>
 where
     I: IntoIterator<Item = String>,
 {
@@ -179,7 +179,7 @@ mod tests {
             strategy: DedupStrategy::Newest,
             time_fallback: DedupTimeFallback::Created,
         };
-        let map = backend_priority_map(vec!["a".to_string(), "b".to_string()]);
+        let map = provider_priority_map(vec!["a".to_string(), "b".to_string()]);
         let result = dedup(vec![older, newer], config, &map);
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].id, "2");
@@ -194,7 +194,7 @@ mod tests {
             strategy: DedupStrategy::Newest,
             time_fallback: DedupTimeFallback::Created,
         };
-        let map = backend_priority_map(vec!["b".to_string(), "a".to_string()]);
+        let map = provider_priority_map(vec!["b".to_string(), "a".to_string()]);
         let result = dedup(vec![a, b], config, &map);
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].provider_id, "b");

@@ -1,7 +1,7 @@
 //! Generic OAuth `client_credentials` credential store.
 //!
-//! Any backend that authenticates via OAuth2 `client_credentials` (e.g.
-//! Bitwarden personal API key, future cloud-provider backends) can use this
+//! Any provider that authenticates via OAuth2 `client_credentials` (e.g.
+//! Bitwarden personal API key, future cloud providers) can use this
 //! module to securely persist and retrieve a `client_id` / `client_secret`
 //! pair on disk.
 //!
@@ -9,7 +9,7 @@
 //!
 //! Credentials are stored as TOML at:
 //! ```text
-//! $XDG_DATA_HOME/rosec/oauth/<backend-id>.toml   (default: ~/.local/share/…)
+//! $XDG_DATA_HOME/rosec/oauth/<provider-id>.toml   (default: ~/.local/share/…)
 //! ```
 //!
 //! The file is created with mode `0600` (owner read/write only) on Unix.
@@ -75,16 +75,16 @@ struct StoredCredential {
     encrypted: EncryptedFields,
 }
 
-/// Return the path for a backend's OAuth credential file.
+/// Return the path for a provider's OAuth credential file.
 ///
-/// `$XDG_DATA_HOME/rosec/oauth/<backend-id>.toml`
-/// (default: `~/.local/share/rosec/oauth/<backend-id>.toml`)
-pub fn credential_path(backend_id: &str) -> Option<PathBuf> {
+/// `$XDG_DATA_HOME/rosec/oauth/<provider-id>.toml`
+/// (default: `~/.local/share/rosec/oauth/<provider-id>.toml`)
+pub fn credential_path(provider_id: &str) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-    // Sanitise the backend ID so it is safe as a filename component.
-    let safe_id: String = backend_id
+    // Sanitise the provider ID so it is safe as a filename component.
+    let safe_id: String = provider_id
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -101,15 +101,15 @@ pub fn credential_path(backend_id: &str) -> Option<PathBuf> {
     )
 }
 
-/// Load the encrypted fields for `backend_id` from disk.
+/// Load the encrypted fields for `provider_id` from disk.
 ///
 /// Returns `None` if the file does not exist or cannot be parsed.
 /// Logs a warning (but does not error) on parse failures so a corrupt file
 /// does not hard-block authentication.
 ///
 /// The returned `(client_id, EncryptedFields)` must be decrypted by the caller.
-pub fn load_encrypted(backend_id: &str) -> Option<(String, EncryptedFields)> {
-    let path = credential_path(backend_id)?;
+pub fn load_encrypted(provider_id: &str) -> Option<(String, EncryptedFields)> {
+    let path = credential_path(provider_id)?;
     let contents = std::fs::read_to_string(&path).ok()?;
     match toml::from_str::<StoredCredential>(&contents) {
         Ok(stored) => Some((stored.client_id, stored.encrypted)),
@@ -120,7 +120,7 @@ pub fn load_encrypted(backend_id: &str) -> Option<(String, EncryptedFields)> {
     }
 }
 
-/// Persist pre-encrypted credential fields for `backend_id` to disk with mode `0600`.
+/// Persist pre-encrypted credential fields for `provider_id` to disk with mode `0600`.
 ///
 /// Creates intermediate directories if needed.
 /// Returns an error string suitable for display to the user.
@@ -129,11 +129,11 @@ pub fn load_encrypted(backend_id: &str) -> Option<(String, EncryptedFields)> {
 /// `client_secret` before calling this function.  This module never sees the
 /// plaintext secret.
 pub fn save_encrypted(
-    backend_id: &str,
+    provider_id: &str,
     client_id: &str,
     encrypted: &EncryptedFields,
 ) -> Result<(), String> {
-    let path = credential_path(backend_id)
+    let path = credential_path(provider_id)
         .ok_or_else(|| "cannot determine data directory (HOME not set)".to_string())?;
 
     if let Some(parent) = path.parent() {
@@ -159,12 +159,12 @@ pub fn save_encrypted(
     Ok(())
 }
 
-/// Delete the stored credential for `backend_id`.
+/// Delete the stored credential for `provider_id`.
 ///
 /// Returns `true` if a file was removed, `false` if nothing existed.
 /// Returns an error string if the file exists but could not be removed.
-pub fn clear(backend_id: &str) -> Result<bool, String> {
-    let path = credential_path(backend_id)
+pub fn clear(provider_id: &str) -> Result<bool, String> {
+    let path = credential_path(provider_id)
         .ok_or_else(|| "cannot determine data directory (HOME not set)".to_string())?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(true),
@@ -233,9 +233,9 @@ mod tests {
     }
 
     #[test]
-    fn credential_path_ends_with_backend_id() {
-        let path = credential_path("my-backend").unwrap();
-        assert!(path.ends_with("rosec/oauth/my-backend.toml"));
+    fn credential_path_ends_with_provider_id() {
+        let path = credential_path("my-provider").unwrap();
+        assert!(path.ends_with("rosec/oauth/my-provider.toml"));
     }
 
     #[test]
@@ -257,24 +257,24 @@ mod tests {
     fn roundtrip_save_load_clear() {
         with_tmp_home(|| {
             let enc = make_encrypted();
-            save_encrypted("test-backend", "user.abc123", &enc).unwrap();
+            save_encrypted("test-provider", "user.abc123", &enc).unwrap();
 
-            let (client_id, loaded) = load_encrypted("test-backend").expect("should load");
+            let (client_id, loaded) = load_encrypted("test-provider").expect("should load");
             assert_eq!(client_id, "user.abc123");
             assert_eq!(loaded.iv_b64, enc.iv_b64);
             assert_eq!(loaded.ciphertext_b64, enc.ciphertext_b64);
             assert_eq!(loaded.mac_b64, enc.mac_b64);
 
-            assert!(clear("test-backend").unwrap());
-            assert!(!clear("test-backend").unwrap()); // second clear: already gone
-            assert!(load_encrypted("test-backend").is_none());
+            assert!(clear("test-provider").unwrap());
+            assert!(!clear("test-provider").unwrap()); // second clear: already gone
+            assert!(load_encrypted("test-provider").is_none());
         });
     }
 
     #[test]
     fn load_missing_returns_none() {
         with_tmp_home(|| {
-            assert!(load_encrypted("nonexistent-backend").is_none());
+            assert!(load_encrypted("nonexistent-provider").is_none());
         });
     }
 

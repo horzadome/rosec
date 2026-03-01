@@ -6,7 +6,7 @@ use zbus::fdo::Error as FdoError;
 use zbus::interface;
 use zbus::message::Header;
 
-use crate::state::{ServiceState, map_backend_error};
+use crate::state::{ServiceState, map_provider_error};
 
 /// Log the D-Bus caller at debug level for a secrets-extension method.
 fn log_caller(method: &str, header: &Header<'_>) {
@@ -42,13 +42,13 @@ impl RosecSecrets {
         log_caller("GetSecretAttributeNames", &header);
         self.state.touch_activity();
 
-        let (backend, item_id) = self.state.backend_and_id_for_path(item_path.as_str())?;
+        let (provider, item_id) = self.state.provider_and_id_for_path(item_path.as_str())?;
 
         let item_attrs = self
             .state
-            .run_on_tokio(async move { backend.get_item_attributes(&item_id).await })
+            .run_on_tokio(async move { provider.get_item_attributes(&item_id).await })
             .await?
-            .map_err(map_backend_error)?;
+            .map_err(map_provider_error)?;
 
         Ok(item_attrs.secret_names)
     }
@@ -72,19 +72,19 @@ impl RosecSecrets {
         log_caller("GetSecretAttribute", &header);
         self.state.touch_activity();
 
-        let (backend, item_id) = self.state.backend_and_id_for_path(item_path.as_str())?;
+        let (provider, item_id) = self.state.provider_and_id_for_path(item_path.as_str())?;
         let attr_name = attr_name.to_string();
         let attr_name_for_err = attr_name.clone();
 
         let secret = self
             .state
-            .run_on_tokio(async move { backend.get_secret_attr(&item_id, &attr_name).await })
+            .run_on_tokio(async move { provider.get_secret_attr(&item_id, &attr_name).await })
             .await?
             .map_err(|e| match e {
                 ProviderError::NotFound => {
                     FdoError::Failed(format!("attribute '{attr_name_for_err}' not found"))
                 }
-                other => map_backend_error(other),
+                other => map_provider_error(other),
             })?;
 
         Ok(secret.as_slice().to_vec())

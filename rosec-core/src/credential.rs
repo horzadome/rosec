@@ -145,30 +145,30 @@ pub fn decrypt(key: &StorageKey, fields: &EncryptedFields) -> Result<Zeroizing<V
     Ok(Zeroizing::new(plaintext.to_vec()))
 }
 
-/// Encrypt `client_secret` and persist the credential for `backend_id`.
+/// Encrypt `client_secret` and persist the credential for `provider_id`.
 ///
 /// The caller supplies a pre-derived `key` (64 bytes).  This function owns
 /// only the encrypt + save steps — key derivation is the caller's concern.
 pub fn encrypt_and_save(
-    backend_id: &str,
+    provider_id: &str,
     key: &StorageKey,
     client_id: &str,
     client_secret: &str,
 ) -> Result<(), String> {
     let plaintext = Zeroizing::new(client_secret.as_bytes().to_vec());
     let fields = encrypt(key, &plaintext)?;
-    oauth::save_encrypted(backend_id, client_id, &fields)
+    oauth::save_encrypted(provider_id, client_id, &fields)
 }
 
-/// Load and decrypt the OAuth credential for `backend_id`.
+/// Load and decrypt the OAuth credential for `provider_id`.
 ///
 /// Returns `None` if no credential is stored.
 /// Returns an error if the stored data is corrupt or MAC verification fails.
 pub fn load_and_decrypt(
-    backend_id: &str,
+    provider_id: &str,
     key: &StorageKey,
 ) -> Result<Option<OAuthCredential>, String> {
-    let Some((client_id, fields)) = oauth::load_encrypted(backend_id) else {
+    let Some((client_id, fields)) = oauth::load_encrypted(provider_id) else {
         return Ok(None);
     };
 
@@ -264,8 +264,8 @@ mod tests {
     fn save_and_load_roundtrip() {
         with_tmp_home(|| {
             let key = test_key(0x42);
-            encrypt_and_save("my-backend", &key, "user.abc", "s3cr3t").unwrap();
-            let cred = load_and_decrypt("my-backend", &key).unwrap().unwrap();
+            encrypt_and_save("my-provider", &key, "user.abc", "s3cr3t").unwrap();
+            let cred = load_and_decrypt("my-provider", &key).unwrap().unwrap();
             assert_eq!(cred.client_id, "user.abc");
             assert_eq!(cred.client_secret.as_str(), "s3cr3t");
         });
@@ -275,7 +275,11 @@ mod tests {
     fn load_missing_returns_none() {
         with_tmp_home(|| {
             let key = test_key(0x01);
-            assert!(load_and_decrypt("no-such-backend", &key).unwrap().is_none());
+            assert!(
+                load_and_decrypt("no-such-provider", &key)
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 }

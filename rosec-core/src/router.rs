@@ -1,6 +1,6 @@
 use std::sync::RwLock;
 
-use crate::dedup::{DedupConfig, backend_priority_map, dedup};
+use crate::dedup::{DedupConfig, dedup, provider_priority_map};
 use crate::{DedupStrategy, DedupTimeFallback, ItemMeta};
 
 #[derive(Debug, Clone)]
@@ -28,7 +28,7 @@ impl Router {
         }
     }
 
-    pub fn dedup(&self, items: Vec<ItemMeta>, backend_order: &[String]) -> Vec<ItemMeta> {
+    pub fn dedup(&self, items: Vec<ItemMeta>, provider_order: &[String]) -> Vec<ItemMeta> {
         let (strategy, time_fallback) = self
             .config
             .read()
@@ -38,7 +38,7 @@ impl Router {
             strategy,
             time_fallback,
         };
-        let priorities = backend_priority_map(backend_order.iter().cloned());
+        let priorities = provider_priority_map(provider_order.iter().cloned());
         dedup(items, config, &priorities).items
     }
 

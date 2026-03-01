@@ -15,21 +15,21 @@ use zbus::object_server::SignalEmitter;
 use zeroize::Zeroizing;
 
 use crate::service::to_object_path;
-use crate::state::{ServiceState, map_backend_error};
+use crate::state::{ServiceState, map_provider_error};
 use rosec_core::UnlockInput;
 
 pub struct SecretPrompt {
     pub path: String,
-    /// The backend that needs to be unlocked when `Prompt()` is called.
-    pub backend_id: String,
+    /// The provider that needs to be unlocked when `Prompt()` is called.
+    pub provider_id: String,
     pub state: Arc<ServiceState>,
 }
 
 impl SecretPrompt {
-    pub fn new(path: String, backend_id: String, state: Arc<ServiceState>) -> Self {
+    pub fn new(path: String, provider_id: String, state: Arc<ServiceState>) -> Self {
         Self {
             path,
-            backend_id,
+            provider_id,
             state,
         }
     }
@@ -57,13 +57,13 @@ impl SecretPrompt {
     ) -> zbus::fdo::Result<()> {
         let state = Arc::clone(&self.state);
         let prompt_path = self.path.clone();
-        let backend_id = self.backend_id.clone();
+        let provider_id = self.provider_id.clone();
 
         // Determine a human-readable label for the prompt dialog.
         let label = state
-            .backend_by_id(&backend_id)
+            .provider_by_id(&provider_id)
             .map(|b| format!("Unlock {}", b.name()))
-            .unwrap_or_else(|| format!("Unlock {backend_id}"));
+            .unwrap_or_else(|| format!("Unlock {provider_id}"));
 
         // Spawn the entire credential-collection + unlock sequence as a
         // background task.  The method returns immediately; the client waits
@@ -77,7 +77,7 @@ impl SecretPrompt {
         state
             .run_on_tokio(async move {
                 tokio::spawn(async move {
-                    run_prompt_task(state2, prompt_path, backend_id, label, ctxt_owned).await;
+                    run_prompt_task(state2, prompt_path, provider_id, label, ctxt_owned).await;
                 });
             })
             .await?;
@@ -117,7 +117,7 @@ impl SecretPrompt {
 async fn run_prompt_task(
     state: Arc<ServiceState>,
     prompt_path: String,
-    backend_id: String,
+    provider_id: String,
     label: String,
     ctxt: SignalEmitter<'static>,
 ) {
@@ -133,12 +133,12 @@ async fn run_prompt_task(
     // Collect credentials via spawn_blocking (blocks on subprocess I/O).
     let state2 = Arc::clone(&state);
     let prompt_path2 = prompt_path.clone();
-    let backend_id2 = backend_id.clone();
+    let provider_id2 = provider_id.clone();
     let label2 = label.clone();
 
     let password_result: Result<Zeroizing<String>, zbus::fdo::Error> =
         match tokio::task::spawn_blocking(move || {
-            state2.spawn_prompt(&prompt_path2, &backend_id2, &label2)
+            state2.spawn_prompt(&prompt_path2, &provider_id2, &label2)
         })
         .await
         {
@@ -153,41 +153,41 @@ async fn run_prompt_task(
 
     match password_result {
         Err(e) => {
-            tracing::debug!(backend = %backend_id, error = %e, "prompt dismissed or failed");
+            tracing::debug!(provider = %provider_id, error = %e, "prompt dismissed or failed");
             state.finish_prompt(&prompt_path);
             emit_dismissed(&ctxt).await;
         }
         Ok(password) => {
-            // Perform the actual backend unlock — password never leaves this process.
-            let Some(backend) = state.backend_by_id(&backend_id) else {
-                tracing::warn!(backend = %backend_id, "backend not found after prompt");
+            // Perform the actual provider unlock — password never leaves this process.
+            let Some(provider) = state.provider_by_id(&provider_id) else {
+                tracing::warn!(provider = %provider_id, "provider not found after prompt");
                 state.finish_prompt(&prompt_path);
                 emit_dismissed(&ctxt).await;
                 return;
             };
 
-            let unlock_result = backend
+            let unlock_result = provider
                 .unlock(UnlockInput::Password(password))
                 .await
-                .map_err(map_backend_error);
+                .map_err(map_provider_error);
 
             state.finish_prompt(&prompt_path);
 
             match unlock_result {
                 Ok(()) => {
-                    state.mark_backend_unlocked(&backend_id);
+                    state.mark_provider_unlocked(&provider_id);
                     state.touch_activity();
 
                     // Trigger a cache sync immediately so items are visible
                     // without waiting for the background poller.
                     let state3 = Arc::clone(&state);
-                    let bid = backend_id.clone();
-                    if let Err(e) = state3.sync_backend(&bid).await {
-                        tracing::debug!(backend = %bid, error = %e,
+                    let bid = provider_id.clone();
+                    if let Err(e) = state3.sync_provider(&bid).await {
+                        tracing::debug!(provider = %bid, error = %e,
                             "post-unlock sync failed (non-fatal)");
                     }
 
-                    tracing::debug!(backend = %backend_id, "backend unlocked via Prompt");
+                    tracing::debug!(provider = %provider_id, "provider unlocked via Prompt");
 
                     let collection = zvariant::Value::from(to_object_path(
                         "/org/freedesktop/secrets/collection/default",
@@ -197,7 +197,7 @@ async fn run_prompt_task(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(backend = %backend_id, error = %e,
+                    tracing::warn!(provider = %provider_id, error = %e,
                         "unlock failed after prompt");
                     emit_dismissed(&ctxt).await;
                 }
