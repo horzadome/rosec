@@ -1,7 +1,7 @@
 use std::sync::RwLock;
 
 use crate::dedup::{DedupConfig, backend_priority_map, dedup};
-use crate::{DedupStrategy, DedupTimeFallback, VaultItemMeta};
+use crate::{DedupStrategy, DedupTimeFallback, ItemMeta};
 
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
@@ -28,7 +28,7 @@ impl Router {
         }
     }
 
-    pub fn dedup(&self, items: Vec<VaultItemMeta>, backend_order: &[String]) -> Vec<VaultItemMeta> {
+    pub fn dedup(&self, items: Vec<ItemMeta>, backend_order: &[String]) -> Vec<ItemMeta> {
         let (strategy, time_fallback) = self
             .config
             .read()
@@ -42,7 +42,7 @@ impl Router {
         dedup(items, config, &priorities).items
     }
 
-    pub fn partition_locked(items: Vec<VaultItemMeta>) -> (Vec<VaultItemMeta>, Vec<VaultItemMeta>) {
+    pub fn partition_locked(items: Vec<ItemMeta>) -> (Vec<ItemMeta>, Vec<ItemMeta>) {
         let mut unlocked = Vec::new();
         let mut locked = Vec::new();
         for item in items {
@@ -64,18 +64,18 @@ mod tests {
     #[test]
     fn partitions_locked_items() {
         let items = vec![
-            VaultItemMeta {
+            ItemMeta {
                 id: "1".to_string(),
-                backend_id: "a".to_string(),
+                provider_id: "a".to_string(),
                 label: "one".to_string(),
                 attributes: Attributes::new(),
                 created: None,
                 modified: None,
                 locked: false,
             },
-            VaultItemMeta {
+            ItemMeta {
                 id: "2".to_string(),
-                backend_id: "b".to_string(),
+                provider_id: "b".to_string(),
                 label: "two".to_string(),
                 attributes: Attributes::new(),
                 created: None,

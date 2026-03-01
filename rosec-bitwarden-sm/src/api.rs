@@ -582,9 +582,9 @@ pub enum SmApiError {
     Crypto(String),
 }
 
-impl From<SmApiError> for rosec_core::BackendError {
+impl From<SmApiError> for rosec_core::ProviderError {
     fn from(e: SmApiError) -> Self {
-        rosec_core::BackendError::Unavailable(e.to_string())
+        rosec_core::ProviderError::Unavailable(e.to_string())
     }
 }
 

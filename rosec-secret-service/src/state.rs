@@ -8,7 +8,8 @@ use rosec_core::config::{Config, PromptConfig};
 use rosec_core::dedup::is_stale;
 use rosec_core::router::Router;
 use rosec_core::{
-    Attributes, AutoLockPolicy, BackendError, SecretBytes, UnlockInput, VaultBackend, VaultItemMeta,
+    Attributes, AutoLockPolicy, Capability, ItemMeta, Provider, ProviderError, SecretBytes,
+    UnlockInput,
 };
 use tracing::{debug, info, warn};
 use zbus::Connection;
@@ -24,17 +25,17 @@ use crate::session::SessionManager;
 /// not configured for a backend.
 ///
 /// The service iterates these patterns in order, calling `get_secret_attr()` for
-/// the first sensitive attribute name that matches.  Falls back to the legacy
-/// `backend.get_secret()` only if no attribute matches (backward compatibility).
+/// the first sensitive attribute name that matches.  Falls back to
+/// `rosec_core::primary_secret()` if no attribute matches.
 const DEFAULT_RETURN_ATTR: &[&str] = &["password", "number", "private_key", "notes"];
 
 // TODO(P3-12): Decompose ServiceState into focused sub-structs.
 //
 // Current state: 15+ fields covering 4 distinct concerns.  Proposed grouping:
 //
-// 1. **BackendRegistry** — `backends`, `backend_order`, `return_attr_map`,
-//    `collection_map`.  Owns backend lifecycle (add/remove/hot-reload) and
-//    per-backend config.  Methods: `get()`, `get_order()`, `add()`, `remove()`,
+// 1. **ProviderRegistry** — `backends`, `backend_order`, `return_attr_map`,
+//    `collection_map`.  Owns provider lifecycle (add/remove/hot-reload) and
+//    per-provider config.  Methods: `get()`, `get_order()`, `add()`, `remove()`,
 //    `reload()`, `return_attr_for()`, `collection_for()`.
 //
 // 2. **ItemCache** — `items`, `registered_items`, `metadata_cache`, `last_sync`.
@@ -57,11 +58,11 @@ const DEFAULT_RETURN_ATTR: &[&str] = &["password", "number", "private_key", "not
 //
 // Migration: introduce sub-structs one at a time behind the same public API.
 // Start with PromptManager (smallest, fewest callers), then LockPolicy,
-// then ItemCache, then BackendRegistry.  Each step is independently testable.
+// then ItemCache, then ProviderRegistry.  Each step is independently testable.
 pub struct ServiceState {
-    /// All registered backends, keyed by backend ID.
+    /// All registered providers, keyed by provider ID.
     /// Wrapped in `RwLock` to support hot-reload without restarting.
-    backends: RwLock<HashMap<String, Arc<dyn VaultBackend>>>,
+    backends: RwLock<HashMap<String, Arc<dyn Provider>>>,
     /// Backend IDs in the order they were configured (fan-out order).
     backend_order: RwLock<Vec<String>>,
     /// Per-backend ordered list of attribute name glob patterns used to
@@ -77,7 +78,7 @@ pub struct ServiceState {
     collection_map: RwLock<HashMap<String, String>>,
     pub router: Arc<Router>,
     pub sessions: Arc<SessionManager>,
-    pub items: Arc<Mutex<HashMap<String, VaultItemMeta>>>,
+    pub items: Arc<Mutex<HashMap<String, ItemMeta>>>,
     pub registered_items: Arc<Mutex<HashSet<String>>>,
     pub last_sync: Arc<Mutex<Option<SystemTime>>>,
     pub conn: Connection,
@@ -97,7 +98,7 @@ pub struct ServiceState {
     /// `SearchItems`, `SearchItemsGlob`, and `resolve_item_path` (hash lookup)
     /// read from this cache, ensuring they always return results regardless of
     /// backend lock state.
-    metadata_cache: Arc<Mutex<HashMap<String, VaultItemMeta>>>,
+    metadata_cache: Arc<Mutex<HashMap<String, ItemMeta>>>,
     /// Prevents multiple simultaneous unlock attempts for the same backend.
     unlock_in_progress: tokio::sync::Mutex<()>,
     /// Per-backend sync coalescing: ensures at most one active sync per backend.
@@ -158,7 +159,7 @@ impl std::fmt::Debug for ServiceState {
 
 impl ServiceState {
     pub fn new(
-        backends: Vec<Arc<dyn VaultBackend>>,
+        backends: Vec<Arc<dyn Provider>>,
         router: Arc<Router>,
         sessions: Arc<SessionManager>,
         conn: Connection,
@@ -182,7 +183,7 @@ impl ServiceState {
     /// `return_attr_map` maps backend ID → ordered glob patterns.  Backends
     /// not present in the map fall back to `DEFAULT_RETURN_ATTR`.
     pub fn new_with_return_attr(
-        backends: Vec<Arc<dyn VaultBackend>>,
+        backends: Vec<Arc<dyn Provider>>,
         router: Arc<Router>,
         sessions: Arc<SessionManager>,
         conn: Connection,
@@ -206,7 +207,7 @@ impl ServiceState {
     /// and the full live `Config` for hot-reload support.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_config(
-        backends: Vec<Arc<dyn VaultBackend>>,
+        backends: Vec<Arc<dyn Provider>>,
         router: Arc<Router>,
         sessions: Arc<SessionManager>,
         conn: Connection,
@@ -217,7 +218,7 @@ impl ServiceState {
         initial_config: Config,
     ) -> Self {
         let backend_order: Vec<String> = backends.iter().map(|b| b.id().to_string()).collect();
-        let backends_map: HashMap<String, Arc<dyn VaultBackend>> = backends
+        let backends_map: HashMap<String, Arc<dyn Provider>> = backends
             .into_iter()
             .map(|b| (b.id().to_string(), b))
             .collect();
@@ -287,24 +288,19 @@ impl ServiceState {
     /// Resolve the primary secret for an item using `return_attr` patterns.
     ///
     /// Iterates the configured (or default) patterns in order and returns the
-    /// first sensitive attribute that the backend can resolve.  Falls back to
-    /// `backend.get_secret()` only when the backend does not support
-    /// `get_secret_attr()` (i.e. returns `BackendError::NotSupported`).
+    /// first sensitive attribute that the provider can resolve.  Falls back to
+    /// `rosec_core::primary_secret()` if no pattern matches.
     pub async fn resolve_primary_secret(
         &self,
-        backend: Arc<dyn VaultBackend>,
+        provider: Arc<dyn Provider>,
         item_id: &str,
-    ) -> Result<SecretBytes, BackendError> {
-        let patterns = self.return_attr_patterns(backend.id());
+    ) -> Result<SecretBytes, ProviderError> {
+        let patterns = self.return_attr_patterns(provider.id());
 
-        // Ask the backend for the available secret attribute names so we can
+        // Ask the provider for the available secret attribute names so we can
         // do pattern matching without calling get_secret_attr for every pattern.
-        let attr_names: Vec<String> = match backend.get_item_attributes(item_id).await {
+        let attr_names: Vec<String> = match provider.get_item_attributes(item_id).await {
             Ok(ia) => ia.secret_names,
-            // Backend doesn't support attribute model — fall back to legacy.
-            Err(BackendError::NotSupported) => {
-                return backend.get_secret(item_id).await;
-            }
             Err(e) => return Err(e),
         };
 
@@ -312,46 +308,48 @@ impl ServiceState {
         for pattern in &patterns {
             let wm = WildMatch::new(pattern);
             if let Some(matched) = attr_names.iter().find(|n| wm.matches(n)) {
-                match backend.get_secret_attr(item_id, matched).await {
+                match provider.get_secret_attr(item_id, matched).await {
                     Ok(secret) => return Ok(secret),
                     // Attr exists in the list but couldn't be resolved — skip.
-                    Err(BackendError::NotFound) => continue,
+                    Err(ProviderError::NotFound) => continue,
                     Err(e) => return Err(e),
                 }
             }
         }
 
-        // No pattern matched — fall back to legacy get_secret.
-        backend.get_secret(item_id).await
+        // No pattern matched — fall back to primary_secret.
+        rosec_core::primary_secret(&*provider, item_id).await
     }
 
-    /// Resolve a D-Bus item path to the `(backend, item_id)` pair needed by
+    /// Resolve a D-Bus item path to the `(provider, item_id)` pair needed by
     /// the rosec extension D-Bus methods.
     ///
-    /// Looks the path up in the item cache to find the backend ID and vault item
-    /// ID, then returns the backend arc.  Returns an `FdoError` if not found.
+    /// Looks the path up in the item cache to find the provider ID and item
+    /// ID, then returns the provider arc.  Returns an `FdoError` if not found.
     pub fn backend_and_id_for_path(
         &self,
         item_path: &str,
-    ) -> Result<(Arc<dyn VaultBackend>, String), FdoError> {
+    ) -> Result<(Arc<dyn Provider>, String), FdoError> {
         let items = self.items.lock().map_err(|_| {
-            map_backend_error(BackendError::Unavailable("items lock poisoned".to_string()))
+            map_backend_error(ProviderError::Unavailable(
+                "items lock poisoned".to_string(),
+            ))
         })?;
         let meta = items
             .get(item_path)
             .ok_or_else(|| FdoError::Failed(format!("item '{item_path}' not found in cache")))?;
         let item_id = meta.id.clone();
-        let backend_id = meta.backend_id.clone();
+        let provider_id = meta.provider_id.clone();
         drop(items);
 
-        let backend = self
-            .backend_by_id(&backend_id)
-            .ok_or_else(|| FdoError::Failed(format!("backend '{backend_id}' not found")))?;
-        Ok((backend, item_id))
+        let provider = self
+            .backend_by_id(&provider_id)
+            .ok_or_else(|| FdoError::Failed(format!("provider '{provider_id}' not found")))?;
+        Ok((provider, item_id))
     }
 
-    /// Return all backends in configured order.
-    pub fn backends_ordered(&self) -> Vec<Arc<dyn VaultBackend>> {
+    /// Return all providers in configured order.
+    pub fn backends_ordered(&self) -> Vec<Arc<dyn Provider>> {
         let order = self.backend_order.read().unwrap_or_else(|e| e.into_inner());
         let map = self.backends.read().unwrap_or_else(|e| e.into_inner());
         order
@@ -361,8 +359,8 @@ impl ServiceState {
             .collect()
     }
 
-    /// Look up a backend by its ID.
-    pub fn backend_by_id(&self, id: &str) -> Option<Arc<dyn VaultBackend>> {
+    /// Look up a provider by its ID.
+    pub fn backend_by_id(&self, id: &str) -> Option<Arc<dyn Provider>> {
         self.backends
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -370,20 +368,20 @@ impl ServiceState {
             .map(Arc::clone)
     }
 
-    /// Return the backend to use for write operations.
+    /// Return the provider to use for write operations.
     ///
     /// Resolution order:
-    /// 1. If `service.write_backend` is configured, return that backend if it supports writes
-    /// 2. Otherwise, return the first backend that supports writes
-    /// 3. If no write-capable backend exists, return None
-    pub fn write_backend(&self) -> Option<Arc<dyn VaultBackend>> {
+    /// 1. If `service.write_backend` is configured, return that provider if it supports writes
+    /// 2. Otherwise, return the first provider that supports writes
+    /// 3. If no write-capable provider exists, return None
+    pub fn write_backend(&self) -> Option<Arc<dyn Provider>> {
         let config = self.live_config();
 
         if let Some(ref backend_id) = config.service.write_backend
-            && let Some(backend) = self.backend_by_id(backend_id)
-            && backend.supports_writes()
+            && let Some(provider) = self.backend_by_id(backend_id)
+            && provider.capabilities().contains(&Capability::Write)
         {
-            return Some(backend);
+            return Some(provider);
         }
 
         if let Some(ref backend_id) = config.service.write_backend {
@@ -395,7 +393,7 @@ impl ServiceState {
 
         self.backends_ordered()
             .into_iter()
-            .find(|b| b.supports_writes())
+            .find(|b| b.capabilities().contains(&Capability::Write))
     }
 
     /// Spawn `fut` on the Tokio runtime and await the result.
@@ -424,10 +422,10 @@ impl ServiceState {
             .len()
     }
 
-    /// Hot-add a new backend at runtime.
+    /// Hot-add a new provider at runtime.
     ///
-    /// No-op if a backend with the same ID is already registered.
-    pub fn hotreload_add_backend(&self, backend: Arc<dyn VaultBackend>) {
+    /// No-op if a provider with the same ID is already registered.
+    pub fn hotreload_add_backend(&self, backend: Arc<dyn Provider>) {
         let id = backend.id().to_string();
         let mut map = self.backends.write().unwrap_or_else(|e| e.into_inner());
         if map.contains_key(&id) {
@@ -464,13 +462,13 @@ impl ServiceState {
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|existing| existing != id);
 
-            // Purge all items belonging to the removed backend from both caches
+            // Purge all items belonging to the removed provider from both caches
             // so they don't appear as ghost entries in SearchItems results.
             if let Ok(mut items) = self.items.lock() {
-                items.retain(|_, meta| meta.backend_id != id);
+                items.retain(|_, meta| meta.provider_id != id);
             }
             if let Ok(mut cache) = self.metadata_cache.lock() {
-                cache.retain(|_, meta| meta.backend_id != id);
+                cache.retain(|_, meta| meta.provider_id != id);
             }
         }
         found
@@ -631,26 +629,18 @@ impl ServiceState {
 
     /// Resolve the effective autolock policy for a given backend/vault ID.
     ///
-    /// Looks up per-backend/per-vault overrides from the live config and merges
+    /// Looks up per-provider overrides from the live config and merges
     /// them on top of the global `[autolock]` section.  If no override is
-    /// configured for this backend, returns the global policy as-is.
-    pub fn effective_autolock_policy(&self, backend_id: &str) -> AutoLockPolicy {
+    /// configured for this provider, returns the global policy as-is.
+    pub fn effective_autolock_policy(&self, provider_id: &str) -> AutoLockPolicy {
         let config = self.live_config();
         let global = &config.autolock;
 
-        // Check backend entries first, then vault entries.
         let overrides = config
-            .backend
+            .provider
             .iter()
-            .find(|b| b.id == backend_id)
-            .and_then(|b| b.autolock.as_ref())
-            .or_else(|| {
-                config
-                    .vault
-                    .iter()
-                    .find(|v| v.id == backend_id)
-                    .and_then(|v| v.autolock.as_ref())
-            });
+            .find(|p| p.id == provider_id)
+            .and_then(|p| p.autolock.as_ref());
 
         match overrides {
             Some(o) => global.merge(o),
@@ -1204,7 +1194,9 @@ impl ServiceState {
         attrs: &HashMap<String, String>,
     ) -> Result<(Vec<String>, Vec<String>), FdoError> {
         let items = self.items.lock().map_err(|_| {
-            map_backend_error(BackendError::Unavailable("items lock poisoned".to_string()))
+            map_backend_error(ProviderError::Unavailable(
+                "items lock poisoned".to_string(),
+            ))
         })?;
 
         Ok(partition_by_glob(items.iter(), attrs))
@@ -1222,7 +1214,7 @@ impl ServiceState {
         attrs: &HashMap<String, String>,
     ) -> Result<(Vec<String>, Vec<String>), FdoError> {
         let cache = self.metadata_cache.lock().map_err(|_| {
-            map_backend_error(BackendError::Unavailable(
+            map_backend_error(ProviderError::Unavailable(
                 "metadata_cache lock poisoned".to_string(),
             ))
         })?;
@@ -1256,7 +1248,7 @@ impl ServiceState {
         attrs: &HashMap<String, String>,
     ) -> Result<(Vec<String>, Vec<String>), FdoError> {
         let cache = self.metadata_cache.lock().map_err(|_| {
-            map_backend_error(BackendError::Unavailable(
+            map_backend_error(ProviderError::Unavailable(
                 "metadata_cache lock poisoned".to_string(),
             ))
         })?;
@@ -1273,7 +1265,7 @@ impl ServiceState {
     pub fn mark_backend_locked_in_cache(&self, backend_id: &str) {
         if let Ok(mut cache) = self.metadata_cache.lock() {
             for meta in cache.values_mut() {
-                if meta.backend_id == backend_id {
+                if meta.provider_id == backend_id {
                     meta.locked = true;
                 }
             }
@@ -1297,11 +1289,13 @@ impl ServiceState {
         self: &Arc<Self>,
         attributes: Option<HashMap<String, String>>,
         item_paths: Option<&[String]>,
-    ) -> Result<Vec<(String, VaultItemMeta)>, FdoError> {
+    ) -> Result<Vec<(String, ItemMeta)>, FdoError> {
         // Path lookup is synchronous — no Tokio needed.
         if let Some(item_paths) = item_paths {
             let state_items = self.items.lock().map_err(|_| {
-                map_backend_error(BackendError::Unavailable("items lock poisoned".to_string()))
+                map_backend_error(ProviderError::Unavailable(
+                    "items lock poisoned".to_string(),
+                ))
             })?;
             return Ok(item_paths
                 .iter()
@@ -1384,7 +1378,7 @@ impl ServiceState {
                 // Count only items belonging to this backend.
                 let count = entries
                     .iter()
-                    .filter(|(_, meta)| meta.backend_id == backend_id)
+                    .filter(|(_, meta)| meta.provider_id == backend_id)
                     .count() as u32;
                 Ok(count)
             })
@@ -1455,7 +1449,7 @@ impl ServiceState {
 
     /// Rebuild the item cache from in-memory backend state.
     /// Dispatches to Tokio so that unlock and list futures run on the Tokio reactor.
-    pub async fn rebuild_cache(self: &Arc<Self>) -> Result<Vec<(String, VaultItemMeta)>, FdoError> {
+    pub async fn rebuild_cache(self: &Arc<Self>) -> Result<Vec<(String, ItemMeta)>, FdoError> {
         let this = Arc::clone(self);
         self.tokio_handle
             .spawn(async move { this.rebuild_cache_inner().await })
@@ -1463,14 +1457,14 @@ impl ServiceState {
             .map_err(|e| FdoError::Failed(format!("cache rebuild task panicked: {e}")))?
     }
 
-    pub(crate) async fn ensure_cache_inner(
-        &self,
-    ) -> Result<Vec<(String, VaultItemMeta)>, FdoError> {
+    pub(crate) async fn ensure_cache_inner(&self) -> Result<Vec<(String, ItemMeta)>, FdoError> {
         let has_items = self
             .items
             .lock()
             .map_err(|_| {
-                map_backend_error(BackendError::Unavailable("items lock poisoned".to_string()))
+                map_backend_error(ProviderError::Unavailable(
+                    "items lock poisoned".to_string(),
+                ))
             })
             .map(|g| !g.is_empty())?;
 
@@ -1479,7 +1473,9 @@ impl ServiceState {
                 return self.rebuild_cache_inner().await;
             }
             let state_items = self.items.lock().map_err(|_| {
-                map_backend_error(BackendError::Unavailable("items lock poisoned".to_string()))
+                map_backend_error(ProviderError::Unavailable(
+                    "items lock poisoned".to_string(),
+                ))
             })?;
             return Ok(state_items
                 .iter()
@@ -1493,7 +1489,9 @@ impl ServiceState {
         let entries = self.fetch_entries().await?;
         self.register_items(&entries).await?;
         let mut state_items = self.items.lock().map_err(|_| {
-            map_backend_error(BackendError::Unavailable("items lock poisoned".to_string()))
+            map_backend_error(ProviderError::Unavailable(
+                "items lock poisoned".to_string(),
+            ))
         })?;
         state_items.clear();
         for (path, item) in entries.iter() {
@@ -1502,9 +1500,7 @@ impl ServiceState {
         Ok(entries)
     }
 
-    pub(crate) async fn rebuild_cache_inner(
-        &self,
-    ) -> Result<Vec<(String, VaultItemMeta)>, FdoError> {
+    pub(crate) async fn rebuild_cache_inner(&self) -> Result<Vec<(String, ItemMeta)>, FdoError> {
         let entries = self.fetch_entries().await?;
         self.register_items(&entries).await?;
 
@@ -1513,15 +1509,17 @@ impl ServiceState {
         // cached items from backends that were skipped (still locked).
         let fresh_backends: HashSet<String> = entries
             .iter()
-            .map(|(_, meta)| meta.backend_id.clone())
+            .map(|(_, meta)| meta.provider_id.clone())
             .collect();
 
         {
             let mut state_items = self.items.lock().map_err(|_| {
-                map_backend_error(BackendError::Unavailable("items lock poisoned".to_string()))
+                map_backend_error(ProviderError::Unavailable(
+                    "items lock poisoned".to_string(),
+                ))
             })?;
             // Remove old entries only for backends that were refreshed.
-            state_items.retain(|_, meta| !fresh_backends.contains(&meta.backend_id));
+            state_items.retain(|_, meta| !fresh_backends.contains(&meta.provider_id));
             // Insert fresh entries.
             for (path, item) in entries.iter() {
                 state_items.insert(path.clone(), item.clone());
@@ -1534,12 +1532,12 @@ impl ServiceState {
         // previous metadata_cache entries with `locked: true`.
         {
             let mut cache = self.metadata_cache.lock().map_err(|_| {
-                map_backend_error(BackendError::Unavailable(
+                map_backend_error(ProviderError::Unavailable(
                     "metadata_cache lock poisoned".to_string(),
                 ))
             })?;
             // Remove old entries for backends that were refreshed.
-            cache.retain(|_, meta| !fresh_backends.contains(&meta.backend_id));
+            cache.retain(|_, meta| !fresh_backends.contains(&meta.provider_id));
             // Insert fresh entries.
             for (path, meta) in entries.iter() {
                 cache.insert(path.clone(), meta.clone());
@@ -1550,8 +1548,8 @@ impl ServiceState {
         Ok(entries)
     }
 
-    async fn fetch_entries(&self) -> Result<Vec<(String, VaultItemMeta)>, FdoError> {
-        let mut all_items: Vec<VaultItemMeta> = Vec::new();
+    async fn fetch_entries(&self) -> Result<Vec<(String, ItemMeta)>, FdoError> {
+        let mut all_items: Vec<ItemMeta> = Vec::new();
         let mut backend_ids: Vec<String> = Vec::new();
         for backend in self.backends_ordered() {
             let bid = backend.id().to_string();
@@ -1560,7 +1558,7 @@ impl ServiceState {
                 .await?;
             let fetched = match result {
                 Ok(items) => items,
-                Err(BackendError::Locked) => {
+                Err(ProviderError::Locked) => {
                     // Backend is locked — skip it so the remaining backends
                     // still populate the cache.  The user must unlock it first.
                     debug!(backend = %bid, "skipping locked backend during cache fetch");
@@ -1576,11 +1574,11 @@ impl ServiceState {
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&bid)
                 .cloned();
-            let tagged: Vec<VaultItemMeta> = fetched
+            let tagged: Vec<ItemMeta> = fetched
                 .into_iter()
                 .map(|mut item| {
-                    if item.backend_id.is_empty() {
-                        item.backend_id = bid.clone();
+                    if item.provider_id.is_empty() {
+                        item.provider_id = bid.clone();
                     }
                     // Stamp collection label if configured and not already set
                     // by the backend itself.
@@ -1603,13 +1601,13 @@ impl ServiceState {
             .to_string();
         let mut entries = Vec::with_capacity(deduped.len());
         for (idx, mut item) in deduped.into_iter().enumerate() {
-            if item.backend_id.is_empty() {
-                item.backend_id = fallback_bid.clone();
+            if item.provider_id.is_empty() {
+                item.provider_id = fallback_bid.clone();
             }
             if item.id.is_empty() {
                 item.id = format!("auto-{idx}");
             }
-            let path = make_item_path(&item.backend_id, &item.id);
+            let path = make_item_path(&item.provider_id, &item.id);
             entries.push((path, item));
         }
         Ok(entries)
@@ -1617,7 +1615,7 @@ impl ServiceState {
 
     fn should_rebuild_cache(&self) -> Result<bool, FdoError> {
         let last_sync = self.last_sync.lock().map_err(|_| {
-            map_backend_error(BackendError::Unavailable("sync lock poisoned".to_string()))
+            map_backend_error(ProviderError::Unavailable("sync lock poisoned".to_string()))
         })?;
         if let Some(last_sync) = *last_sync {
             Ok(is_stale(last_sync, 1))
@@ -1628,7 +1626,7 @@ impl ServiceState {
 
     fn update_cache_time(&self) -> Result<(), FdoError> {
         let mut last_sync = self.last_sync.lock().map_err(|_| {
-            map_backend_error(BackendError::Unavailable("sync lock poisoned".to_string()))
+            map_backend_error(ProviderError::Unavailable("sync lock poisoned".to_string()))
         })?;
         *last_sync = Some(SystemTime::now());
         Ok(())
@@ -1636,13 +1634,13 @@ impl ServiceState {
 
     pub(crate) async fn register_items(
         &self,
-        entries: &[(String, VaultItemMeta)],
+        entries: &[(String, ItemMeta)],
     ) -> Result<(), FdoError> {
         let server = self.conn.object_server();
         let mut pending = Vec::new();
         {
             let registered = self.registered_items.lock().map_err(|_| {
-                map_backend_error(BackendError::Unavailable(
+                map_backend_error(ProviderError::Unavailable(
                     "registered lock poisoned".to_string(),
                 ))
             })?;
@@ -1661,15 +1659,15 @@ impl ServiceState {
         for (path, item) in &pending {
             // Look up the correct backend for this item
             let backend = self
-                .backend_by_id(&item.backend_id)
+                .backend_by_id(&item.provider_id)
                 .or_else(|| self.backends_ordered().into_iter().next())
                 .ok_or_else(|| {
-                    map_backend_error(BackendError::Unavailable(format!(
-                        "no backend found for item backend_id '{}'",
-                        item.backend_id
+                    map_backend_error(ProviderError::Unavailable(format!(
+                        "no provider found for item provider_id '{}'",
+                        item.provider_id
                     )))
                 })?;
-            let return_attr_patterns = self.return_attr_patterns(&item.backend_id);
+            let return_attr_patterns = self.return_attr_patterns(&item.provider_id);
             let state = ItemState {
                 meta: item.clone(),
                 path: path.clone(),
@@ -1686,7 +1684,7 @@ impl ServiceState {
         }
 
         let mut registered = self.registered_items.lock().map_err(|_| {
-            map_backend_error(BackendError::Unavailable(
+            map_backend_error(ProviderError::Unavailable(
                 "registered lock poisoned".to_string(),
             ))
         })?;
@@ -1765,30 +1763,32 @@ fn build_prompt_json(backend_id: String, label: &str, cfg: &PromptConfig) -> Str
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn map_backend_error(err: BackendError) -> FdoError {
+pub(crate) fn map_backend_error(err: ProviderError) -> FdoError {
     match err {
-        BackendError::Locked => FdoError::Failed("locked".to_string()),
-        BackendError::NotFound => FdoError::Failed("not found".to_string()),
-        BackendError::NotSupported => FdoError::NotSupported("not supported".to_string()),
+        ProviderError::Locked => FdoError::Failed("locked".to_string()),
+        ProviderError::NotFound => FdoError::Failed("not found".to_string()),
+        ProviderError::NotSupported => FdoError::NotSupported("not supported".to_string()),
         // Unavailable carries a reason string already intended for callers
-        // (e.g. "backend locked", "network unreachable") — pass it through.
-        BackendError::Unavailable(reason) => FdoError::Failed(reason),
+        // (e.g. "provider locked", "network unreachable") — pass it through.
+        ProviderError::Unavailable(reason) => FdoError::Failed(reason),
         // Sentinel string detected by the CLI to trigger the registration retry flow.
-        BackendError::RegistrationRequired => FdoError::Failed("registration_required".to_string()),
-        // Wrong password/passphrase — the backend has stored credentials but
+        ProviderError::RegistrationRequired => {
+            FdoError::Failed("registration_required".to_string())
+        }
+        // Wrong password/passphrase — the provider has stored credentials but
         // the provided password produced a wrong decryption key.  The unlock
         // sweep should re-prompt individually rather than entering registration.
-        BackendError::AuthFailed => FdoError::Failed("auth_failed".to_string()),
+        ProviderError::AuthFailed => FdoError::Failed("auth_failed".to_string()),
         // Item already exists (for create with replace=false).
-        BackendError::AlreadyExists => FdoError::Failed("already exists".to_string()),
+        ProviderError::AlreadyExists => FdoError::Failed("already exists".to_string()),
         // Invalid input (validation failed).
-        BackendError::InvalidInput(reason) => FdoError::Failed(reason.to_string()),
+        ProviderError::InvalidInput(reason) => FdoError::Failed(reason.to_string()),
         // Other/internal errors: log the full chain server-side, return an
         // opaque message to the D-Bus caller to avoid leaking internal detail
         // (cipher UUIDs, server HTTP bodies, file paths, etc.).
-        BackendError::Other(err) => {
-            warn!(error = %err, "internal backend error");
-            FdoError::Failed("backend error".to_string())
+        ProviderError::Other(err) => {
+            warn!(error = %err, "internal provider error");
+            FdoError::Failed("provider error".to_string())
         }
     }
 }
@@ -1809,7 +1809,7 @@ fn attributes_match(item: &Attributes, query: &Attributes) -> bool {
 /// The special key `"name"` matches against the item label.  All patterns must
 /// match (AND semantics) for an item to be included.
 fn partition_by_glob<'a>(
-    entries: impl Iterator<Item = (&'a String, &'a VaultItemMeta)>,
+    entries: impl Iterator<Item = (&'a String, &'a ItemMeta)>,
     attrs: &HashMap<String, String>,
 ) -> (Vec<String>, Vec<String>) {
     let mut unlocked = Vec::new();
@@ -1885,25 +1885,21 @@ mod tests {
     use std::sync::Arc;
 
     use rosec_core::router::RouterConfig;
-    use rosec_core::{BackendStatus, SecretBytes, UnlockInput, VaultItem};
+    use rosec_core::{ProviderStatus, SecretBytes, UnlockInput};
 
     #[derive(Debug)]
     struct MockBackend {
-        items: Vec<VaultItemMeta>,
+        items: Vec<ItemMeta>,
     }
 
     impl MockBackend {
-        fn new(items: Vec<VaultItemMeta>) -> Self {
+        fn new(items: Vec<ItemMeta>) -> Self {
             Self { items }
         }
     }
 
     #[async_trait::async_trait]
-    impl VaultBackend for MockBackend {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
+    impl Provider for MockBackend {
         fn id(&self) -> &str {
             "mock"
         }
@@ -1916,40 +1912,26 @@ mod tests {
             "mock"
         }
 
-        async fn status(&self) -> Result<BackendStatus, BackendError> {
-            Ok(BackendStatus {
+        async fn status(&self) -> Result<ProviderStatus, ProviderError> {
+            Ok(ProviderStatus {
                 locked: false,
                 last_sync: None,
             })
         }
 
-        async fn unlock(&self, _input: UnlockInput) -> Result<(), BackendError> {
+        async fn unlock(&self, _input: UnlockInput) -> Result<(), ProviderError> {
             Ok(())
         }
 
-        async fn lock(&self) -> Result<(), BackendError> {
+        async fn lock(&self) -> Result<(), ProviderError> {
             Ok(())
         }
 
-        async fn list_items(&self) -> Result<Vec<VaultItemMeta>, BackendError> {
+        async fn list_items(&self) -> Result<Vec<ItemMeta>, ProviderError> {
             Ok(self.items.clone())
         }
 
-        async fn get_item(&self, id: &str) -> Result<VaultItem, BackendError> {
-            let meta = self
-                .items
-                .iter()
-                .find(|item| item.id == id)
-                .cloned()
-                .ok_or(BackendError::NotFound)?;
-            Ok(VaultItem { meta, secret: None })
-        }
-
-        async fn get_secret(&self, id: &str) -> Result<SecretBytes, BackendError> {
-            Ok(SecretBytes::new(format!("secret-{id}").into_bytes()))
-        }
-
-        async fn search(&self, attrs: &Attributes) -> Result<Vec<VaultItemMeta>, BackendError> {
+        async fn search(&self, attrs: &Attributes) -> Result<Vec<ItemMeta>, ProviderError> {
             let results = self
                 .items
                 .iter()
@@ -1962,33 +1944,43 @@ mod tests {
         /// Return a simple set of item attributes for testing the attribute model.
         ///
         /// Items with id "rich-item" expose `password` and `totp` as secret attrs.
-        /// All others return `NotSupported` so the fallback to `get_secret` is tested.
+        /// All others return `NotSupported` so the fallback to `primary_secret` is tested.
         async fn get_item_attributes(
             &self,
             id: &str,
-        ) -> Result<rosec_core::ItemAttributes, BackendError> {
+        ) -> Result<rosec_core::ItemAttributes, ProviderError> {
             if id == "rich-item" {
                 Ok(rosec_core::ItemAttributes {
                     public: Attributes::new(),
                     secret_names: vec!["password".to_string(), "totp".to_string()],
                 })
             } else {
-                Err(BackendError::NotSupported)
+                // Return empty attributes so primary_secret can try the default attr
+                Ok(rosec_core::ItemAttributes {
+                    public: Attributes::new(),
+                    secret_names: vec!["secret".to_string()],
+                })
             }
         }
 
-        async fn get_secret_attr(&self, id: &str, attr: &str) -> Result<SecretBytes, BackendError> {
+        async fn get_secret_attr(
+            &self,
+            id: &str,
+            attr: &str,
+        ) -> Result<SecretBytes, ProviderError> {
             if id == "rich-item" && attr == "password" {
                 Ok(SecretBytes::new(b"rich-password".to_vec()))
             } else if id == "rich-item" && attr == "totp" {
                 Ok(SecretBytes::new(b"JBSWY3DPEHPK3PXP".to_vec()))
+            } else if attr == "secret" {
+                Ok(SecretBytes::new(format!("secret-{id}").into_bytes()))
             } else {
-                Err(BackendError::NotFound)
+                Err(ProviderError::NotFound)
             }
         }
     }
 
-    async fn new_state(items: Vec<VaultItemMeta>) -> Arc<ServiceState> {
+    async fn new_state(items: Vec<ItemMeta>) -> Arc<ServiceState> {
         let backend = Arc::new(MockBackend::new(items));
         let router = Arc::new(Router::new(RouterConfig {
             dedup_strategy: rosec_core::DedupStrategy::Newest,
@@ -2008,10 +2000,10 @@ mod tests {
         ))
     }
 
-    fn meta(id: &str, label: &str, locked: bool) -> VaultItemMeta {
-        VaultItemMeta {
+    fn meta(id: &str, label: &str, locked: bool) -> ItemMeta {
+        ItemMeta {
             id: id.to_string(),
-            backend_id: "mock".to_string(),
+            provider_id: "mock".to_string(),
             label: label.to_string(),
             attributes: Attributes::new(),
             created: None,
@@ -2073,8 +2065,12 @@ mod tests {
             .get_session_key(&session)
             .expect("session key lookup");
         let item_meta = &resolved[0].1;
-        let backend = state.backend_by_id(&item_meta.backend_id).expect("backend");
-        let secret = backend.get_secret(&item_meta.id).await.expect("get_secret");
+        let backend = state
+            .backend_by_id(&item_meta.provider_id)
+            .expect("backend");
+        let secret = rosec_core::primary_secret(&*backend, &item_meta.id)
+            .await
+            .expect("primary_secret");
         let value = crate::service::build_secret_value(&session, &secret, aes_key.as_deref())
             .expect("build_secret_value");
 
@@ -2101,8 +2097,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_primary_secret_falls_back_to_get_secret_when_not_supported() {
-        // plain-item triggers NotSupported from get_item_attributes → falls back.
+    async fn resolve_primary_secret_falls_back_to_primary_secret() {
+        // plain-item has no return_attr match → falls back to primary_secret().
         let state = new_state(vec![meta("plain-item", "plain", false)]).await;
         let backend = state.backend_by_id("mock").expect("mock backend");
         let secret = state

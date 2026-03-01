@@ -9,7 +9,7 @@ use zbus::Connection;
 use zeroize::Zeroizing;
 use zvariant::{OwnedObjectPath, OwnedValue};
 
-use rosec_core::VaultBackend as _;
+use rosec_core::Provider as _;
 use rosec_core::config::Config;
 use rosec_core::config_edit;
 
@@ -26,10 +26,8 @@ async fn main() -> Result<()> {
     let cmd = args.first().map(String::as_str).unwrap_or("help");
 
     match cmd {
-        // vault / vaults are full aliases for the same subcommand tree
-        "vault" | "vaults" => cmd_vault(&args[1..]).await,
-        // backend / backends are full aliases for the same subcommand tree
-        "backend" | "backends" => cmd_backend(&args[1..]).await,
+        // provider / providers are full aliases for the same subcommand tree
+        "provider" | "providers" => cmd_provider(&args[1..]).await,
         "config" => cmd_config(&args[1..]),
         "status" => cmd_status().await,
         "sync" | "refresh" => cmd_sync().await,
@@ -58,22 +56,18 @@ USAGE:
     rosec <command> [args...]
 
 COMMANDS:
-    vault <subcommand>                  Manage local encrypted vaults (alias: vaults)
-      list                              List configured vaults and their state
-      create [--id <id>] [--path <p>]   Create a new vault (prompts for password)
+    provider <subcommand>               Manage providers (alias: providers)
+      list                              List all configured providers and their state
+      add <kind> [options]              Add a provider to the config file
+      remove <id>                       Remove a provider from the config file
       attach --path <file> [--id <id>]  Attach an existing vault file to the config
-      detach <id>                       Remove a vault from config (file stays on disk)
-      destroy <id>                      Remove a vault from config AND delete the file
-      add-password <id>                 Add a new unlock password to a vault
-      remove-password <id> <entry-id>   Remove a password from a vault
-      list-passwords <id>               List unlock passwords for a vault
-      auth <id>                         Authenticate/unlock a vault
-
-    backend <subcommand>                Manage external backends (alias: backends)
-      list                              List configured backends and their lock state
-      auth <id>                         Authenticate/unlock a backend
-      add <kind> [options]              Add a backend to the config file
-      remove <id>                       Remove a backend from the config file
+      detach <id>                       Remove provider from config (file stays on disk)
+      add-password <id>                 Add a new unlock password to a local vault provider
+      remove-password <id> <entry-id>   Remove a password from a local vault provider
+      list-passwords <id>               List unlock passwords for a local vault provider
+      change-password <id>              Change the unlock password for a provider
+      auth <id>                         Authenticate/unlock a provider
+      kinds                             List available provider kinds
 
     config <subcommand>                 Read or modify config.toml
       show                              Print the current effective configuration
@@ -81,16 +75,17 @@ COMMANDS:
       set <key> <value>                 Update a setting in config.toml (daemon hot-reloads automatically)
 
     status                              Show daemon status
-    sync                                Sync vault with remote server (alias: refresh)
+    sync                                Sync providers with remote servers (alias: refresh)
     search [-s] [--format=<fmt>] [--show-path] [key=value]...
                                         Search items by attributes (no args = list all)
     get <id>                            Print the secret value only (pipeable)
     inspect <id>                        Show full item detail: label, attributes, secret
-    lock                                Lock all backends
+    lock                                Lock all providers
     unlock                              Unlock (triggers GUI/TTY prompt)
     help                                Show this help
 
-BACKEND KINDS:
+PROVIDER KINDS:
+    local                               Local encrypted vault (file on disk)
     bitwarden                           Bitwarden Password Manager
     bitwarden-sm                        Bitwarden Secrets Manager
 
@@ -113,30 +108,29 @@ SEARCH FILTERS:
     Common attribute names: type, username, uri, folder, name
 
 NOTES:
-    If a backend is locked when running 'search' or 'get', you will be
+    If a provider is locked when running 'search' or 'get', you will be
     prompted for credentials automatically and the operation retried.
 
     The 16-char hex ID shown in 'search' output is unique and stable.
     Pass it directly to 'rosec get'.
 
 EXAMPLES:
-    rosec vault create                                      # create a new vault (auto ID + path)
-    rosec vault create --id work --path ~/vaults/work.vault # custom ID and path
-    rosec vault attach --path /mnt/shared/team.vault        # attach an existing vault file
-    rosec vault list                                        # show all vaults
-    rosec vault auth personal                               # unlock a vault
-    rosec vault add-password personal                       # add a second unlock password
-    rosec vault remove-password personal <entry-id>         # remove a password
-    rosec vault detach work                                 # remove from config (file stays)
-    rosec vault destroy old-vault                           # remove from config AND delete file
+    rosec provider add local                                # create a new local vault (auto ID + path)
+    rosec provider add local --id work --path ~/vaults/work.vault
+    rosec provider attach --path /mnt/shared/team.vault     # attach an existing vault file
+    rosec provider list                                     # show all providers
+    rosec provider auth personal                            # unlock a provider
+    rosec provider add-password personal                    # add a second unlock password
+    rosec provider remove-password personal <entry-id>      # remove a password
+    rosec provider detach work                              # remove from config (file stays)
+    rosec provider remove old-vault                         # remove from config AND delete file
 
-    rosec backend list
-    rosec backend add bitwarden email=you@example.com       # ID auto-generated from email
-    rosec backend add bitwarden-sm organization_id=uuid
-    rosec backend add bitwarden --id work email=work@corp.com region=eu
-    rosec backend auth bitwarden-3f8a1c2d
-    rosec backend remove bitwarden-3f8a1c2d
-    rosec backends list        # 'backends' is a full alias for 'backend'
+    rosec provider add bitwarden email=you@example.com      # ID auto-generated from email
+    rosec provider add bitwarden-sm organization_id=uuid
+    rosec provider add bitwarden --id work email=work@corp.com region=eu
+    rosec provider auth bitwarden-3f8a1c2d
+    rosec provider remove bitwarden-3f8a1c2d
+    rosec providers list       # 'providers' is a full alias for 'provider'
 
     rosec search                                            # list all items
     rosec search type=login                                 # only login items
@@ -223,38 +217,52 @@ EXAMPLES:
     );
 }
 
-fn print_backend_help() {
+fn print_provider_help() {
     println!(
         "\
-rosec backend - manage vault backends
+rosec provider - manage providers
 
 USAGE:
-    rosec backend <subcommand> [args...]
-    rosec backends <subcommand> [args...]   (alias)
+    rosec provider <subcommand> [args...]
+    rosec providers <subcommand> [args...]   (alias)
 
 SUBCOMMANDS:
-    list                      List backends and their lock state
-    kinds                     List available backend kinds
-    auth <id> [--force]       Authenticate/unlock a backend
-    add <kind> [options]      Add a backend to config.toml
-    remove <id>               Remove a backend from config.toml
-    change-password <id>      Change the unlock password for a backend
+    list                              List all providers and their lock state
+    kinds                             List available provider kinds
+    auth <id> [--force]               Authenticate/unlock a provider
+    add <kind> [options]              Add a provider to config.toml
+    remove <id>                       Remove a provider from config.toml
+    create [--id <id>] [--path <p>] [--collection <c>]
+                                      Create a new local vault (prompts for password)
+    destroy <id>                      Remove provider from config AND delete the vault file
+    attach --path <file> [--id <id>]  Attach an existing vault file to the config
+    detach <id>                       Remove provider from config (file stays on disk)
+    add-password <id> [--label <l>]   Add a new unlock password to a local vault provider
+    remove-password <id> <entry-id>   Remove a password from a local vault provider
+    list-passwords <id>               List unlock passwords for a local vault provider
+    change-password <id>              Change the unlock password for a provider
 
 NOTE:
     Device registration (Bitwarden) and first-time token setup (SM) are handled
-    automatically during 'auth' when the backend requires them.  Use --force
+    automatically during 'auth' when the provider requires them.  Use --force
     to re-run registration even when stored credentials already exist (e.g. to
     replace a rotated SM access token or re-register a Bitwarden device).
 
 OPTIONS for 'add':
-    --id <id>                 Override auto-generated ID (default: derived from email/org)
-    key=value ...             Backend options (email, region, base_url, etc.)
+    --id <id>                 Override auto-generated ID (default: derived from email/org or path)
+    --path <path>             Path to the vault file (local vaults only)
+    --collection <name>       Collection label for grouping items
+    key=value ...             Provider options (email, region, base_url, etc.)
     --config <path>           Config file to edit (default: ~/.config/rosec/config.toml)"
     );
 }
 
-fn cmd_backend_kinds() {
-    println!("Available backend kinds:\n");
+fn cmd_provider_kinds() {
+    println!("Available provider kinds:\n");
+    println!("  local");
+    println!("    A local encrypted vault file on disk.");
+    println!("    Options: --id <id>, --path <path>, --collection <name>");
+    println!();
     for kind in config_edit::KNOWN_KINDS {
         let required = config_edit::required_options_for_kind(kind);
         let optional = config_edit::optional_options_for_kind(kind);
@@ -281,8 +289,8 @@ async fn conn() -> Result<Connection> {
 
 /// Poll rosecd's `BackendList` until `id` appears (max 3 s, 200 ms intervals).
 ///
-/// Returns `Some(proxy)` if the daemon is running and the backend appeared,
-/// `None` if the daemon isn't running or the backend didn't appear in time.
+/// Returns `Some(proxy)` if the daemon is running and the provider appeared,
+/// `None` if the daemon isn't running or the provider didn't appear in time.
 async fn wait_for_daemon_reload(id: &str) -> Option<zbus::Proxy<'static>> {
     let conn = conn().await.ok()?;
     let proxy = zbus::Proxy::new(
@@ -808,104 +816,146 @@ async fn prompt_field(label: &str, placeholder: &str, kind: &str) -> Result<Zero
 }
 
 // ---------------------------------------------------------------------------
-// backend / backends subcommand tree
+// provider / providers subcommand tree
 // ---------------------------------------------------------------------------
 
-async fn cmd_backend(args: &[String]) -> Result<()> {
+async fn cmd_provider(args: &[String]) -> Result<()> {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     match sub {
-        "list" | "ls" => cmd_backend_list().await,
-        "auth" => cmd_backend_auth(&args[1..]).await,
-        "add" => cmd_backend_add(&args[1..]).await,
-        "remove" | "rm" => cmd_backend_remove(&args[1..]).await,
-        "change-password" => cmd_backend_change_password(&args[1..]).await,
+        "list" | "ls" => cmd_provider_list().await,
+        "auth" => cmd_provider_auth(&args[1..]).await,
+        "add" => cmd_provider_add(&args[1..]).await,
+        "remove" | "rm" => cmd_provider_remove(&args[1..]).await,
+        "create" => cmd_provider_create(&args[1..]).await,
+        "destroy" => cmd_provider_destroy(&args[1..]).await,
+        "attach" => cmd_provider_attach(&args[1..]).await,
+        "detach" => cmd_provider_detach(&args[1..]).await,
+        "add-password" => cmd_provider_add_password(&args[1..]).await,
+        "remove-password" => cmd_provider_remove_password(&args[1..]).await,
+        "list-passwords" => cmd_provider_list_passwords(&args[1..]).await,
+        "change-password" => cmd_provider_change_password(&args[1..]).await,
         "kinds" => {
-            cmd_backend_kinds();
+            cmd_provider_kinds();
             Ok(())
         }
         "help" | "--help" | "-h" => {
-            print_backend_help();
+            print_provider_help();
             Ok(())
         }
         other => {
-            print_backend_help();
-            bail!("unknown backend subcommand: {other}");
+            print_provider_help();
+            bail!("unknown provider subcommand: {other}");
         }
     }
 }
 
-/// `rosec backend list` — show all configured backends with lock state.
-async fn cmd_backend_list() -> Result<()> {
-    let conn = conn().await?;
-    let proxy = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.secrets",
-        "/org/rosec/Daemon",
-        "org.rosec.Daemon",
-    )
-    .await?;
+/// `rosec provider list` — show all configured providers with lock state.
+async fn cmd_provider_list() -> Result<()> {
+    // Try D-Bus first for live state.
+    if let Ok(conn) = conn().await
+        && let Ok(proxy) = zbus::Proxy::new(
+            &conn,
+            "org.freedesktop.secrets",
+            "/org/rosec/Daemon",
+            "org.rosec.Daemon",
+        )
+        .await
+        && let Ok(entries) = proxy
+            .call::<_, _, Vec<(String, String, String, bool)>>("BackendList", &())
+            .await
+    {
+        if entries.is_empty() {
+            println!("No providers configured. Run `rosec provider add <kind>` to add one.");
+            return Ok(());
+        }
 
-    let entries: Vec<(String, String, String, bool)> = proxy.call("BackendList", &()).await?;
+        let id_w = entries
+            .iter()
+            .map(|(id, ..)| id.len())
+            .max()
+            .unwrap_or(2)
+            .max(2);
+        let name_w = entries
+            .iter()
+            .map(|(_, n, ..)| n.len())
+            .max()
+            .unwrap_or(4)
+            .max(4);
+        let kind_w = entries
+            .iter()
+            .map(|(_, _, k, _)| k.len())
+            .max()
+            .unwrap_or(4)
+            .max(4);
 
-    if entries.is_empty() {
-        println!("No backends configured. Run `rosec backend add <kind>` to add one.");
+        println!(
+            "{:<id_w$}  {:<name_w$}  {:<kind_w$}  STATE",
+            "ID", "NAME", "KIND",
+        );
+        println!("{}", "-".repeat(id_w + name_w + kind_w + 14));
+        for (id, name, kind, locked) in &entries {
+            println!(
+                "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {}",
+                id,
+                name,
+                kind,
+                if *locked { "locked" } else { "unlocked" },
+            );
+        }
         return Ok(());
     }
 
-    let id_w = entries
+    // Fallback: read config directly.
+    let cfg = load_config();
+    if cfg.provider.is_empty() {
+        println!("No providers configured. Run `rosec provider add <kind>` to add one.");
+        return Ok(());
+    }
+
+    let id_w = cfg
+        .provider
         .iter()
-        .map(|(id, ..)| id.len())
+        .map(|p| p.id.len())
         .max()
         .unwrap_or(2)
         .max(2);
-    let name_w = entries
+    let kind_w = cfg
+        .provider
         .iter()
-        .map(|(_, n, ..)| n.len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
-    let kind_w = entries
-        .iter()
-        .map(|(_, _, k, _)| k.len())
+        .map(|p| p.kind.len())
         .max()
         .unwrap_or(4)
         .max(4);
 
-    println!(
-        "{:<id_w$}  {:<name_w$}  {:<kind_w$}  STATE",
-        "ID", "NAME", "KIND",
-    );
-    println!("{}", "-".repeat(id_w + name_w + kind_w + 14));
-    for (id, name, kind, locked) in &entries {
+    println!("{:<id_w$}  {:<kind_w$}  STATE", "ID", "KIND");
+    println!("{}", "-".repeat(id_w + kind_w + 12));
+    for entry in &cfg.provider {
         println!(
-            "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {}",
-            id,
-            name,
-            kind,
-            if *locked { "locked" } else { "unlocked" },
+            "{:<id_w$}  {:<kind_w$}  (daemon not running)",
+            entry.id, entry.kind,
         );
     }
     Ok(())
 }
 
-/// `rosec backend auth <id>` — interactively authenticate a backend.
+/// `rosec provider auth <id>` — interactively authenticate a provider.
 ///
 /// Opens `/dev/tty` and passes the fd to `rosecd` via D-Bus fd-passing.
 /// All credential prompting happens inside the daemon — credentials never
 /// appear in any D-Bus message payload.
-async fn cmd_backend_auth(args: &[String]) -> Result<()> {
-    let mut backend_id: Option<&str> = None;
+async fn cmd_provider_auth(args: &[String]) -> Result<()> {
+    let mut provider_id: Option<&str> = None;
     let mut force = false;
     for arg in args {
         match arg.as_str() {
             "--force" | "-f" => force = true,
             s if s.starts_with('-') => bail!("unknown option: {s}"),
-            _ if backend_id.is_none() => backend_id = Some(arg.as_str()),
+            _ if provider_id.is_none() => provider_id = Some(arg.as_str()),
             _ => bail!("unexpected argument: {arg}"),
         }
     }
-    let backend_id = backend_id
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec backend auth <backend-id> [--force]"))?;
+    let provider_id =
+        provider_id.ok_or_else(|| anyhow::anyhow!("usage: rosec provider auth <id> [--force]"))?;
 
     let conn = conn().await?;
     let proxy = zbus::Proxy::new(
@@ -918,76 +968,25 @@ async fn cmd_backend_auth(args: &[String]) -> Result<()> {
 
     let tty_fd = open_tty_owned_fd()?;
     let _: () = proxy
-        .call("AuthBackendWithTty", &(backend_id, tty_fd, force))
+        .call("AuthBackendWithTty", &(provider_id, tty_fd, force))
         .await?;
 
-    println!("Backend '{backend_id}' authenticated.");
+    println!("Provider '{provider_id}' authenticated.");
     Ok(())
 }
 
-/// `rosec backend change-password <id>` — change the unlock password.
-///
-/// Prompts for the current password, then the new password (with confirmation).
-/// Passes both passwords to the daemon via pipe fd-passing — credentials never
-/// appear in any D-Bus message payload.
-///
-/// Works for local vaults (rotates the key-wrapping entry) and SM backends
-/// (re-encrypts the stored access token with the new password).
-async fn cmd_backend_change_password(args: &[String]) -> Result<()> {
-    let backend_id = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec backend change-password <backend-id>"))?;
-
-    let old_pw = prompt_field("Current password", "", "password").await?;
-    if old_pw.is_empty() {
-        bail!("current password cannot be empty");
-    }
-
-    let new_pw = prompt_field("New password", "", "password").await?;
-    if new_pw.is_empty() {
-        bail!("new password cannot be empty");
-    }
-
-    let confirm_pw = prompt_field("Confirm new password", "", "password").await?;
-    if new_pw.as_str() != confirm_pw.as_str() {
-        bail!("passwords do not match");
-    }
-
-    let old_fd = password_to_pipe_fd(old_pw.as_bytes())?;
-    let new_fd = password_to_pipe_fd(new_pw.as_bytes())?;
-
-    let conn = conn().await?;
-    let proxy = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.secrets",
-        "/org/rosec/Daemon",
-        "org.rosec.Daemon",
-    )
-    .await?;
-
-    let _: () = proxy
-        .call(
-            "ChangeBackendPassword",
-            &(backend_id.as_str(), old_fd, new_fd),
-        )
-        .await?;
-
-    println!("Password changed for backend '{backend_id}'.");
-    Ok(())
-}
-
-/// `rosec backend add <kind> [--id <id>] [key=value ...]`
-async fn cmd_backend_add(args: &[String]) -> Result<()> {
+/// `rosec provider add <kind> [--id <id>] [key=value ...]`
+async fn cmd_provider_add(args: &[String]) -> Result<()> {
     let kind = args.first().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: rosec backend add <kind> [--id <id>] [key=value ...]\nKinds: {}",
+            "usage: rosec provider add <kind> [--id <id>] [key=value ...]\nKinds: {}",
             config_edit::KNOWN_KINDS.join(", ")
         )
     })?;
 
     if !config_edit::KNOWN_KINDS.contains(&kind.as_str()) {
         bail!(
-            "unknown backend kind '{kind}'. Known kinds: {}",
+            "unknown provider kind '{kind}'. Known kinds: {}",
             config_edit::KNOWN_KINDS.join(", ")
         );
     }
@@ -1035,10 +1034,10 @@ async fn cmd_backend_add(args: &[String]) -> Result<()> {
         }
     }
 
-    // Determine the backend ID: explicit --id wins; otherwise derive from credentials.
+    // Determine the provider ID: explicit --id wins; otherwise derive from credentials.
     let id = match custom_id {
         Some(ref id) => id.clone(),
-        None => derive_backend_id(kind, &options),
+        None => derive_provider_id(kind, &options),
     };
 
     // Prompt for optional options not already supplied.
@@ -1060,35 +1059,35 @@ async fn cmd_backend_add(args: &[String]) -> Result<()> {
     }
 
     let cfg = config_path();
-    config_edit::add_backend(&cfg, &id, kind, &options)?;
-    println!("Added backend '{id}' (kind: {kind}) to {}", cfg.display());
+    config_edit::add_provider(&cfg, &id, kind, &options)?;
+    println!("Added provider '{id}' (kind: {kind}) to {}", cfg.display());
 
-    // If rosecd is running, wait for it to hot-reload the new backend then
+    // If rosecd is running, wait for it to hot-reload the new provider then
     // immediately kick off the auth flow so the user doesn't have to run
-    // `rosec backend auth <id>` manually as a separate step.
+    // `rosec provider auth <id>` manually as a separate step.
     if let Some(proxy) = wait_for_daemon_reload(&id).await {
-        println!("rosecd picked up the new backend — starting authentication.");
+        println!("rosecd picked up the new provider — starting authentication.");
         let tty_fd = open_tty_owned_fd()?;
         let _: () = proxy
             .call("AuthBackendWithTty", &(id.as_str(), tty_fd, false))
             .await?;
-        println!("Backend '{id}' authenticated.");
+        println!("Provider '{id}' authenticated.");
     } else {
         println!("rosecd will hot-reload the config automatically if it is running.");
-        println!("Run `rosec backend auth {id}` to authenticate.");
+        println!("Run `rosec provider auth {id}` to authenticate.");
     }
 
     Ok(())
 }
 
-/// Derive a short, stable backend ID from the credential that identifies the account.
+/// Derive a short, stable provider ID from the credential that identifies the account.
 ///
 /// Format: `{kind}-{first8hexchars of sha256(credential)}`
 ///
 /// - `bitwarden`: hashes the email address
 /// - `bitwarden-sm`: hashes the organization_id
 /// - anything else: falls back to the kind string itself
-fn derive_backend_id(kind: &str, options: &[(String, String)]) -> String {
+fn derive_provider_id(kind: &str, options: &[(String, String)]) -> String {
     let credential_key = match kind {
         "bitwarden" => "email",
         "bitwarden-sm" => "organization_id",
@@ -1114,188 +1113,23 @@ fn derive_backend_id(kind: &str, options: &[(String, String)]) -> String {
     format!("{kind}-{short}")
 }
 
-/// `rosec backend remove <id>`
-async fn cmd_backend_remove(args: &[String]) -> Result<()> {
+/// `rosec provider remove <id>`
+async fn cmd_provider_remove(args: &[String]) -> Result<()> {
     let id = args
         .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec backend remove <id>"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider remove <id>"))?;
     let cfg = config_path();
-    config_edit::remove_backend(&cfg, id)?;
-    println!("Removed backend '{id}' from {}", cfg.display());
+    config_edit::remove_provider(&cfg, id)?;
+    println!("Removed provider '{id}' from {}", cfg.display());
     println!("rosecd will hot-reload the config automatically if it is running.");
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// vault / vaults subcommand tree
-// ---------------------------------------------------------------------------
-
-fn print_vault_help() {
-    println!(
-        "\
-rosec vault - manage local encrypted vaults
-
-USAGE:
-    rosec vault <subcommand> [args...]
-    rosec vaults <subcommand> [args...]   (alias)
-
-SUBCOMMANDS:
-    list                              List configured vaults and their state
-    create [--id <id>] [--path <p>] [--collection <c>]
-                                      Create a new vault (prompts for password)
-    attach --path <file> [--id <id>] [--collection <c>]
-                                      Attach an existing vault file to the config
-    detach <id>                       Remove vault from config (file stays on disk)
-    destroy <id>                      Remove vault from config AND delete the file
-    add-password <id> [--label <l>]   Add a new unlock password to a vault
-    remove-password <id> <entry-id>   Remove a password from a vault
-    list-passwords <id>               List unlock passwords for a vault
-    change-password <id>              Change the unlock password for a vault
-    auth <id>                         Authenticate/unlock a vault
-
-OPTIONS:
-    --id <id>             Vault identifier (default: derived from path)
-    --path <path>         Path to the vault file (default: $XDG_DATA_HOME/rosec/vaults/<id>.vault)
-    --collection <name>   Collection label for grouping items
-    --label <name>        Label for a password entry (default: user@hostname; must be unique)
-    --config <path>       Config file to edit (default: ~/.config/rosec/config.toml)
-
-NOTE:
-    Vaults are rosec's local encrypted stores, distinct from external backends
-    (Bitwarden, etc.).  Each vault is a single encrypted file on disk supporting
-    multiple unlock passwords via key wrapping.
-
-EXAMPLES:
-    rosec vault create
-    rosec vault create --id work --path ~/vaults/work.vault --collection work
-    rosec vault attach --path /mnt/syncthing/shared.vault --id shared
-    rosec vault list
-    rosec vault auth personal
-    rosec vault add-password personal --label pam
-    rosec vault list-passwords personal
-    rosec vault change-password personal
-    rosec vault remove-password personal a1b2c3d4
-    rosec vault detach work
-    rosec vault destroy old-vault"
-    );
-}
-
-async fn cmd_vault(args: &[String]) -> Result<()> {
-    let sub = args.first().map(String::as_str).unwrap_or("list");
-    match sub {
-        "list" | "ls" => cmd_vault_list().await,
-        "create" => cmd_vault_create(&args[1..]).await,
-        "attach" => cmd_vault_attach(&args[1..]).await,
-        "detach" => cmd_vault_detach(&args[1..]).await,
-        "destroy" => cmd_vault_destroy(&args[1..]).await,
-        "add-password" => cmd_vault_add_password(&args[1..]).await,
-        "remove-password" => cmd_vault_remove_password(&args[1..]).await,
-        "list-passwords" => cmd_vault_list_passwords(&args[1..]).await,
-        "change-password" => cmd_vault_change_password(&args[1..]).await,
-        "auth" => cmd_vault_auth(&args[1..]).await,
-        "help" | "--help" | "-h" => {
-            print_vault_help();
-            Ok(())
-        }
-        other => {
-            print_vault_help();
-            bail!("unknown vault subcommand: {other}");
-        }
-    }
-}
-
-/// `rosec vault list` — show all configured vaults with lock state.
-///
-/// If rosecd is running, fetches live lock state from BackendList (filtered to
-/// vault-kind entries). Otherwise falls back to listing from config.
-async fn cmd_vault_list() -> Result<()> {
-    // Try D-Bus first for live state.
-    if let Ok(conn) = conn().await
-        && let Ok(proxy) = zbus::Proxy::new(
-            &conn,
-            "org.freedesktop.secrets",
-            "/org/rosec/Daemon",
-            "org.rosec.Daemon",
-        )
-        .await
-        && let Ok(entries) = proxy
-            .call::<_, _, Vec<(String, String, String, bool)>>("BackendList", &())
-            .await
-    {
-        let vaults: Vec<_> = entries
-            .iter()
-            .filter(|(_, _, kind, _)| kind == "vault")
-            .collect();
-
-        if vaults.is_empty() {
-            println!("No vaults configured. Run `rosec vault create` to create one.");
-            return Ok(());
-        }
-
-        let id_w = vaults
-            .iter()
-            .map(|(id, ..)| id.len())
-            .max()
-            .unwrap_or(2)
-            .max(2);
-        let name_w = vaults
-            .iter()
-            .map(|(_, n, ..)| n.len())
-            .max()
-            .unwrap_or(4)
-            .max(4);
-
-        println!("{:<id_w$}  {:<name_w$}  STATE", "ID", "NAME");
-        println!("{}", "-".repeat(id_w + name_w + 12));
-        for (id, name, _, locked) in &vaults {
-            println!(
-                "{:<id_w$}  {:<name_w$}  {}",
-                id,
-                name,
-                if *locked { "locked" } else { "unlocked" },
-            );
-        }
-        return Ok(());
-    }
-
-    // Fallback: read config directly.
-    let cfg = load_config();
-    if cfg.vault.is_empty() {
-        println!("No vaults configured. Run `rosec vault create` to create one.");
-        return Ok(());
-    }
-
-    let id_w = cfg
-        .vault
-        .iter()
-        .map(|v| v.id.len())
-        .max()
-        .unwrap_or(2)
-        .max(2);
-    let path_w = cfg
-        .vault
-        .iter()
-        .map(|v| v.path.len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
-
-    println!("{:<id_w$}  {:<path_w$}  STATE", "ID", "PATH");
-    println!("{}", "-".repeat(id_w + path_w + 12));
-    for entry in &cfg.vault {
-        println!(
-            "{:<id_w$}  {:<path_w$}  (daemon not running)",
-            entry.id, entry.path,
-        );
-    }
-    Ok(())
-}
-
-/// `rosec vault create [--id <id>] [--path <path>] [--collection <c>]`
+/// `rosec provider create [--id <id>] [--path <path>] [--collection <c>]`
 ///
 /// Creates a new vault file on disk and adds a `[[vault]]` entry to the config.
 /// Prompts for the initial password interactively.
-async fn cmd_vault_create(args: &[String]) -> Result<()> {
+async fn cmd_provider_create(args: &[String]) -> Result<()> {
     let mut custom_id: Option<String> = None;
     let mut custom_path: Option<String> = None;
     let mut collection: Option<String> = None;
@@ -1338,7 +1172,7 @@ async fn cmd_vault_create(args: &[String]) -> Result<()> {
                 collection = Some(a.strip_prefix("--collection=").unwrap_or(a).to_string());
             }
             "--help" | "-h" => {
-                print_vault_help();
+                print_provider_help();
                 return Ok(());
             }
             other => bail!("unexpected argument: {other}"),
@@ -1387,14 +1221,14 @@ async fn cmd_vault_create(args: &[String]) -> Result<()> {
 
     // Add the vault to config.toml.
     let cfg = config_path();
-    config_edit::add_vault(&cfg, &id, &vault_path, collection.as_deref())?;
+    config_edit::add_local_provider(&cfg, &id, &vault_path, collection.as_deref())?;
 
     println!("Created vault '{id}' at {vault_path}");
     println!("Added to {}", cfg.display());
 
     // If rosecd is running, wait for it to hot-reload the new vault then
     // immediately kick off the auth flow so the user doesn't have to run
-    // `rosec vault auth <id>` manually as a separate step.
+    // `rosec provider auth <id>` manually as a separate step.
     if let Some(proxy) = wait_for_daemon_reload(&id).await {
         println!("rosecd picked up the new vault — starting authentication.");
         let tty_fd = open_tty_owned_fd()?;
@@ -1404,16 +1238,16 @@ async fn cmd_vault_create(args: &[String]) -> Result<()> {
         println!("Vault '{id}' authenticated.");
     } else {
         println!("rosecd will hot-reload the config automatically if it is running.");
-        println!("Run `rosec vault auth {id}` to authenticate.");
+        println!("Run `rosec provider auth {id}` to authenticate.");
     }
 
     Ok(())
 }
 
-/// `rosec vault attach --path <file> [--id <id>] [--collection <c>]`
+/// `rosec provider attach --path <file> [--id <id>] [--collection <c>]`
 ///
 /// Adds an existing vault file to the config without creating it.
-async fn cmd_vault_attach(args: &[String]) -> Result<()> {
+async fn cmd_provider_attach(args: &[String]) -> Result<()> {
     let mut custom_id: Option<String> = None;
     let mut vault_path: Option<String> = None;
     let mut collection: Option<String> = None;
@@ -1456,7 +1290,7 @@ async fn cmd_vault_attach(args: &[String]) -> Result<()> {
                 collection = Some(a.strip_prefix("--collection=").unwrap_or(a).to_string());
             }
             "--help" | "-h" => {
-                print_vault_help();
+                print_provider_help();
                 return Ok(());
             }
             other => bail!("unexpected argument: {other}"),
@@ -1465,7 +1299,9 @@ async fn cmd_vault_attach(args: &[String]) -> Result<()> {
     }
 
     let vault_path = vault_path.ok_or_else(|| {
-        anyhow::anyhow!("--path is required\nusage: rosec vault attach --path <file> [--id <id>]")
+        anyhow::anyhow!(
+            "--path is required\nusage: rosec provider attach --path <file> [--id <id>]"
+        )
     })?;
 
     // Derive ID from filename if not specified.
@@ -1475,45 +1311,52 @@ async fn cmd_vault_attach(args: &[String]) -> Result<()> {
     };
 
     let cfg = config_path();
-    config_edit::add_vault(&cfg, &id, &vault_path, collection.as_deref())?;
+    config_edit::add_local_provider(&cfg, &id, &vault_path, collection.as_deref())?;
 
     println!("Attached vault '{id}' ({vault_path}) to {}", cfg.display());
     println!("rosecd will hot-reload the config automatically if it is running.");
-    println!("Run `rosec vault auth {id}` to authenticate.");
+    println!("Run `rosec provider auth {id}` to authenticate.");
     Ok(())
 }
 
-/// `rosec vault detach <id>`
+/// `rosec provider detach <id>`
 ///
 /// Removes the vault from the config file but leaves the vault file on disk.
-async fn cmd_vault_detach(args: &[String]) -> Result<()> {
+async fn cmd_provider_detach(args: &[String]) -> Result<()> {
     let id = args
         .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec vault detach <id>"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider detach <id>"))?;
     let cfg = config_path();
-    config_edit::remove_vault(&cfg, id)?;
+    config_edit::remove_provider(&cfg, id)?;
     println!("Detached vault '{id}' from {}", cfg.display());
-    println!("The vault file was NOT deleted. Use `rosec vault destroy` to also delete the file.");
+    println!(
+        "The vault file was NOT deleted. Use `rosec provider destroy` to also delete the file."
+    );
     println!("rosecd will hot-reload the config automatically if it is running.");
     Ok(())
 }
 
-/// `rosec vault destroy <id>`
+/// `rosec provider destroy <id>`
 ///
 /// Removes the vault from the config AND deletes the vault file from disk.
-async fn cmd_vault_destroy(args: &[String]) -> Result<()> {
+async fn cmd_provider_destroy(args: &[String]) -> Result<()> {
     let id = args
         .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec vault destroy <id>"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider destroy <id>"))?;
 
     // Look up the path from config before removing the entry.
     let cfg_data = load_config();
     let vault_entry = cfg_data
-        .vault
+        .provider
         .iter()
-        .find(|v| v.id == *id)
+        .find(|v| v.kind == "local" && v.id == *id)
         .ok_or_else(|| anyhow::anyhow!("vault '{id}' not found in config"))?;
-    let vault_path = expand_tilde(&vault_entry.path);
+    let vault_path = expand_tilde(
+        vault_entry
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("vault '{id}' has no path configured"))?,
+    );
 
     // Confirm destruction.
     let confirm = prompt_field(
@@ -1529,7 +1372,7 @@ async fn cmd_vault_destroy(args: &[String]) -> Result<()> {
 
     // Remove from config.
     let cfg = config_path();
-    config_edit::remove_vault(&cfg, id)?;
+    config_edit::remove_provider(&cfg, id)?;
 
     // Delete the vault file.
     match std::fs::remove_file(&vault_path) {
@@ -1547,11 +1390,11 @@ async fn cmd_vault_destroy(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `rosec vault add-password <id> [--label <label>]`
+/// `rosec provider add-password <id> [--label <label>]`
 ///
 /// Add a new unlock password to a vault. The vault must be unlocked (running in
 /// rosecd).
-async fn cmd_vault_add_password(args: &[String]) -> Result<()> {
+async fn cmd_provider_add_password(args: &[String]) -> Result<()> {
     let mut vault_id: Option<&str> = None;
     let mut label: Option<String> = None;
     let mut i = 0usize;
@@ -1571,7 +1414,7 @@ async fn cmd_vault_add_password(args: &[String]) -> Result<()> {
                 label = Some(a.strip_prefix("--label=").unwrap_or(a).to_string());
             }
             "--help" | "-h" => {
-                print_vault_help();
+                print_provider_help();
                 return Ok(());
             }
             a if a.starts_with('-') => bail!("unknown flag: {a}"),
@@ -1585,8 +1428,9 @@ async fn cmd_vault_add_password(args: &[String]) -> Result<()> {
         i += 1;
     }
 
-    let vault_id = vault_id
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec vault add-password <id> [--label <label>]"))?;
+    let vault_id = vault_id.ok_or_else(|| {
+        anyhow::anyhow!("usage: rosec provider add-password <id> [--label <label>]")
+    })?;
 
     // Default label: user@hostname
     let label = label.unwrap_or_else(default_password_label);
@@ -1621,14 +1465,14 @@ async fn cmd_vault_add_password(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `rosec vault list-passwords <vault-id>`
+/// `rosec provider list-passwords <vault-id>`
 ///
 /// List the wrapping entries (unlock passwords) for a vault. The vault must be
 /// unlocked. Shows the entry ID and label for each password.
-async fn cmd_vault_list_passwords(args: &[String]) -> Result<()> {
+async fn cmd_provider_list_passwords(args: &[String]) -> Result<()> {
     let vault_id = args
         .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec vault list-passwords <vault-id>"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider list-passwords <vault-id>"))?;
 
     let conn = conn().await?;
     let proxy = zbus::Proxy::new(
@@ -1659,15 +1503,15 @@ async fn cmd_vault_list_passwords(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `rosec vault change-password <vault-id>`
+/// `rosec provider change-password <vault-id>`
 ///
 /// Change the unlock password for a vault.  Prompts for the current password,
 /// new password, and confirmation.  The wrapping entry matched by the old
 /// password is atomically replaced with a new one for the new password.
-async fn cmd_vault_change_password(args: &[String]) -> Result<()> {
+async fn cmd_provider_change_password(args: &[String]) -> Result<()> {
     let vault_id = args
         .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec vault change-password <vault-id>"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider change-password <vault-id>"))?;
 
     let old_pw = prompt_field("Current password", "", "password").await?;
     if old_pw.is_empty() {
@@ -1707,13 +1551,13 @@ async fn cmd_vault_change_password(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `rosec vault remove-password <vault-id> <entry-id>`
+/// `rosec provider remove-password <vault-id> <entry-id>`
 ///
 /// Remove an unlock password from a vault. The vault must be unlocked and must
 /// have at least 2 passwords.
-async fn cmd_vault_remove_password(args: &[String]) -> Result<()> {
+async fn cmd_provider_remove_password(args: &[String]) -> Result<()> {
     if args.len() < 2 {
-        bail!("usage: rosec vault remove-password <vault-id> <entry-id>");
+        bail!("usage: rosec provider remove-password <vault-id> <entry-id>");
     }
     let vault_id = &args[0];
     let entry_id = &args[1];
@@ -1755,32 +1599,6 @@ async fn cmd_vault_remove_password(args: &[String]) -> Result<()> {
         .await?;
 
     println!("Removed password entry '{entry_id}' from vault '{vault_id}'.");
-    Ok(())
-}
-
-/// `rosec vault auth <id>` — interactively authenticate a vault.
-///
-/// Opens `/dev/tty` and passes the fd to `rosecd` via D-Bus fd-passing.
-async fn cmd_vault_auth(args: &[String]) -> Result<()> {
-    let vault_id = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec vault auth <vault-id>"))?;
-
-    let conn = conn().await?;
-    let proxy = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.secrets",
-        "/org/rosec/Daemon",
-        "org.rosec.Daemon",
-    )
-    .await?;
-
-    let tty_fd = open_tty_owned_fd()?;
-    let _: () = proxy
-        .call("AuthBackendWithTty", &(vault_id.as_str(), tty_fd, false))
-        .await?;
-
-    println!("Vault '{vault_id}' authenticated.");
     Ok(())
 }
 

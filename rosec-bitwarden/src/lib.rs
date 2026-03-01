@@ -10,13 +10,13 @@
 //! - **`crypto`**: Key derivation (PBKDF2, Argon2id, HKDF) and encryption (AES-CBC, HMAC-SHA256, RSA-OAEP)
 //! - **`cipher`**: Cipher string parsing and decryption (`2.iv|ct|mac` format)
 //! - **`vault`**: Decrypted vault state management
-//! - **`backend`**: `VaultBackend` trait implementation
+//! - **`backend`**: `Provider` trait implementation
 //!
 //! # Usage
 //!
 //! ```rust,ignore
 //! use rosec_bitwarden::{BitwardenBackend, BitwardenConfig};
-//! use rosec_core::{UnlockInput, VaultBackend};
+//! use rosec_core::{UnlockInput, Provider};
 //!
 //! let config = BitwardenConfig {
 //!     id: "personal".to_string(),

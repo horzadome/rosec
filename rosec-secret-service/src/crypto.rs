@@ -18,7 +18,7 @@ use aes::Aes128;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use hkdf::Hkdf;
 use num_bigint::BigUint;
-use rosec_core::BackendError;
+use rosec_core::ProviderError;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -68,11 +68,11 @@ pub enum SessionAlgorithm {
 }
 
 impl SessionAlgorithm {
-    pub fn parse(name: &str) -> Result<Self, BackendError> {
+    pub fn parse(name: &str) -> Result<Self, ProviderError> {
         match name {
             "plain" => Ok(Self::Plain),
             "dh-ietf1024-sha256-aes128-cbc-pkcs7" => Ok(Self::DhIetf1024),
-            _ => Err(BackendError::NotSupported),
+            _ => Err(ProviderError::NotSupported),
         }
     }
 }
@@ -97,7 +97,7 @@ pub struct DhKeypair {
 ///
 /// Uses a thread-local CSPRNG (seeded from the OS) for the private key.
 /// The private key is 1024 bits; the public key is `g^private mod p`.
-pub fn generate_dh_keypair() -> Result<DhKeypair, BackendError> {
+pub fn generate_dh_keypair() -> Result<DhKeypair, ProviderError> {
     let p = BigUint::from_bytes_be(MODP1024_PRIME_BYTES);
     let g = BigUint::from(MODP1024_GENERATOR);
 
@@ -125,9 +125,9 @@ pub fn generate_dh_keypair() -> Result<DhKeypair, BackendError> {
 pub fn derive_session_key(
     keypair: &DhKeypair,
     client_pubkey_bytes: &[u8],
-) -> Result<Zeroizing<[u8; AES128_KEY_BYTES]>, BackendError> {
+) -> Result<Zeroizing<[u8; AES128_KEY_BYTES]>, ProviderError> {
     if client_pubkey_bytes.len() != DH_KEY_BYTES {
-        return Err(BackendError::Unavailable(format!(
+        return Err(ProviderError::Unavailable(format!(
             "client DH public key must be {DH_KEY_BYTES} bytes, got {}",
             client_pubkey_bytes.len()
         )));
@@ -140,7 +140,7 @@ pub fn derive_session_key(
     let two = BigUint::from(2u32);
     let p_minus_two = &p - &two;
     if client_pub < two || client_pub > p_minus_two {
-        return Err(BackendError::Unavailable(
+        return Err(ProviderError::Unavailable(
             "client DH public key out of valid range".to_string(),
         ));
     }
@@ -154,7 +154,7 @@ pub fn derive_session_key(
     let hkdf = Hkdf::<Sha256>::new(None, shared_bytes.as_ref());
     let mut key = Zeroizing::new([0u8; AES128_KEY_BYTES]);
     hkdf.expand(&[], key.as_mut())
-        .map_err(|_| BackendError::Unavailable("HKDF expand failed".to_string()))?;
+        .map_err(|_| ProviderError::Unavailable("HKDF expand failed".to_string()))?;
 
     Ok(key)
 }
@@ -172,7 +172,7 @@ type Aes128CbcDec = cbc::Decryptor<Aes128>;
 pub fn aes128_cbc_encrypt(
     key: &[u8; AES128_KEY_BYTES],
     plaintext: &[u8],
-) -> Result<(Vec<u8>, Vec<u8>), BackendError> {
+) -> Result<(Vec<u8>, Vec<u8>), ProviderError> {
     let mut iv = [0u8; AES_BLOCK_BYTES];
     rand::RngExt::fill(&mut rand::rng(), &mut iv[..]);
 
@@ -189,21 +189,21 @@ pub fn aes128_cbc_decrypt(
     key: &[u8; AES128_KEY_BYTES],
     iv: &[u8],
     ciphertext: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, BackendError> {
+) -> Result<Zeroizing<Vec<u8>>, ProviderError> {
     if iv.len() != AES_BLOCK_BYTES {
-        return Err(BackendError::Unavailable(format!(
+        return Err(ProviderError::Unavailable(format!(
             "IV must be {AES_BLOCK_BYTES} bytes, got {}",
             iv.len()
         )));
     }
     let iv_arr: &[u8; AES_BLOCK_BYTES] = iv
         .try_into()
-        .map_err(|_| BackendError::Unavailable("invalid IV length".to_string()))?;
+        .map_err(|_| ProviderError::Unavailable("invalid IV length".to_string()))?;
 
     let decryptor = Aes128CbcDec::new(key.into(), iv_arr.into());
     let plaintext = decryptor
         .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
-        .map_err(|e| BackendError::Unavailable(format!("AES-128-CBC decrypt failed: {e}")))?;
+        .map_err(|e| ProviderError::Unavailable(format!("AES-128-CBC decrypt failed: {e}")))?;
 
     Ok(Zeroizing::new(plaintext))
 }
@@ -289,7 +289,7 @@ mod tests {
         let zero = vec![0u8; DH_KEY_BYTES];
         assert!(matches!(
             derive_session_key(&server_kp, &zero),
-            Err(BackendError::Unavailable(_))
+            Err(ProviderError::Unavailable(_))
         ));
     }
 
@@ -300,7 +300,7 @@ mod tests {
         *one.last_mut().unwrap() = 1;
         assert!(matches!(
             derive_session_key(&server_kp, &one),
-            Err(BackendError::Unavailable(_))
+            Err(ProviderError::Unavailable(_))
         ));
     }
 
@@ -310,7 +310,7 @@ mod tests {
         let short = vec![0u8; 64];
         assert!(matches!(
             derive_session_key(&server_kp, &short),
-            Err(BackendError::Unavailable(_))
+            Err(ProviderError::Unavailable(_))
         ));
     }
 

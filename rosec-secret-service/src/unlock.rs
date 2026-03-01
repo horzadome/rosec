@@ -421,8 +421,8 @@ async fn auth_backend_with_tty_inner(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Collect auth field descriptors for a backend into `TtyField` structs.
-pub(crate) fn backend_auth_fields(backend: &dyn rosec_core::VaultBackend) -> Vec<TtyField> {
+/// Collect auth field descriptors for a provider into `TtyField` structs.
+pub(crate) fn backend_auth_fields(backend: &dyn rosec_core::Provider) -> Vec<TtyField> {
     let pw = backend.password_field();
     let mut fields = vec![TtyField {
         id: pw.id.to_string(),

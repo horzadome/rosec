@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use crate::{DedupStrategy, DedupTimeFallback, VaultItemMeta};
+use crate::{DedupStrategy, DedupTimeFallback, ItemMeta};
 
 type DedupKey = (String, Vec<(String, String)>);
 
@@ -13,11 +13,11 @@ pub struct DedupConfig {
 
 #[derive(Debug, Clone)]
 pub struct DedupResult {
-    pub items: Vec<VaultItemMeta>,
+    pub items: Vec<ItemMeta>,
 }
 
 pub fn dedup(
-    mut items: Vec<VaultItemMeta>,
+    mut items: Vec<ItemMeta>,
     config: DedupConfig,
     backend_priority: &HashMap<String, usize>,
 ) -> DedupResult {
@@ -25,7 +25,7 @@ pub fn dedup(
         return DedupResult { items };
     }
 
-    let mut by_key: HashMap<DedupKey, Vec<VaultItemMeta>> = HashMap::new();
+    let mut by_key: HashMap<DedupKey, Vec<ItemMeta>> = HashMap::new();
     for item in items.drain(..) {
         let mut attrs: Vec<(String, String)> = item
             .attributes
@@ -52,9 +52,9 @@ pub fn dedup(
 }
 
 fn select_by_priority(
-    candidates: &[VaultItemMeta],
+    candidates: &[ItemMeta],
     backend_priority: &HashMap<String, usize>,
-) -> VaultItemMeta {
+) -> ItemMeta {
     // Callers always pass non-empty slices (grouped from a non-empty HashMap entry).
     // We use `unwrap_or_else` with the first element as a safe fallback rather than
     // panicking, since `min_by_key` only returns None on an empty iterator and we
@@ -64,7 +64,7 @@ fn select_by_priority(
         .iter()
         .min_by_key(|item| {
             backend_priority
-                .get(&item.backend_id)
+                .get(&item.provider_id)
                 .copied()
                 .unwrap_or(usize::MAX)
         })
@@ -73,10 +73,10 @@ fn select_by_priority(
 }
 
 fn select_by_newest(
-    candidates: &[VaultItemMeta],
+    candidates: &[ItemMeta],
     fallback: DedupTimeFallback,
     backend_priority: &HashMap<String, usize>,
-) -> VaultItemMeta {
+) -> ItemMeta {
     // Callers always pass non-empty slices (grouped from a non-empty HashMap entry).
     debug_assert!(!candidates.is_empty(), "candidates must be non-empty");
     // Use iterator destructuring so there is no index-based access.
@@ -85,9 +85,9 @@ fn select_by_newest(
         // Empty slice: debug_assert above catches this in test builds;
         // in release builds return a zero-value item rather than panic.
         None => {
-            return VaultItemMeta {
+            return ItemMeta {
                 id: String::new(),
-                backend_id: String::new(),
+                provider_id: String::new(),
                 label: String::new(),
                 attributes: crate::Attributes::new(),
                 created: None,
@@ -106,11 +106,11 @@ fn select_by_newest(
         }
         if candidate_time == winner_time {
             let candidate_priority = backend_priority
-                .get(&candidate.backend_id)
+                .get(&candidate.provider_id)
                 .copied()
                 .unwrap_or(usize::MAX);
             let winner_priority = backend_priority
-                .get(&winner.backend_id)
+                .get(&winner.provider_id)
                 .copied()
                 .unwrap_or(usize::MAX);
             if candidate_priority < winner_priority {
@@ -121,7 +121,7 @@ fn select_by_newest(
     winner
 }
 
-fn timestamp(item: &VaultItemMeta, fallback: DedupTimeFallback) -> SystemTime {
+fn timestamp(item: &ItemMeta, fallback: DedupTimeFallback) -> SystemTime {
     if let Some(modified) = item.modified {
         return modified;
     }
@@ -151,17 +151,12 @@ pub fn is_stale(last_access: SystemTime, timeout_minutes: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Attributes, VaultItemMeta};
+    use crate::{Attributes, ItemMeta};
 
-    fn meta(
-        id: &str,
-        backend_id: &str,
-        label: &str,
-        modified: Option<SystemTime>,
-    ) -> VaultItemMeta {
-        VaultItemMeta {
+    fn meta(id: &str, provider_id: &str, label: &str, modified: Option<SystemTime>) -> ItemMeta {
+        ItemMeta {
             id: id.to_string(),
-            backend_id: backend_id.to_string(),
+            provider_id: provider_id.to_string(),
             label: label.to_string(),
             attributes: Attributes::new(),
             created: None,
@@ -202,6 +197,6 @@ mod tests {
         let map = backend_priority_map(vec!["b".to_string(), "a".to_string()]);
         let result = dedup(vec![a, b], config, &map);
         assert_eq!(result.items.len(), 1);
-        assert_eq!(result.items[0].backend_id, "b");
+        assert_eq!(result.items[0].provider_id, "b");
     }
 }

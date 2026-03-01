@@ -36,7 +36,7 @@ pub enum BitwardenError {
     Other(#[from] anyhow::Error),
 }
 
-impl From<BitwardenError> for rosec_core::BackendError {
+impl From<BitwardenError> for rosec_core::ProviderError {
     fn from(err: BitwardenError) -> Self {
         match err {
             BitwardenError::Locked => Self::Locked,

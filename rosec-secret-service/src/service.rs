@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rosec_core::{BackendError, SecretBytes};
+use rosec_core::{ProviderError, SecretBytes};
 use tracing::debug;
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
@@ -114,12 +114,12 @@ impl SecretService {
             }
             let backend = self
                 .state
-                .backend_by_id(&item.backend_id)
+                .backend_by_id(&item.provider_id)
                 .or_else(|| self.state.backends_ordered().into_iter().next())
                 .ok_or_else(|| {
                     FdoError::Failed(format!(
-                        "no backend for item backend_id '{}'",
-                        item.backend_id
+                        "no provider for item provider_id '{}'",
+                        item.provider_id
                     ))
                 })?;
             let item_id = item.id.clone();
@@ -134,9 +134,9 @@ impl SecretService {
             // omitting an item is valid.
             let secret = match secret_result {
                 Ok(s) => s,
-                Err(BackendError::Other(_)) => continue,
-                Err(BackendError::NotFound) => continue,
-                Err(BackendError::Locked) => continue,
+                Err(ProviderError::Other(_)) => continue,
+                Err(ProviderError::NotFound) => continue,
+                Err(ProviderError::Locked) => continue,
                 Err(e) => return Err(map_backend_error(e)),
             };
             let value = build_secret_value(session, &secret, aes_key.as_deref())?;

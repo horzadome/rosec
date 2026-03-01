@@ -30,27 +30,43 @@ pub type Attributes = HashMap<String, String>;
 /// special meaning (id, label, timestamps, type discriminator).
 pub const RESERVED_ATTRIBUTES: &[&str] = &["id", "label", "created", "modified", "type"];
 
-/// Classification of a backend for user-facing separation.
+// ---------------------------------------------------------------------------
+// Capability model
+// ---------------------------------------------------------------------------
+
+/// Declares what optional functionality a provider supports.
 ///
-/// Vaults are rosec's own local encrypted stores, managed via `rosec vault`
-/// CLI commands. External backends connect to third-party password managers
-/// (Bitwarden, etc.) and are managed via `rosec backend` commands.
+/// Providers return a static slice from [`Provider::capabilities`].  The service
+/// layer and CLI check capabilities before calling optional trait methods.
 ///
-/// Internally both implement `VaultBackend` and participate in the same
-/// unlock sweep, router, and D-Bus interface. The distinction is purely
-/// user-facing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BackendClass {
-    /// Local encrypted vault owned by rosec.
-    Vault,
-    /// External password manager or secret store.
-    External,
+/// Use [`require`] to gate an operation on a capability — it returns
+/// `ProviderError::NotSupported` if the provider lacks the required capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Capability {
+    /// Provider can sync with a remote source ([`Provider::sync`]).
+    Sync,
+    /// Provider supports write operations (create, update, delete items).
+    Write,
+    /// Provider exposes SSH keys ([`Provider::list_ssh_keys`], [`Provider::get_ssh_private_key`]).
+    Ssh,
+    /// Provider supports key-wrapping / multiple unlock passwords.
+    KeyWrapping,
+    /// Provider supports password changes ([`Provider::change_password`]).
+    PasswordChange,
+}
+
+/// Check that `provider` declares `cap`; return `ProviderError::NotSupported` if not.
+pub fn require(provider: &dyn Provider, cap: Capability) -> Result<(), ProviderError> {
+    if provider.capabilities().contains(&cap) {
+        Ok(())
+    } else {
+        Err(ProviderError::NotSupported)
+    }
 }
 
 /// Item type for determining default secret attribute.
 ///
-/// Used by `get_primary_secret()` to return the appropriate secret based on
+/// Used by [`primary_secret`] to return the appropriate secret based on
 /// item type when the caller doesn't specify an attribute name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemType {
@@ -101,18 +117,18 @@ impl NewItem {
     /// - label is empty
     /// - no secrets provided
     /// - reserved attribute names are used
-    pub fn validate(&self) -> Result<(), BackendError> {
+    pub fn validate(&self) -> Result<(), ProviderError> {
         if self.label.is_empty() {
-            return Err(BackendError::InvalidInput("label cannot be empty".into()));
+            return Err(ProviderError::InvalidInput("label cannot be empty".into()));
         }
         if self.secrets.is_empty() {
-            return Err(BackendError::InvalidInput(
+            return Err(ProviderError::InvalidInput(
                 "at least one secret required".into(),
             ));
         }
         for key in RESERVED_ATTRIBUTES {
             if self.attributes.contains_key(*key) {
-                return Err(BackendError::InvalidInput(
+                return Err(ProviderError::InvalidInput(
                     format!("reserved attribute name: {}", key).into(),
                 ));
             }
@@ -137,26 +153,20 @@ pub struct ItemUpdate {
 }
 
 #[derive(Debug, Clone)]
-pub struct BackendStatus {
+pub struct ProviderStatus {
     pub locked: bool,
     pub last_sync: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VaultItemMeta {
+pub struct ItemMeta {
     pub id: String,
-    pub backend_id: String,
+    pub provider_id: String,
     pub label: String,
     pub attributes: Attributes,
     pub created: Option<SystemTime>,
     pub modified: Option<SystemTime>,
     pub locked: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VaultItem {
-    pub meta: VaultItemMeta,
-    pub secret: Option<SecretBytes>,
 }
 
 pub struct SecretBytes(Zeroizing<Vec<u8>>);
@@ -223,15 +233,15 @@ pub enum AuthFieldKind {
     Secret,
 }
 
-/// Describes a single credential field that a backend needs for `unlock`.
+/// Describes a single credential field that a provider needs for `unlock`.
 ///
-/// Backends return a static slice of `AuthField` from `auth_fields()`.  The
+/// Providers return a static slice of `AuthField` from `auth_fields()`.  The
 /// daemon's prompt subprocess and the `rosec auth` CLI subcommand use this list
-/// to build backend-agnostic input forms.
+/// to build provider-agnostic input forms.
 #[derive(Debug, Clone, Copy)]
 pub struct AuthField {
     /// Machine-readable identifier — used as the key in the field map passed
-    /// back to `unlock`.  Must be unique within a backend's field list.
+    /// back to `unlock`.  Must be unique within a provider's field list.
     pub id: &'static str,
     /// Human-readable label shown next to the input widget.
     pub label: &'static str,
@@ -242,10 +252,10 @@ pub struct AuthField {
     pub kind: AuthFieldKind,
 }
 
-/// Information returned by a backend when device/API-key registration is required.
+/// Information returned by a provider when device/API-key registration is required.
 ///
 /// The auth flow displays `instructions` to the user before prompting for the
-/// `fields`.  Both are backend-defined so the copy is accurate and actionable.
+/// `fields`.  Both are provider-defined so the copy is accurate and actionable.
 #[derive(Debug, Clone, Copy)]
 pub struct RegistrationInfo {
     /// Human-readable instructions telling the user how to obtain the required
@@ -262,7 +272,7 @@ pub struct RegistrationInfo {
     pub fields: &'static [AuthField],
 }
 
-/// Credentials passed to `VaultBackend::unlock`.
+/// Credentials passed to [`Provider::unlock`].
 ///
 /// This enum intentionally does NOT derive `Serialize` or `Deserialize`.
 /// Credentials (master passwords, session tokens, OTPs) must never be
@@ -272,10 +282,10 @@ pub enum UnlockInput {
     /// Standard password-only unlock (master password for PM backends, or a
     /// locally-derived key for token-based backends that use local encryption).
     Password(Zeroizing<String>),
-    /// Password + registration credentials, supplied when the backend previously
-    /// returned `BackendError::RegistrationRequired`.
+    /// Password + registration credentials, supplied when the provider previously
+    /// returned `ProviderError::RegistrationRequired`.
     ///
-    /// The backend uses `password` to derive the local storage key (to encrypt
+    /// The provider uses `password` to derive the local storage key (to encrypt
     /// the registration credentials at rest), then performs device registration,
     /// then retries its normal unlock flow.
     WithRegistration {
@@ -300,14 +310,14 @@ impl std::fmt::Debug for UnlockInput {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum BackendError {
-    #[error("backend locked")]
+pub enum ProviderError {
+    #[error("provider locked")]
     Locked,
     #[error("item not found")]
     NotFound,
     #[error("not supported")]
     NotSupported,
-    #[error("backend unavailable: {0}")]
+    #[error("provider unavailable: {0}")]
     Unavailable(String),
     /// An item with the same attributes already exists (for create with replace=false).
     #[error("item already exists")]
@@ -315,16 +325,16 @@ pub enum BackendError {
     /// Invalid input (validation failed).
     #[error("invalid input: {0}")]
     InvalidInput(Box<str>),
-    /// The backend requires device/API-key registration before it can unlock.
+    /// The provider requires device/API-key registration before it can unlock.
     ///
     /// The auth flow should prompt for `RegistrationInfo::fields` (obtained via
-    /// `VaultBackend::registration_info()`) and retry with
+    /// `Provider::registration_info()`) and retry with
     /// `UnlockInput::WithRegistration`.
     #[error("registration required")]
     RegistrationRequired,
     /// The password (or passphrase) was incorrect.
     ///
-    /// Unlike `RegistrationRequired`, this means the backend *has* stored
+    /// Unlike `RegistrationRequired`, this means the provider *has* stored
     /// credentials but the provided password produced a wrong decryption key.
     /// The auth flow should re-prompt for the password rather than asking the
     /// user to re-register.
@@ -338,23 +348,23 @@ pub enum BackendError {
 // Attribute model
 // ---------------------------------------------------------------------------
 
-/// Describes a single attribute that a backend can produce for vault items.
+/// Describes a single attribute that a provider can produce for items.
 ///
-/// Backends return a static slice of these from [`VaultBackend::available_attributes`]
+/// Providers return a static slice of these from [`Provider::available_attributes`]
 /// so the service layer can validate config and support introspection.
 #[derive(Debug, Clone)]
 pub struct AttributeDescriptor {
     /// Machine-readable attribute name (e.g. `"password"`, `"totp"`, `"number"`).
     ///
     /// Uses the flat, unprefixed naming convention.  Custom fields from the
-    /// vault source are exposed with a `"custom."` prefix to avoid collisions.
+    /// source are exposed with a `"custom."` prefix to avoid collisions.
     pub name: &'static str,
 
     /// `true` if the attribute value is sensitive (passwords, TOTP seeds, card
     /// numbers, private keys, PII).  Sensitive attributes are never exposed in
     /// the D-Bus `Attributes` property — only their *names* are discoverable
     /// via a rosec-specific D-Bus method, and their *values* are retrieved via
-    /// [`VaultBackend::get_secret_attr`].
+    /// [`Provider::get_secret_attr`].
     pub sensitive: bool,
 
     /// Which item types this attribute applies to (e.g. `["login"]`, `["card"]`,
@@ -366,10 +376,10 @@ pub struct AttributeDescriptor {
     pub description: &'static str,
 }
 
-/// The full attribute set for a single vault item, split into public metadata
+/// The full attribute set for a single item, split into public metadata
 /// and the names of available sensitive (secret) attributes.
 ///
-/// Produced by [`VaultBackend::get_item_attributes`].  The service layer uses
+/// Produced by [`Provider::get_item_attributes`].  The service layer uses
 /// `public` for the D-Bus `Attributes` property and `secret_names` for the
 /// rosec-specific secret attribute discovery method.
 #[derive(Debug, Clone)]
@@ -383,7 +393,7 @@ pub struct ItemAttributes {
     /// Names of available sensitive attributes for this item.
     ///
     /// Does NOT contain the actual secret values — those are retrieved via
-    /// [`VaultBackend::get_secret_attr`].  This list powers the rosec-specific
+    /// [`Provider::get_secret_attr`].  This list powers the rosec-specific
     /// `GetSecretAttributeNames` D-Bus method.
     pub secret_names: Vec<String>,
 }
@@ -392,9 +402,9 @@ pub struct ItemAttributes {
 // SSH agent types
 // ---------------------------------------------------------------------------
 
-/// Public metadata for a single SSH key exposed by a backend.
+/// Public metadata for a single SSH key exposed by a provider.
 ///
-/// Contains no private key material — use [`VaultBackend::get_ssh_private_key`]
+/// Contains no private key material — use [`Provider::get_ssh_private_key`]
 /// to retrieve the actual key for signing.
 #[derive(Debug, Clone)]
 pub struct SshKeyMeta {
@@ -404,8 +414,8 @@ pub struct SshKeyMeta {
     /// Human-readable vault item name.
     pub item_name: String,
 
-    /// Backend that owns this key.
-    pub backend_id: String,
+    /// Provider that owns this key.
+    pub provider_id: String,
 
     /// OpenSSH wire-format public key (the `authorized_keys` line), if known.
     ///
@@ -431,7 +441,7 @@ pub struct SshKeyMeta {
     pub revision_date: Option<SystemTime>,
 }
 
-/// Raw private key material retrieved from a vault backend.
+/// Raw private key material retrieved from a provider.
 ///
 /// Contains PEM-encoded private key bytes.  The caller must parse and
 /// zeroize the material after use.  Never stored to disk.
@@ -462,36 +472,49 @@ pub type CallbackFn = Arc<dyn Fn() + Send + Sync + 'static>;
 /// was checked but nothing differed.
 pub type SyncSucceededFn = Arc<dyn Fn(bool) + Send + Sync + 'static>;
 
-/// Callbacks registered by `rosecd` on each backend after construction.
+/// Callbacks registered by `rosecd` on each provider after construction.
 ///
-/// All fields are `Option` — backends fire only the callbacks that are set.
-/// The default implementation of [`VaultBackend::set_event_callbacks`] is a
-/// no-op, so backends that do not yet support the callback system compile and
+/// All fields are `Option` — providers fire only the callbacks that are set.
+/// The default implementation of [`Provider::set_event_callbacks`] is a
+/// no-op, so providers that do not yet support the callback system compile and
 /// run safely.
 #[derive(Clone, Default)]
-pub struct BackendCallbacks {
+pub struct ProviderCallbacks {
     /// Fired immediately after a successful unlock.
     pub on_unlocked: Option<CallbackFn>,
     /// Fired immediately after a successful lock.
     pub on_locked: Option<CallbackFn>,
     /// Fired after a sync completes successfully.
     ///
-    /// `changed` is `true` when the vault contents changed materially
-    /// (ciphers added / removed / modified); `false` when the sync ran
+    /// `changed` is `true` when the contents changed materially
+    /// (items added / removed / modified); `false` when the sync ran
     /// but found nothing new.  Callers typically rebuild SSH keys only
     /// when `changed == true`.
     pub on_sync_succeeded: Option<SyncSucceededFn>,
     /// Fired after a sync attempt fails (network error, auth error, etc.).
     pub on_sync_failed: Option<CallbackFn>,
+    /// Nudge from the remote that a sync should happen (e.g. SignalR notification).
+    ///
+    /// Replaces the previous `as_any()` downcast pattern — providers that receive
+    /// remote push notifications store this callback and invoke it when the remote
+    /// signals that data has changed.  The daemon's handler then triggers a sync.
+    pub on_remote_sync_nudge: Option<CallbackFn>,
+    /// Nudge from the remote that the vault should be locked (e.g. SignalR logout).
+    ///
+    /// Same pattern as `on_remote_sync_nudge` — providers invoke this when the
+    /// remote signals that the session should be terminated.
+    pub on_remote_lock_nudge: Option<CallbackFn>,
 }
 
-impl std::fmt::Debug for BackendCallbacks {
+impl std::fmt::Debug for ProviderCallbacks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BackendCallbacks")
+        f.debug_struct("ProviderCallbacks")
             .field("on_unlocked", &self.on_unlocked.is_some())
             .field("on_locked", &self.on_locked.is_some())
             .field("on_sync_succeeded", &self.on_sync_succeeded.is_some())
             .field("on_sync_failed", &self.on_sync_failed.is_some())
+            .field("on_remote_sync_nudge", &self.on_remote_sync_nudge.is_some())
+            .field("on_remote_lock_nudge", &self.on_remote_lock_nudge.is_some())
             .finish()
     }
 }
@@ -499,60 +522,56 @@ impl std::fmt::Debug for BackendCallbacks {
 // ---------------------------------------------------------------------------
 
 #[async_trait::async_trait]
-pub trait VaultBackend: Send + Sync {
-    /// Return `self` as `&dyn std::any::Any` to allow downcasting to concrete types.
-    ///
-    /// Implementations should return `self` directly:
-    /// ```ignore
-    /// fn as_any(&self) -> &dyn std::any::Any { self }
-    /// ```
-    fn as_any(&self) -> &dyn std::any::Any;
-
+pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
     fn name(&self) -> &str;
 
-    /// The backend type identifier (e.g. `"bitwarden"`, `"bitwarden-sm"`, `"vault"`).
+    /// The provider type identifier (e.g. `"bitwarden"`, `"bitwarden-sm"`, `"local"`).
     ///
-    /// Used by `rosec backend list` / `rosec vault list` to show what kind of
-    /// backend each entry is.
+    /// Used by `rosec provider list` to show what kind of provider each entry is.
     fn kind(&self) -> &str;
 
-    /// Whether this is a local vault or an external backend.
+    /// Declare what optional functionality this provider supports.
     ///
-    /// Used by the CLI to separate `rosec vault` commands (for [`BackendClass::Vault`])
-    /// from `rosec backend` commands (for [`BackendClass::External`]).
+    /// The service layer and CLI check this before calling optional trait methods.
+    /// Use [`require`] to gate an operation: it returns `ProviderError::NotSupported`
+    /// if the provider lacks the required capability.
     ///
-    /// Default: [`BackendClass::External`].
-    fn backend_class(&self) -> BackendClass {
-        BackendClass::External
+    /// Default: empty (no optional capabilities).
+    fn capabilities(&self) -> &'static [Capability] {
+        &[]
     }
 
-    /// Register lifecycle event callbacks on this backend.
+    /// Register lifecycle event callbacks on this provider.
     ///
     /// Called once by `rosecd` after construction, before any unlock is
-    /// attempted.  Backends store the callbacks and fire them at the
+    /// attempted.  Providers store the callbacks and fire them at the
     /// appropriate points:
     ///
-    /// - `on_unlocked` — after a successful [`unlock`][VaultBackend::unlock]
-    /// - `on_locked`   — after a successful [`lock`][VaultBackend::lock]
-    /// - `on_sync_succeeded(changed)` — after a successful [`sync`][VaultBackend::sync];
-    ///   `changed` is `true` iff vault contents differ from before the sync
+    /// - `on_unlocked` — after a successful [`unlock`][Provider::unlock]
+    /// - `on_locked`   — after a successful [`lock`][Provider::lock]
+    /// - `on_sync_succeeded(changed)` — after a successful [`sync`][Provider::sync];
+    ///   `changed` is `true` iff contents differ from before the sync
     /// - `on_sync_failed` — after a failed sync attempt
+    /// - `on_remote_sync_nudge` — stored and invoked when a remote push
+    ///   notification signals that data has changed (e.g. SignalR)
+    /// - `on_remote_lock_nudge` — invoked when the remote signals session
+    ///   termination
     ///
-    /// The default is a no-op.  Backends that do not implement this method
+    /// The default is a no-op.  Providers that do not implement this method
     /// simply ignore all callbacks.
-    fn set_event_callbacks(&self, _callbacks: BackendCallbacks) -> Result<(), BackendError> {
+    fn set_event_callbacks(&self, _callbacks: ProviderCallbacks) -> Result<(), ProviderError> {
         Ok(())
     }
 
-    /// The password / local-key field for this backend.
+    /// The password / local-key field for this provider.
     ///
     /// The auth flow always prompts this field first, before anything else.
-    /// Backends may customise the label and description:
+    /// Providers may customise the label and description:
     ///
-    /// - Password Manager backends (Bitwarden PM): `"Master Password"` with the
+    /// - Password Manager providers (Bitwarden PM): `"Master Password"` with the
     ///   standard Bitwarden placeholder.
-    /// - Token-based backends (Bitwarden SM, future cloud providers): something
+    /// - Token-based providers (Bitwarden SM, future cloud providers): something
     ///   like `"Key encryption password"` with a description explaining it is
     ///   only used locally to protect the stored API token.
     ///
@@ -567,36 +586,36 @@ pub trait VaultBackend: Send + Sync {
         }
     }
 
-    /// Registration information for backends that require device/API-key
+    /// Registration information for providers that require device/API-key
     /// registration before the normal password-based unlock can succeed.
     ///
-    /// Returns `None` for backends that never require registration (default).
-    /// Returns `Some(RegistrationInfo)` for backends where the server may reject
+    /// Returns `None` for providers that never require registration (default).
+    /// Returns `Some(RegistrationInfo)` for providers where the server may reject
     /// a first-time login from an unrecognised device and require an API key.
     ///
-    /// When the auth flow receives `BackendError::RegistrationRequired`, it
+    /// When the auth flow receives `ProviderError::RegistrationRequired`, it
     /// calls this method to obtain the instructions and fields to display,
     /// then retries unlock with `UnlockInput::WithRegistration`.
     fn registration_info(&self) -> Option<RegistrationInfo> {
         None
     }
 
-    /// Describe any additional credential fields this backend needs for `unlock`,
+    /// Describe any additional credential fields this provider needs for `unlock`,
     /// beyond the password field returned by `password_field()`.
     ///
     /// The returned slice drives the prompt UI (both the Wayland GUI and the
     /// TTY fallback) and the `rosec auth` CLI subcommand.  Field values are
     /// collected by the caller, assembled into a `HashMap<&str, Zeroizing<String>>`,
-    /// and passed back to the backend via `unlock`.
+    /// and passed back to the provider via `unlock`.
     ///
     /// The default implementation returns an empty slice.
     fn auth_fields(&self) -> &'static [AuthField] {
         &[]
     }
 
-    async fn status(&self) -> Result<BackendStatus, BackendError>;
+    async fn status(&self) -> Result<ProviderStatus, ProviderError>;
 
-    /// Authenticate this backend with the supplied credentials.
+    /// Authenticate this provider with the supplied credentials.
     ///
     /// `UnlockInput::Password(pw)` is the normal unlock path — the password is
     /// used directly (PM: vault decryption key) or as input to a key derivation
@@ -605,37 +624,37 @@ pub trait VaultBackend: Send + Sync {
     /// non-empty.
     ///
     /// `UnlockInput::WithRegistration { password, registration_fields }` is
-    /// used when the backend previously returned `BackendError::RegistrationRequired`.
+    /// used when the provider previously returned `ProviderError::RegistrationRequired`.
     /// The password serves the same role as above; `registration_fields` carries
     /// the additional credentials needed for first-time setup or token rotation
     /// (e.g. an SM access token, or PM device API key).
     ///
     /// In-memory credentials (decrypted vault keys, access tokens) are held as
     /// `Zeroizing<_>` and scrubbed on lock/drop.  `sync()` operates on these
-    /// in-memory credentials and returns `BackendError::Locked` once they are
+    /// in-memory credentials and returns `ProviderError::Locked` once they are
     /// gone — callers must unlock again before syncing after a lock.
     ///
-    /// Returns `BackendError::RegistrationRequired` if the backend needs
+    /// Returns `ProviderError::RegistrationRequired` if the provider needs
     /// first-time setup before the normal password unlock can succeed.
-    async fn unlock(&self, input: UnlockInput) -> Result<(), BackendError>;
-    async fn lock(&self) -> Result<(), BackendError>;
+    async fn unlock(&self, input: UnlockInput) -> Result<(), ProviderError>;
+    async fn lock(&self) -> Result<(), ProviderError>;
 
-    /// Change the unlock password for this backend.
+    /// Change the unlock password for this provider.
     ///
-    /// Semantics vary by backend type:
+    /// Semantics vary by provider type:
     ///
     /// - **Local vault**: finds the wrapping entry that `old_password` unlocks,
     ///   adds a new wrapping entry for `new_password`, then removes the old one.
     ///   The vault key itself is unchanged — only the key-wrapping layer is
     ///   rotated.  The vault must be unlocked.
     ///
-    /// - **SM backend**: decrypts the stored access token with the old-password-
+    /// - **SM provider**: decrypts the stored access token with the old-password-
     ///   derived storage key, re-encrypts it with the new-password-derived key,
-    ///   and persists the result.  The backend must be unlocked (so the access
+    ///   and persists the result.  The provider must be unlocked (so the access
     ///   token is available in memory for verification).
     ///
-    /// Returns `BackendError::AuthFailed` if `old_password` is incorrect.
-    /// Returns `BackendError::NotSupported` for backends that do not support
+    /// Returns `ProviderError::AuthFailed` if `old_password` is incorrect.
+    /// Returns `ProviderError::NotSupported` for providers that do not support
     /// password changes (the default).
     ///
     /// # Security
@@ -647,23 +666,22 @@ pub trait VaultBackend: Send + Sync {
         &self,
         _old_password: Zeroizing<String>,
         _new_password: Zeroizing<String>,
-    ) -> Result<(), BackendError> {
-        Err(BackendError::NotSupported)
+    ) -> Result<(), ProviderError> {
+        Err(ProviderError::NotSupported)
     }
 
-    /// Pull fresh data from the remote source and update the in-memory vault.
+    /// Pull fresh data from the remote source and update the in-memory store.
     ///
-    /// Returns `Ok(())` on success, `BackendError::Locked` if the backend is
-    /// not yet authenticated.  The default returns `BackendError::Locked` so
-    /// that backends without a custom sync implementation fail safely rather
-    /// than silently succeeding.  Backends with network sync (Bitwarden PM/SM)
-    /// override this.
-    async fn sync(&self) -> Result<(), BackendError> {
-        Err(BackendError::Locked)
+    /// Gated behind [`Capability::Sync`].  Returns `Ok(())` on success,
+    /// `ProviderError::Locked` if the provider is not yet authenticated.
+    /// The default returns `ProviderError::NotSupported` — providers with
+    /// network sync (Bitwarden PM/SM) override this.
+    async fn sync(&self) -> Result<(), ProviderError> {
+        Err(ProviderError::NotSupported)
     }
 
     /// Return the UTC timestamp of the last successful sync, or `None` if no
-    /// sync has occurred since the backend was constructed.
+    /// sync has occurred since the provider was constructed.
     fn last_synced_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         None
     }
@@ -672,50 +690,40 @@ pub trait VaultBackend: Send + Sync {
     ///
     /// Returns `Ok(true)` if a sync is needed, `Ok(false)` if the local copy
     /// is up-to-date, or an error if the check itself failed.  The default
-    /// returns `Ok(true)` (always sync), so backends that don't implement a
+    /// returns `Ok(true)` (always sync), so providers that don't implement a
     /// cheap remote-check still behave correctly — just less efficiently.
     ///
     /// Implementations should use a lightweight API call (e.g.
     /// `GET /accounts/revision-date` for Bitwarden PM,
     /// `GET /organizations/{id}/secrets/sync` for Bitwarden SM).
-    async fn check_remote_changed(&self) -> Result<bool, BackendError> {
+    async fn check_remote_changed(&self) -> Result<bool, ProviderError> {
         Ok(true)
     }
 
-    async fn list_items(&self) -> Result<Vec<VaultItemMeta>, BackendError>;
-    async fn get_item(&self, id: &str) -> Result<VaultItem, BackendError>;
-    async fn get_secret(&self, id: &str) -> Result<SecretBytes, BackendError>;
-    async fn search(&self, attrs: &Attributes) -> Result<Vec<VaultItemMeta>, BackendError>;
+    async fn list_items(&self) -> Result<Vec<ItemMeta>, ProviderError>;
+    async fn search(&self, attrs: &Attributes) -> Result<Vec<ItemMeta>, ProviderError>;
 
     // -----------------------------------------------------------------------
-    // Attribute model (new)
+    // Attribute model
     // -----------------------------------------------------------------------
 
-    /// Static catalogue of all attributes this backend can produce.
+    /// Static catalogue of all attributes this provider can produce.
     ///
     /// Returns a slice of [`AttributeDescriptor`]s describing every field this
-    /// backend knows about (both public and sensitive).  The service layer uses
+    /// provider knows about (both public and sensitive).  The service layer uses
     /// this to validate `return_attr` glob patterns at startup and to power
     /// introspection / CLI help.
     ///
-    /// Default: empty (backends that haven't migrated to the attribute model).
+    /// Default: empty (providers that haven't migrated to the attribute model).
     fn available_attributes(&self) -> &'static [AttributeDescriptor] {
         &[]
     }
 
     /// Get the full attribute set (public metadata + secret attribute names)
-    /// for a specific vault item.
+    /// for a specific item.
     ///
-    /// The default implementation falls back to the existing `get_item()` and
-    /// uses `meta.attributes` as public, with no secret attributes.  Backends
-    /// should override this to populate `secret_names`.
-    async fn get_item_attributes(&self, id: &str) -> Result<ItemAttributes, BackendError> {
-        let item = self.get_item(id).await?;
-        Ok(ItemAttributes {
-            public: item.meta.attributes,
-            secret_names: Vec::new(),
-        })
-    }
+    /// All providers must implement this — there is no default.
+    async fn get_item_attributes(&self, id: &str) -> Result<ItemAttributes, ProviderError>;
 
     /// Retrieve a specific sensitive attribute value by name.
     ///
@@ -723,29 +731,26 @@ pub trait VaultBackend: Send + Sync {
     /// login password, `get_secret_attr("cipher-uuid", "totp")` returns the
     /// TOTP seed.
     ///
-    /// Returns `BackendError::NotFound` if the attribute doesn't exist on the
-    /// item, or `BackendError::NotSupported` if the backend hasn't implemented
-    /// the attribute model.
+    /// Returns `ProviderError::NotFound` if the attribute doesn't exist on the
+    /// item.
     ///
-    /// Default: returns `NotSupported`.
-    async fn get_secret_attr(&self, _id: &str, _attr: &str) -> Result<SecretBytes, BackendError> {
-        Err(BackendError::NotSupported)
-    }
+    /// All providers must implement this — there is no default.
+    async fn get_secret_attr(&self, id: &str, attr: &str) -> Result<SecretBytes, ProviderError>;
 
     // -----------------------------------------------------------------------
     // SSH agent interface
     // -----------------------------------------------------------------------
 
-    /// List all SSH keys available from this backend (public metadata only).
+    /// List all SSH keys available from this provider (public metadata only).
     ///
-    /// Returns one [`SshKeyMeta`] per discoverable SSH key.  Keys may come
-    /// from:
-    /// - Native SSH key vault items
+    /// Gated behind [`Capability::Ssh`].  Returns one [`SshKeyMeta`] per
+    /// discoverable SSH key.  Keys may come from:
+    /// - Native SSH key items
     /// - PEM private key material found in notes, passwords, or hidden fields
     ///
     /// Called by the SSH agent layer after each sync and after unlock.  The
-    /// default returns an empty list (backend does not expose SSH keys).
-    async fn list_ssh_keys(&self) -> Result<Vec<SshKeyMeta>, BackendError> {
+    /// default returns an empty list (provider does not expose SSH keys).
+    async fn list_ssh_keys(&self) -> Result<Vec<SshKeyMeta>, ProviderError> {
         Ok(Vec::new())
     }
 
@@ -755,27 +760,19 @@ pub trait VaultBackend: Send + Sync {
     /// [`SshPrivateKeyMaterial`] contains the raw PEM bytes — callers are
     /// responsible for parsing and zeroizing after use.
     ///
-    /// Returns [`BackendError::NotFound`] if no SSH key exists for that ID,
-    /// [`BackendError::Locked`] if the backend is locked, or
-    /// [`BackendError::NotSupported`] if the backend never exposes private keys
+    /// Returns [`ProviderError::NotFound`] if no SSH key exists for that ID,
+    /// [`ProviderError::Locked`] if the provider is locked, or
+    /// [`ProviderError::NotSupported`] if the provider never exposes private keys
     /// (default).
-    async fn get_ssh_private_key(&self, _id: &str) -> Result<SshPrivateKeyMaterial, BackendError> {
-        Err(BackendError::NotSupported)
+    async fn get_ssh_private_key(&self, _id: &str) -> Result<SshPrivateKeyMaterial, ProviderError> {
+        Err(ProviderError::NotSupported)
     }
 
     // -----------------------------------------------------------------------
-    // Write operations (default: NotSupported)
+    // Write operations (gated behind Capability::Write)
     // -----------------------------------------------------------------------
 
-    /// Check if this backend supports write operations.
-    ///
-    /// Used by the D-Bus layer to return appropriate errors early and by the
-    /// write router to select the target backend.
-    fn supports_writes(&self) -> bool {
-        false
-    }
-
-    /// Create a new item in this backend.
+    /// Create a new item in this provider.
     ///
     /// # Arguments
     /// * `item` - The item to create (label, attributes, secrets)
@@ -784,15 +781,15 @@ pub trait VaultBackend: Send + Sync {
     ///
     /// # Returns
     /// * `Ok(id)` - The ID of the created or updated item
-    /// * `Err(BackendError::AlreadyExists)` - Item exists and replace=false
-    /// * `Err(BackendError::InvalidInput)` - Validation failed
-    /// * `Err(BackendError::NotSupported)` - Backend is read-only
-    /// * `Err(BackendError::Locked)` - Backend is locked
+    /// * `Err(ProviderError::AlreadyExists)` - Item exists and replace=false
+    /// * `Err(ProviderError::InvalidInput)` - Validation failed
+    /// * `Err(ProviderError::NotSupported)` - Provider is read-only
+    /// * `Err(ProviderError::Locked)` - Provider is locked
     ///
     /// Attribute matching for replace uses all provided attributes (case-sensitive
     /// string equality per Secret Service spec).
-    async fn create_item(&self, _item: NewItem, _replace: bool) -> Result<String, BackendError> {
-        Err(BackendError::NotSupported)
+    async fn create_item(&self, _item: NewItem, _replace: bool) -> Result<String, ProviderError> {
+        Err(ProviderError::NotSupported)
     }
 
     /// Update an existing item.
@@ -802,40 +799,26 @@ pub trait VaultBackend: Send + Sync {
     /// - `secrets`: merge into existing secrets if Some (only provided keys change)
     ///
     /// # Returns
-    /// * `Err(BackendError::NotFound)` - Item doesn't exist
-    /// * `Err(BackendError::InvalidInput)` - Reserved attribute name used
-    /// * `Err(BackendError::NotSupported)` - Backend is read-only
-    /// * `Err(BackendError::Locked)` - Backend is locked
-    async fn update_item(&self, _id: &str, _update: ItemUpdate) -> Result<(), BackendError> {
-        Err(BackendError::NotSupported)
+    /// * `Err(ProviderError::NotFound)` - Item doesn't exist
+    /// * `Err(ProviderError::InvalidInput)` - Reserved attribute name used
+    /// * `Err(ProviderError::NotSupported)` - Provider is read-only
+    /// * `Err(ProviderError::Locked)` - Provider is locked
+    async fn update_item(&self, _id: &str, _update: ItemUpdate) -> Result<(), ProviderError> {
+        Err(ProviderError::NotSupported)
     }
 
     /// Delete an item by ID.
     ///
     /// # Returns
-    /// * `Err(BackendError::NotFound)` - Item doesn't exist
-    /// * `Err(BackendError::NotSupported)` - Backend is read-only
-    /// * `Err(BackendError::Locked)` - Backend is locked
-    async fn delete_item(&self, _id: &str) -> Result<(), BackendError> {
-        Err(BackendError::NotSupported)
-    }
-
-    /// Get the primary secret for an item using type-aware default attribute.
-    ///
-    /// Dispatches to `get_secret_attr(id, type.default_secret_attr())` based on
-    /// the item's `attributes.type` field:
-    /// - `generic` (or unset) → `"secret"`
-    /// - `login` → `"password"`
-    /// - `ssh-key` → `"private_key"`
-    async fn get_primary_secret(&self, id: &str) -> Result<SecretBytes, BackendError> {
-        let item = self.get_item(id).await?;
-        let item_type = ItemType::from_attributes(&item.meta.attributes);
-        self.get_secret_attr(id, item_type.default_secret_attr())
-            .await
+    /// * `Err(ProviderError::NotFound)` - Item doesn't exist
+    /// * `Err(ProviderError::NotSupported)` - Provider is read-only
+    /// * `Err(ProviderError::Locked)` - Provider is locked
+    async fn delete_item(&self, _id: &str) -> Result<(), ProviderError> {
+        Err(ProviderError::NotSupported)
     }
 
     // -----------------------------------------------------------------------
-    // Key-wrapping / password management (vault-only)
+    // Key-wrapping / password management (gated behind Capability::KeyWrapping)
     // -----------------------------------------------------------------------
 
     /// Add a password (wrapping entry) to this vault.
@@ -844,13 +827,13 @@ pub trait VaultBackend: Send + Sync {
     /// that the existing entries protect.
     ///
     /// Returns the wrapping entry ID on success.
-    /// Default: `NotSupported` (external backends do not have wrapping entries).
-    async fn vault_add_password(
+    /// Default: `NotSupported` (providers without key wrapping).
+    async fn add_password(
         &self,
         _password: &[u8],
         _label: String,
-    ) -> Result<String, BackendError> {
-        Err(BackendError::NotSupported)
+    ) -> Result<String, ProviderError> {
+        Err(ProviderError::NotSupported)
     }
 
     /// Remove a password (wrapping entry) from this vault by entry ID.
@@ -859,8 +842,8 @@ pub trait VaultBackend: Send + Sync {
     /// (the last entry cannot be removed).
     ///
     /// Default: `NotSupported`.
-    async fn vault_remove_password(&self, _entry_id: &str) -> Result<(), BackendError> {
-        Err(BackendError::NotSupported)
+    async fn remove_password(&self, _entry_id: &str) -> Result<(), ProviderError> {
+        Err(ProviderError::NotSupported)
     }
 
     /// List all wrapping entries (passwords) for this vault.
@@ -868,9 +851,33 @@ pub trait VaultBackend: Send + Sync {
     /// Returns `Vec<(entry_id, Option<label>)>`.  The vault must be unlocked.
     ///
     /// Default: `NotSupported`.
-    async fn vault_list_passwords(&self) -> Result<Vec<(String, Option<String>)>, BackendError> {
-        Err(BackendError::NotSupported)
+    async fn list_passwords(&self) -> Result<Vec<(String, Option<String>)>, ProviderError> {
+        Err(ProviderError::NotSupported)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Free functions
+// ---------------------------------------------------------------------------
+
+/// Get the primary secret for an item using type-aware default attribute.
+///
+/// Dispatches to `provider.get_secret_attr(id, type.default_secret_attr())` based
+/// on the item's public attributes:
+/// - `generic` (or unset) → `"secret"`
+/// - `login` → `"password"`
+/// - `ssh-key` → `"private_key"`
+///
+/// This replaces the former `get_primary_secret` method on the trait.
+pub async fn primary_secret(
+    provider: &dyn Provider,
+    id: &str,
+) -> Result<SecretBytes, ProviderError> {
+    let attrs = provider.get_item_attributes(id).await?;
+    let item_type = ItemType::from_attributes(&attrs.public);
+    provider
+        .get_secret_attr(id, item_type.default_secret_attr())
+        .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -896,7 +903,7 @@ pub struct AutoLockPolicy {
     pub max_unlocked_minutes: Option<u64>,
 }
 
-/// Per-backend/per-vault autolock overrides.
+/// Per-provider autolock overrides.
 ///
 /// All fields are optional — `None` means "inherit from the global `[autolock]`
 /// section".  Only explicitly set fields override the global defaults.
@@ -912,7 +919,7 @@ pub struct AutoLockOverride {
 }
 
 impl AutoLockPolicy {
-    /// Produce an effective policy by layering per-backend overrides on top of
+    /// Produce an effective policy by layering per-provider overrides on top of
     /// the global policy.  Fields present in `overrides` replace the
     /// corresponding global field; `None` fields inherit from `self`.
     ///
@@ -1085,5 +1092,72 @@ mod tests {
         assert!(!merged.on_session_lock);
         assert_eq!(merged.idle_timeout_minutes, Some(60));
         assert_eq!(merged.max_unlocked_minutes, Some(240));
+    }
+
+    // Capability / require tests
+
+    /// Minimal test provider for capability checks.
+    struct TestProvider {
+        caps: &'static [Capability],
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for TestProvider {
+        fn id(&self) -> &str {
+            "test"
+        }
+        fn name(&self) -> &str {
+            "Test"
+        }
+        fn kind(&self) -> &str {
+            "test"
+        }
+        fn capabilities(&self) -> &'static [Capability] {
+            self.caps
+        }
+        async fn status(&self) -> Result<ProviderStatus, ProviderError> {
+            Ok(ProviderStatus {
+                locked: true,
+                last_sync: None,
+            })
+        }
+        async fn unlock(&self, _input: UnlockInput) -> Result<(), ProviderError> {
+            Err(ProviderError::NotSupported)
+        }
+        async fn lock(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn list_items(&self) -> Result<Vec<ItemMeta>, ProviderError> {
+            Ok(Vec::new())
+        }
+        async fn search(&self, _attrs: &Attributes) -> Result<Vec<ItemMeta>, ProviderError> {
+            Ok(Vec::new())
+        }
+        async fn get_item_attributes(&self, _id: &str) -> Result<ItemAttributes, ProviderError> {
+            Err(ProviderError::NotFound)
+        }
+        async fn get_secret_attr(
+            &self,
+            _id: &str,
+            _attr: &str,
+        ) -> Result<SecretBytes, ProviderError> {
+            Err(ProviderError::NotFound)
+        }
+    }
+
+    #[test]
+    fn require_succeeds_for_declared_capability() {
+        let p = TestProvider {
+            caps: &[Capability::Write, Capability::Ssh],
+        };
+        assert!(require(&p, Capability::Write).is_ok());
+        assert!(require(&p, Capability::Ssh).is_ok());
+    }
+
+    #[test]
+    fn require_fails_for_missing_capability() {
+        let p = TestProvider { caps: &[] };
+        let err = require(&p, Capability::Sync).unwrap_err();
+        assert!(matches!(err, ProviderError::NotSupported));
     }
 }

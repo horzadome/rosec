@@ -18,21 +18,21 @@
 //! from **both** a machine-local secret and the user's unlock password:
 //!
 //! ```text
-//! HKDF-SHA256(ikm: machine_secret || password, salt: backend_id) → 64-byte storage key
+//! HKDF-SHA256(ikm: machine_secret || password, salt: provider_id) → 64-byte storage key
 //! ```
 //!
 //! This means:
 //! - A password is **always required** to unlock — there is no auto-unlock path.
 //! - The same password participates in the opportunistic unlock sweep alongside
 //!   Bitwarden PM backends, so users with a shared password only type it once.
-//! - Wrong password → wrong storage key → `BackendError::AuthFailed` (re-prompt
+//! - Wrong password → wrong storage key → `ProviderError::AuthFailed` (re-prompt
 //!   for the correct password, not re-registration).
 //! - Changing the password or rotating the token requires re-running
-//!   `rosec backend auth`.
+//!   `rosec provider auth`.
 //!
 //! ## First-time setup
 //!
-//! `unlock()` returns `BackendError::RegistrationRequired` if no encrypted token
+//! `unlock()` returns `ProviderError::RegistrationRequired` if no encrypted token
 //! is found on disk.  The auth flow then prompts for `registration_info()` fields
 //! (the access token itself) and retries with `UnlockInput::WithRegistration`.
 //! The backend derives the storage key from the password, encrypts the token, and
@@ -41,17 +41,17 @@
 //! # Configuration
 //!
 //! ```toml
-//! [[backend]]
+//! [[provider]]
 //! id   = "my-sm"
 //! kind = "bitwarden-sm"
 //!
-//! [backend.options]
+//! [provider.options]
 //! organization_id = "00000000-…"   # required — filters which secrets to expose
 //! server_url      = "https://…"    # optional — omit for official cloud
 //! ```
 //!
 //! The access token is **not** stored in `config.toml`.  It is collected
-//! interactively on first `rosec backend auth` and persisted encrypted at
+//! interactively on first `rosec provider auth` and persisted encrypted at
 //! `$XDG_DATA_HOME/rosec/oauth/<id>.toml`.
 
 mod api;
@@ -62,8 +62,8 @@ use chrono::{DateTime, Utc};
 use hkdf::Hkdf;
 use rosec_core::credential::StorageKey;
 use rosec_core::{
-    Attributes, AuthField, AuthFieldKind, BackendCallbacks, BackendError, BackendStatus,
-    RegistrationInfo, SecretBytes, UnlockInput, VaultBackend, VaultItem, VaultItemMeta,
+    Attributes, AuthField, AuthFieldKind, Capability, ItemAttributes, ItemMeta, Provider,
+    ProviderCallbacks, ProviderError, ProviderStatus, RegistrationInfo, SecretBytes, UnlockInput,
 };
 use sha2::Sha256;
 use std::sync::RwLock;
@@ -90,7 +90,7 @@ pub enum SmRegion {
 /// Configuration for the Bitwarden SM backend.
 #[derive(Debug, Clone)]
 pub struct SmConfig {
-    /// Backend instance ID (used as `VaultBackend::id()`).
+    /// Provider instance ID (used as `Provider::id()`).
     pub id: String,
     /// Optional human-readable name.
     pub name: Option<String>,
@@ -112,7 +112,7 @@ pub struct SmConfig {
 struct AuthState {
     /// Cached vault items.
     secrets: Vec<DecryptedSecret>,
-    /// Timestamp of last successful sync (legacy; kept for `BackendStatus`).
+    /// Timestamp of last successful sync (legacy; kept for `ProviderStatus`).
     last_sync: Option<SystemTime>,
     /// UTC timestamp of the last successful sync (used for delta-sync checks).
     last_synced_at: DateTime<Utc>,
@@ -138,7 +138,7 @@ pub struct SmBackend {
     /// Authenticated state; `None` when locked.
     state: Mutex<Option<AuthState>>,
     /// Lifecycle event callbacks (SSH manager, etc.).
-    callbacks: RwLock<BackendCallbacks>,
+    callbacks: RwLock<ProviderCallbacks>,
 }
 
 impl std::fmt::Debug for SmBackend {
@@ -157,7 +157,7 @@ impl SmBackend {
             config,
             access_token: Mutex::new(None),
             state: Mutex::new(None),
-            callbacks: RwLock::new(BackendCallbacks::default()),
+            callbacks: RwLock::new(ProviderCallbacks::default()),
         }
     }
 
@@ -180,9 +180,9 @@ impl SmBackend {
     /// password` as IKM.  Both factors are required: the machine secret ties
     /// the ciphertext to this installation; the password provides the
     /// interactive access-control gate.  Neither alone is sufficient.
-    fn derive_storage_key(&self, password: &str) -> Result<StorageKey, BackendError> {
+    fn derive_storage_key(&self, password: &str) -> Result<StorageKey, ProviderError> {
         let seed = rosec_core::machine_key::load_or_create()
-            .map_err(|e| BackendError::Unavailable(format!("machine key: {e}")))?;
+            .map_err(|e| ProviderError::Unavailable(format!("machine key: {e}")))?;
         // Concatenate machine secret and password as IKM so both are required.
         let mut ikm = Zeroizing::new(Vec::with_capacity(seed.len() + password.len()));
         ikm.extend_from_slice(&seed);
@@ -191,29 +191,29 @@ impl SmBackend {
         let info = format!("rosec-sm-token-v2:{}", self.config.id);
         let mut key_material = Zeroizing::new(vec![0u8; 64]);
         hkdf.expand(info.as_bytes(), &mut key_material)
-            .map_err(|e| BackendError::Unavailable(format!("SM key derivation failed: {e}")))?;
+            .map_err(|e| ProviderError::Unavailable(format!("SM key derivation failed: {e}")))?;
         StorageKey::from_bytes(&key_material)
-            .map_err(|e| BackendError::Unavailable(format!("SM storage key: {e}")))
+            .map_err(|e| ProviderError::Unavailable(format!("SM storage key: {e}")))
     }
 
     /// Perform the API login + secrets fetch.
-    async fn do_unlock(&self, raw_token: &str) -> Result<AuthState, BackendError> {
+    async fn do_unlock(&self, raw_token: &str) -> Result<AuthState, ProviderError> {
         let org_id = Uuid::parse_str(&self.config.organization_id).map_err(|e| {
-            BackendError::Unavailable(format!(
+            ProviderError::Unavailable(format!(
                 "invalid organization_id '{}': {e}",
                 self.config.organization_id
             ))
         })?;
 
         let token = AccessToken::parse(raw_token)
-            .map_err(|e| BackendError::Unavailable(format!("SM access token parse: {e}")))?;
+            .map_err(|e| ProviderError::Unavailable(format!("SM access token parse: {e}")))?;
 
         let client = SmApiClient::new(self.urls())
-            .map_err(|e| BackendError::Unavailable(format!("SM HTTP client: {e}")))?;
+            .map_err(|e| ProviderError::Unavailable(format!("SM HTTP client: {e}")))?;
 
         let (bearer, secrets) = fetch_secrets(&client, &token, org_id)
             .await
-            .map_err(|e| BackendError::Unavailable(format!("SM login/fetch: {e}")))?;
+            .map_err(|e| ProviderError::Unavailable(format!("SM login/fetch: {e}")))?;
 
         debug!(backend = %self.config.id, count = secrets.len(), "SM unlock complete");
 
@@ -228,11 +228,7 @@ impl SmBackend {
 }
 
 #[async_trait::async_trait]
-impl VaultBackend for SmBackend {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
+impl Provider for SmBackend {
     fn id(&self) -> &str {
         &self.config.id
     }
@@ -248,18 +244,22 @@ impl VaultBackend for SmBackend {
         "bitwarden-sm"
     }
 
-    fn set_event_callbacks(&self, callbacks: BackendCallbacks) -> Result<(), BackendError> {
+    fn capabilities(&self) -> &'static [Capability] {
+        &[Capability::Sync, Capability::PasswordChange]
+    }
+
+    fn set_event_callbacks(&self, callbacks: ProviderCallbacks) -> Result<(), ProviderError> {
         *self
             .callbacks
             .write()
-            .map_err(|_| BackendError::Other(anyhow::anyhow!("callbacks lock poisoned")))? =
+            .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))? =
             callbacks;
         Ok(())
     }
 
-    async fn status(&self) -> Result<BackendStatus, BackendError> {
+    async fn status(&self) -> Result<ProviderStatus, ProviderError> {
         let state = self.state.lock().await;
-        Ok(BackendStatus {
+        Ok(ProviderStatus {
             locked: state.is_none(),
             last_sync: state.as_ref().and_then(|s| s.last_sync),
         })
@@ -307,15 +307,15 @@ stored locally — you will not need to enter it again.",
     /// - **`Password(pw)`** — normal unlock after initial setup.  Derives the
     ///   storage key from `pw` and the machine secret, loads the encrypted
     ///   access token from disk, decrypts it, and authenticates with Bitwarden.
-    ///   Wrong password → wrong key → `BackendError::AuthFailed` (re-prompt).
-    ///   No stored token → `BackendError::RegistrationRequired` (first-time
+    ///   Wrong password → wrong key → `ProviderError::AuthFailed` (re-prompt).
+    ///   No stored token → `ProviderError::RegistrationRequired` (first-time
     ///   setup required).
     ///
     /// - **`WithRegistration { password, registration_fields }`** — first-time
     ///   setup or token rotation.  Derives the storage key from `password`,
     ///   encrypts the `access_token` from `registration_fields`, persists it,
     ///   then authenticates.
-    async fn unlock(&self, input: UnlockInput) -> Result<(), BackendError> {
+    async fn unlock(&self, input: UnlockInput) -> Result<(), ProviderError> {
         let (password, token_to_save) = match input {
             UnlockInput::Password(pw) => (pw, None),
             UnlockInput::WithRegistration {
@@ -325,7 +325,7 @@ stored locally — you will not need to enter it again.",
                 let token = registration_fields
                     .get("access_token")
                     .ok_or_else(|| {
-                        BackendError::Unavailable(
+                        ProviderError::Unavailable(
                             "registration_fields missing 'access_token'".to_string(),
                         )
                     })?
@@ -344,14 +344,14 @@ stored locally — you will not need to enter it again.",
                 "access_token",
                 new_token.as_str(),
             )
-            .map_err(|e| BackendError::Unavailable(format!("failed to save SM token: {e}")))?;
+            .map_err(|e| ProviderError::Unavailable(format!("failed to save SM token: {e}")))?;
             info!(backend = %self.config.id, "SM access token saved (encrypted)");
             new_token
         } else {
             // Normal unlock: derive key from password and decrypt stored token.
             match rosec_core::credential::load_and_decrypt(&self.config.id, &storage_key) {
                 Ok(Some(cred)) => cred.client_secret,
-                Ok(None) => return Err(BackendError::RegistrationRequired),
+                Ok(None) => return Err(ProviderError::RegistrationRequired),
                 Err(e) => {
                     // Decryption/MAC failure means the password is wrong (it
                     // derives a different HKDF key).  This is NOT a missing
@@ -361,7 +361,7 @@ stored locally — you will not need to enter it again.",
                     // registration flow.
                     debug!(backend = %self.config.id,
                         "credential decryption failed (wrong password): {e}");
-                    return Err(BackendError::AuthFailed);
+                    return Err(ProviderError::AuthFailed);
                 }
             }
         };
@@ -380,7 +380,7 @@ stored locally — you will not need to enter it again.",
         if let Some(cb) = self
             .callbacks
             .read()
-            .map_err(|_| BackendError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
+            .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
             .on_unlocked
             .clone()
         {
@@ -397,20 +397,20 @@ stored locally — you will not need to enter it again.",
     /// against the in-memory token (defence-in-depth: even if the MAC passes,
     /// the decrypted token must match what we hold in memory).
     ///
-    /// Returns `BackendError::AuthFailed` if `old_password` is wrong.
-    /// Returns `BackendError::Locked` if the backend is not unlocked.
+    /// Returns `ProviderError::AuthFailed` if `old_password` is wrong.
+    /// Returns `ProviderError::Locked` if the backend is not unlocked.
     async fn change_password(
         &self,
         old_password: Zeroizing<String>,
         new_password: Zeroizing<String>,
-    ) -> Result<(), BackendError> {
+    ) -> Result<(), ProviderError> {
         // Verify the backend is unlocked and snapshot the in-memory token.
         let in_memory_token = {
             let guard = self.access_token.lock().await;
             guard
                 .as_deref()
                 .map(|t| Zeroizing::new(t.to_string()))
-                .ok_or(BackendError::Locked)?
+                .ok_or(ProviderError::Locked)?
         };
 
         // Derive old storage key and decrypt the stored token.
@@ -418,15 +418,15 @@ stored locally — you will not need to enter it again.",
         let stored_token = match rosec_core::credential::load_and_decrypt(&self.config.id, &old_key)
         {
             Ok(Some(cred)) => cred.client_secret,
-            Ok(None) => return Err(BackendError::AuthFailed),
-            Err(_) => return Err(BackendError::AuthFailed),
+            Ok(None) => return Err(ProviderError::AuthFailed),
+            Err(_) => return Err(ProviderError::AuthFailed),
         };
 
         // Defence-in-depth: the decrypted token must match what we hold in
         // memory.  A MAC-passing but semantically wrong token would mean the
         // on-disk credential was replaced out-of-band.
         if *stored_token != *in_memory_token {
-            return Err(BackendError::AuthFailed);
+            return Err(ProviderError::AuthFailed);
         }
 
         // Derive new storage key and re-encrypt.
@@ -437,7 +437,7 @@ stored locally — you will not need to enter it again.",
             "access_token",
             stored_token.as_str(),
         )
-        .map_err(|e| BackendError::Unavailable(format!("failed to re-encrypt SM token: {e}")))?;
+        .map_err(|e| ProviderError::Unavailable(format!("failed to re-encrypt SM token: {e}")))?;
 
         info!(backend = %self.config.id, "SM unlock password changed");
         Ok(())
@@ -447,15 +447,15 @@ stored locally — you will not need to enter it again.",
     ///
     /// Requires the backend to be unlocked — the access token is held in memory
     /// only while unlocked (zeroized on lock/drop).  Returns
-    /// `BackendError::Locked` if called while locked; the caller must unlock
+    /// `ProviderError::Locked` if called while locked; the caller must unlock
     /// first.  There is no disk fallback: the password used to derive the
     /// storage key is not retained after unlock.
-    async fn sync(&self) -> Result<(), BackendError> {
+    async fn sync(&self) -> Result<(), ProviderError> {
         let token = {
             let guard = self.access_token.lock().await;
             guard.as_deref().map(|t| Zeroizing::new(t.to_string()))
         };
-        let token = token.ok_or(BackendError::Locked)?;
+        let token = token.ok_or(ProviderError::Locked)?;
 
         // Snapshot the current secret IDs so we can detect changes after sync.
         let before_ids: std::collections::HashSet<uuid::Uuid> = {
@@ -491,7 +491,7 @@ stored locally — you will not need to enter it again.",
                 if let Some(cb) = self
                     .callbacks
                     .read()
-                    .map_err(|_| BackendError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
+                    .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
                     .on_sync_succeeded
                     .clone()
                 {
@@ -503,7 +503,7 @@ stored locally — you will not need to enter it again.",
                 if let Some(cb) = self
                     .callbacks
                     .read()
-                    .map_err(|_| BackendError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
+                    .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
                     .on_sync_failed
                     .clone()
                 {
@@ -514,7 +514,7 @@ stored locally — you will not need to enter it again.",
         }
     }
 
-    async fn lock(&self) -> Result<(), BackendError> {
+    async fn lock(&self) -> Result<(), ProviderError> {
         {
             let mut token_guard = self.access_token.lock().await;
             *token_guard = None; // Zeroizing<String> is scrubbed on drop
@@ -528,7 +528,7 @@ stored locally — you will not need to enter it again.",
         if let Some(cb) = self
             .callbacks
             .read()
-            .map_err(|_| BackendError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
+            .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
             .on_locked
             .clone()
         {
@@ -555,7 +555,7 @@ stored locally — you will not need to enter it again.",
     /// returns `{ "hasChanges": bool }`.  If the backend is locked (no cached
     /// bearer / no stored token) we re-authenticate first.  Returns `Ok(true)`
     /// on any transient error so the caller falls back to a full sync.
-    async fn check_remote_changed(&self) -> Result<bool, BackendError> {
+    async fn check_remote_changed(&self) -> Result<bool, ProviderError> {
         // Snapshot the current bearer + last_synced_at under a single lock hold.
         // The clone is required: we cannot hold the mutex across the async HTTP
         // call below.  Zeroizing<String> ensures the copy is zeroed on drop.
@@ -569,10 +569,10 @@ stored locally — you will not need to enter it again.",
         };
 
         let org_id = Uuid::parse_str(&self.config.organization_id)
-            .map_err(|e| BackendError::Unavailable(format!("invalid organization_id: {e}")))?;
+            .map_err(|e| ProviderError::Unavailable(format!("invalid organization_id: {e}")))?;
 
         let client = SmApiClient::new(self.urls())
-            .map_err(|e| BackendError::Unavailable(format!("SM HTTP client: {e}")))?;
+            .map_err(|e| ProviderError::Unavailable(format!("SM HTTP client: {e}")))?;
 
         let last_synced_str: String = last_synced_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
@@ -595,9 +595,9 @@ stored locally — you will not need to enter it again.",
         }
     }
 
-    async fn list_items(&self) -> Result<Vec<VaultItemMeta>, BackendError> {
+    async fn list_items(&self) -> Result<Vec<ItemMeta>, ProviderError> {
         let state = self.state.lock().await;
-        let auth = state.as_ref().ok_or(BackendError::Locked)?;
+        let auth = state.as_ref().ok_or(ProviderError::Locked)?;
         Ok(auth
             .secrets
             .iter()
@@ -605,36 +605,40 @@ stored locally — you will not need to enter it again.",
             .collect())
     }
 
-    async fn get_item(&self, id: &str) -> Result<VaultItem, BackendError> {
+    async fn get_item_attributes(&self, id: &str) -> Result<ItemAttributes, ProviderError> {
         let state = self.state.lock().await;
-        let auth = state.as_ref().ok_or(BackendError::Locked)?;
-        let target_id = Uuid::parse_str(id).map_err(|_| BackendError::NotFound)?;
+        let auth = state.as_ref().ok_or(ProviderError::Locked)?;
+        let target_id = Uuid::parse_str(id).map_err(|_| ProviderError::NotFound)?;
         let secret = auth
             .secrets
             .iter()
             .find(|s| s.id == target_id)
-            .ok_or(BackendError::NotFound)?;
-        Ok(VaultItem {
-            meta: secret_to_meta(secret, &self.config.id),
-            secret: Some(secret_value(secret)),
+            .ok_or(ProviderError::NotFound)?;
+        let meta = secret_to_meta(secret, &self.config.id);
+        Ok(ItemAttributes {
+            public: meta.attributes,
+            secret_names: vec!["password".to_string()],
         })
     }
 
-    async fn get_secret(&self, id: &str) -> Result<SecretBytes, BackendError> {
+    async fn get_secret_attr(&self, id: &str, attr: &str) -> Result<SecretBytes, ProviderError> {
         let state = self.state.lock().await;
-        let auth = state.as_ref().ok_or(BackendError::Locked)?;
-        let target_id = Uuid::parse_str(id).map_err(|_| BackendError::NotFound)?;
+        let auth = state.as_ref().ok_or(ProviderError::Locked)?;
+        let target_id = Uuid::parse_str(id).map_err(|_| ProviderError::NotFound)?;
         let secret = auth
             .secrets
             .iter()
             .find(|s| s.id == target_id)
-            .ok_or(BackendError::NotFound)?;
-        Ok(secret_value(secret))
+            .ok_or(ProviderError::NotFound)?;
+        match attr {
+            "password" => Ok(secret_value(secret)),
+            _ => Err(ProviderError::NotFound),
+        }
     }
 
-    async fn search(&self, attrs: &Attributes) -> Result<Vec<VaultItemMeta>, BackendError> {
+    async fn search(&self, attrs: &Attributes) -> Result<Vec<ItemMeta>, ProviderError> {
         let state = self.state.lock().await;
-        let auth = state.as_ref().ok_or(BackendError::Locked)?;
+        let auth = state.as_ref().ok_or(ProviderError::Locked)?;
         Ok(auth
             .secrets
             .iter()
@@ -648,7 +652,7 @@ stored locally — you will not need to enter it again.",
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn secret_to_meta(secret: &DecryptedSecret, backend_id: &str) -> VaultItemMeta {
+fn secret_to_meta(secret: &DecryptedSecret, provider_id: &str) -> ItemMeta {
     let mut attributes = Attributes::new();
     attributes.insert("type".to_string(), "secret".to_string());
     attributes.insert("sm.key".to_string(), secret.key.clone());
@@ -659,9 +663,9 @@ fn secret_to_meta(secret: &DecryptedSecret, backend_id: &str) -> VaultItemMeta {
     if let Some(name) = &secret.project_name {
         attributes.insert("sm.project".to_string(), name.clone());
     }
-    VaultItemMeta {
+    ItemMeta {
         id: secret.id.to_string(),
-        backend_id: backend_id.to_string(),
+        provider_id: provider_id.to_string(),
         label: secret.key.clone(),
         attributes,
         created: None,
@@ -753,17 +757,17 @@ mod tests {
     async fn list_items_when_locked_returns_error() {
         assert!(matches!(
             make_backend().list_items().await,
-            Err(BackendError::Locked)
+            Err(ProviderError::Locked)
         ));
     }
 
     #[tokio::test]
-    async fn get_secret_when_locked_returns_error() {
+    async fn get_secret_attr_when_locked_returns_error() {
         assert!(matches!(
             make_backend()
-                .get_secret("00000000-0000-0000-0000-000000000000")
+                .get_secret_attr("00000000-0000-0000-0000-000000000000", "password")
                 .await,
-            Err(BackendError::Locked)
+            Err(ProviderError::Locked)
         ));
     }
 
@@ -782,7 +786,7 @@ mod tests {
                 .await
         };
         let _ = std::fs::remove_dir_all(&tmp);
-        assert!(matches!(result, Err(BackendError::RegistrationRequired)));
+        assert!(matches!(result, Err(ProviderError::RegistrationRequired)));
     }
 
     #[tokio::test]
@@ -816,7 +820,7 @@ mod tests {
             .await
         };
         let _ = std::fs::remove_dir_all(&tmp);
-        assert!(matches!(result, Err(BackendError::AuthFailed)));
+        assert!(matches!(result, Err(ProviderError::AuthFailed)));
     }
 
     #[tokio::test]
@@ -847,7 +851,7 @@ mod tests {
         let items = b.list_items().await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "MY_API_KEY");
-        assert_eq!(items[0].backend_id, "test-sm");
+        assert_eq!(items[0].provider_id, "test-sm");
         assert_eq!(
             items[0].attributes.get("sm.key").map(String::as_str),
             Some("MY_API_KEY")
@@ -859,7 +863,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_secret_returns_value() {
+    async fn get_secret_attr_returns_value() {
         let b = make_backend();
         let secret_id = Uuid::new_v4();
         inject_state(
@@ -875,7 +879,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            b.get_secret(&secret_id.to_string())
+            b.get_secret_attr(&secret_id.to_string(), "password")
                 .await
                 .unwrap()
                 .as_slice(),
@@ -884,7 +888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_secret_falls_back_to_note_when_value_empty() {
+    async fn get_secret_attr_falls_back_to_note_when_value_empty() {
         let b = make_backend();
         let secret_id = Uuid::new_v4();
         inject_state(
@@ -900,7 +904,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            b.get_secret(&secret_id.to_string())
+            b.get_secret_attr(&secret_id.to_string(), "password")
                 .await
                 .unwrap()
                 .as_slice(),
@@ -909,12 +913,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_secret_not_found() {
+    async fn get_secret_attr_not_found() {
         let b = make_backend();
         inject_state(&b, Vec::new()).await;
         assert!(matches!(
-            b.get_secret("00000000-0000-0000-0000-000000000001").await,
-            Err(BackendError::NotFound)
+            b.get_secret_attr("00000000-0000-0000-0000-000000000001", "password")
+                .await,
+            Err(ProviderError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_secret_attr_unknown_attr_returns_not_found() {
+        let b = make_backend();
+        let secret_id = Uuid::new_v4();
+        inject_state(
+            &b,
+            vec![DecryptedSecret {
+                id: secret_id,
+                key: "SOME_KEY".to_string(),
+                value: Zeroizing::new("val".to_string()),
+                note: Zeroizing::new("".to_string()),
+                project_id: None,
+                project_name: None,
+            }],
+        )
+        .await;
+        assert!(matches!(
+            b.get_secret_attr(&secret_id.to_string(), "nonexistent")
+                .await,
+            Err(ProviderError::NotFound)
         ));
     }
 
@@ -962,9 +990,9 @@ mod tests {
             project_id: Some(Uuid::nil()),
             project_name: Some("my-project".to_string()),
         };
-        let meta = secret_to_meta(&secret, "backend-x");
+        let meta = secret_to_meta(&secret, "provider-x");
         assert_eq!(meta.label, "MY_SECRET");
-        assert_eq!(meta.backend_id, "backend-x");
+        assert_eq!(meta.provider_id, "provider-x");
         assert_eq!(
             meta.attributes.get("type").map(String::as_str),
             Some("secret")
@@ -979,17 +1007,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_item_when_locked_returns_error() {
+    async fn get_item_attributes_when_locked_returns_error() {
         assert!(matches!(
             make_backend()
-                .get_item("00000000-0000-0000-0000-000000000000")
+                .get_item_attributes("00000000-0000-0000-0000-000000000000")
                 .await,
-            Err(BackendError::Locked)
+            Err(ProviderError::Locked)
         ));
     }
 
     #[tokio::test]
-    async fn get_item_found_and_not_found() {
+    async fn get_item_attributes_found_and_not_found() {
         let b = make_backend();
         let secret_id = Uuid::new_v4();
         inject_state(
@@ -1004,12 +1032,24 @@ mod tests {
             }],
         )
         .await;
-        let item = b.get_item(&secret_id.to_string()).await.unwrap();
-        assert_eq!(item.meta.label, "FOUND_KEY");
-        assert_eq!(item.secret.unwrap().as_slice(), b"found-value");
+        let attrs = b.get_item_attributes(&secret_id.to_string()).await.unwrap();
+        assert_eq!(
+            attrs.public.get("sm.key").map(String::as_str),
+            Some("FOUND_KEY")
+        );
+        assert!(attrs.secret_names.contains(&"password".to_string()));
+        // Verify we can retrieve the secret via get_secret_attr.
+        assert_eq!(
+            b.get_secret_attr(&secret_id.to_string(), "password")
+                .await
+                .unwrap()
+                .as_slice(),
+            b"found-value"
+        );
         assert!(matches!(
-            b.get_item("00000000-0000-0000-0000-000000000099").await,
-            Err(BackendError::NotFound)
+            b.get_item_attributes("00000000-0000-0000-0000-000000000099")
+                .await,
+            Err(ProviderError::NotFound)
         ));
     }
 
@@ -1123,7 +1163,7 @@ mod tests {
             .await
         };
         let _ = std::fs::remove_dir_all(&tmp);
-        assert!(matches!(result, Err(BackendError::AuthFailed)));
+        assert!(matches!(result, Err(ProviderError::AuthFailed)));
     }
 
     #[tokio::test]
@@ -1136,6 +1176,6 @@ mod tests {
                 Zeroizing::new("new".to_string()),
             )
             .await;
-        assert!(matches!(result, Err(BackendError::Locked)));
+        assert!(matches!(result, Err(ProviderError::Locked)));
     }
 }

@@ -1,8 +1,8 @@
 //! In-memory key store.
 //!
 //! The [`KeyStore`] holds all SSH keys currently available from unlocked
-//! backends.  It is populated by `rosecd` after each vault sync and cleared
-//! when a backend is locked.
+//! providers.  It is populated by `rosecd` after each vault sync and cleared
+//! when a provider is locked.
 //!
 //! The store is accessed from two places:
 //! - The SSH agent [`Session`][crate::session::AgentSession] for signing.
@@ -25,8 +25,8 @@ pub struct KeyEntry {
     /// Human-readable name of the vault item this key came from.
     pub item_name: String,
 
-    /// Backend that owns this key.
-    pub backend_id: String,
+    /// Provider that owns this key.
+    pub provider_id: String,
 
     /// The private key (zeroized on drop via `ssh_key::PrivateKey`).
     pub private_key: PrivateKey,
@@ -57,7 +57,7 @@ impl std::fmt::Debug for KeyEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KeyEntry")
             .field("item_name", &self.item_name)
-            .field("backend_id", &self.backend_id)
+            .field("provider_id", &self.provider_id)
             .field("fingerprint", &self.fingerprint)
             .field("ssh_hosts", &self.ssh_hosts)
             .field("require_confirm", &self.require_confirm)
@@ -115,17 +115,17 @@ impl KeyStore {
             .push(entry);
     }
 
-    /// Remove all keys belonging to a specific backend.
-    pub fn remove_backend(&mut self, backend_id: &str) {
+    /// Remove all keys belonging to a specific provider.
+    pub fn remove_provider(&mut self, provider_id: &str) {
         let before: usize = self.entries.values().map(|v| v.len()).sum();
         for group in self.entries.values_mut() {
-            group.retain(|e| e.backend_id != backend_id);
+            group.retain(|e| e.provider_id != provider_id);
         }
         // Remove empty groups.
         self.entries.retain(|_, v| !v.is_empty());
         let after: usize = self.entries.values().map(|v| v.len()).sum();
         let removed = before - after;
-        debug!(backend = %backend_id, removed, "keystore: removed keys for backend");
+        debug!(provider = %provider_id, removed, "keystore: removed keys for provider");
     }
 
     /// Remove all keys.
@@ -181,7 +181,7 @@ impl KeyStore {
 pub fn build_entry(
     private_key: PrivateKey,
     item_name: String,
-    backend_id: String,
+    provider_id: String,
     ssh_hosts: Vec<String>,
     ssh_user: Option<String>,
     require_confirm: bool,
@@ -193,7 +193,7 @@ pub fn build_entry(
 
     Some(KeyEntry {
         item_name,
-        backend_id,
+        provider_id,
         private_key,
         fingerprint,
         public_key_openssh,

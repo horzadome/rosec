@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use notify::Watcher;
-use rosec_core::VaultBackend;
+use rosec_core::Provider;
 use rosec_core::config::Config;
 use rosec_core::router::{Router, RouterConfig};
 use rosec_secret_service::server::register_objects_with_full_config;
@@ -45,9 +45,9 @@ async fn run() -> Result<()> {
     let config = load_config(&config_path)?;
     tracing::info!("loaded config from {}", config_path.display());
     tracing::info!(
-        "vaults: {}, backends: {}",
-        config.vault.len(),
-        config.backend.len()
+        "local vaults: {}, external providers: {}",
+        config.provider.iter().filter(|e| e.kind == "local").count(),
+        config.provider.iter().filter(|e| e.kind != "local").count()
     );
 
     let router_config = RouterConfig {
@@ -57,12 +57,11 @@ async fn run() -> Result<()> {
     let router = Arc::new(Router::new(router_config));
     let sessions = Arc::new(SessionManager::new());
 
-    let backends: Vec<Arc<dyn VaultBackend>> = build_backends(&config).await?;
+    let providers: Vec<Arc<dyn Provider>> = build_providers(&config).await?;
 
-    // Build per-backend return_attr and collection maps from config.
-    // Include both vault entries and backend entries.
-    let mut return_attr_map: std::collections::HashMap<String, Vec<String>> = config
-        .vault
+    // Build per-provider return_attr and collection maps from config.
+    let return_attr_map: std::collections::HashMap<String, Vec<String>> = config
+        .provider
         .iter()
         .filter_map(|entry| {
             entry
@@ -71,15 +70,9 @@ async fn run() -> Result<()> {
                 .map(|patterns| (entry.id.clone(), patterns.clone()))
         })
         .collect();
-    return_attr_map.extend(config.backend.iter().filter_map(|entry| {
-        entry
-            .return_attr
-            .as_ref()
-            .map(|patterns| (entry.id.clone(), patterns.clone()))
-    }));
 
-    let mut collection_map: std::collections::HashMap<String, String> = config
-        .vault
+    let collection_map: std::collections::HashMap<String, String> = config
+        .provider
         .iter()
         .filter_map(|entry| {
             entry
@@ -88,17 +81,11 @@ async fn run() -> Result<()> {
                 .map(|col| (entry.id.clone(), col.clone()))
         })
         .collect();
-    collection_map.extend(config.backend.iter().filter_map(|entry| {
-        entry
-            .collection
-            .as_ref()
-            .map(|col| (entry.id.clone(), col.clone()))
-    }));
 
     let conn = zbus::Connection::session().await?;
     let state = register_objects_with_full_config(
         &conn,
-        backends,
+        providers,
         router,
         sessions,
         return_attr_map,
@@ -147,10 +134,11 @@ async fn run() -> Result<()> {
         });
     }
 
-    // Register lifecycle event callbacks on every backend via the VaultBackend
-    // trait, and SignalR nudge callbacks on Bitwarden backends specifically.
+    // Register lifecycle event callbacks on every provider via the Provider
+    // trait.  Nudge callbacks (sync / lock) are set as fields on
+    // ProviderCallbacks before calling set_event_callbacks().
     // Must be done after `state` and `ssh_manager` are created.
-    wire_backend_callbacks(&state, &ssh_manager);
+    wire_provider_callbacks(&state, &ssh_manager);
 
     tracing::info!("rosecd ready on session bus");
 
@@ -173,31 +161,31 @@ async fn run() -> Result<()> {
 
     // Auto-lock policy background task.
     // Reads autolock settings from live_config on every tick so changes to the
-    // config file take effect without a restart.  Each backend is evaluated
+    // config file take effect without a restart.  Each provider is evaluated
     // independently against its effective policy (global defaults merged with
-    // any per-backend/per-vault overrides).
+    // any per-provider/per-vault overrides).
     let autolock_state = Arc::clone(&state);
     let autolock_ssh = ssh_manager.clone();
     tokio::spawn(autolock_loop(autolock_state, autolock_ssh));
 
     // Wait for SIGTERM or SIGINT for graceful shutdown.
     shutdown_signal().await;
-    tracing::info!("received shutdown signal, locking all backends before exit");
+    tracing::info!("received shutdown signal, locking all providers before exit");
     // Clear SSH keys first so no sign requests can be served during shutdown.
     if let Some(ref sm) = ssh_manager {
         sm.clear();
     }
-    // Explicitly lock all backends so decrypted state is zeroed before the
+    // Explicitly lock all providers so decrypted state is zeroed before the
     // process exits.  Errors are logged but not fatal — the process is exiting
     // anyway and Zeroizing<> drop impls will still run.
     if let Err(e) = state.auto_lock().await {
         tracing::warn!("lock-on-exit failed: {e}");
     }
-    tracing::info!("all backends locked, exiting");
+    tracing::info!("all providers locked, exiting");
     Ok(())
 }
 
-/// Background sync loop: periodically checks each unlocked backend for remote
+/// Background sync loop: periodically checks each unlocked provider for remote
 /// changes, syncs when needed, and rebuilds the item cache as a safety net.
 ///
 /// Reads `refresh_interval_secs` from live config on every tick so config file
@@ -214,36 +202,36 @@ async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
 
         let mut did_any_work = false;
 
-        for backend in state.backends_ordered() {
-            let backend_id = backend.id().to_string();
-            let locked = match backend.status().await {
+        for provider in state.backends_ordered() {
+            let provider_id = provider.id().to_string();
+            let locked = match provider.status().await {
                 Ok(s) => s.locked,
                 Err(e) => {
-                    tracing::debug!(backend = %backend_id, error = %e, "status check failed, skipping");
+                    tracing::debug!(provider = %provider_id, error = %e, "status check failed, skipping");
                     continue;
                 }
             };
 
             if locked {
-                tracing::debug!(backend = %backend_id, "background: backend locked, skipping sync");
+                tracing::debug!(provider = %provider_id, "background: provider locked, skipping sync");
                 continue;
             }
 
-            match backend.check_remote_changed().await {
+            match provider.check_remote_changed().await {
                 Ok(true) => {
-                    tracing::debug!(backend = %backend_id, "background: remote changed, syncing");
-                    match state.try_sync_backend(&backend_id).await {
+                    tracing::debug!(provider = %provider_id, "background: remote changed, syncing");
+                    match state.try_sync_backend(&provider_id).await {
                         Ok(true) => {
-                            tracing::debug!(backend = %backend_id, "background: sync ok");
+                            tracing::debug!(provider = %provider_id, "background: sync ok");
                             did_any_work = true;
                         }
                         Ok(false) => {
-                            tracing::debug!(backend = %backend_id, "background: sync skipped (already in progress)");
+                            tracing::debug!(provider = %provider_id, "background: sync skipped (already in progress)");
                         }
                         Err(e) => {
                             log_background_failure(
                                 &mut consecutive_failures,
-                                &backend_id,
+                                &provider_id,
                                 "sync",
                                 &e,
                             );
@@ -251,17 +239,17 @@ async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
                     }
                 }
                 Ok(false) => {
-                    tracing::debug!(backend = %backend_id, "background: no remote changes");
+                    tracing::debug!(provider = %provider_id, "background: no remote changes");
                 }
                 Err(e) => {
-                    tracing::debug!(backend = %backend_id, error = %e,
+                    tracing::debug!(provider = %provider_id, error = %e,
                         "background: remote-changed check failed, skipping sync");
                 }
             }
         }
 
         // Safety-net rebuild: keep the in-process item cache consistent
-        // even if no per-backend sync ran.
+        // even if no per-provider sync ran.
         if !did_any_work {
             match state.rebuild_cache().await {
                 Ok(entries) => {
@@ -279,7 +267,7 @@ async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
 }
 
 /// Auto-lock policy loop: evaluates idle-timeout and max-unlocked policies for
-/// each backend every 30 seconds.
+/// each provider every 30 seconds.
 ///
 /// Reads autolock settings from live_config on every tick so config file changes
 /// take effect without a restart.
@@ -293,9 +281,9 @@ async fn autolock_loop(
 
         let mut any_locked = false;
 
-        for backend in state.backends_ordered() {
-            let backend_id = backend.id().to_string();
-            let policy = state.effective_autolock_policy(&backend_id);
+        for provider in state.backends_ordered() {
+            let provider_id = provider.id().to_string();
+            let policy = state.effective_autolock_policy(&provider_id);
 
             // Check idle timeout (0 means disabled).
             if let Some(idle_min) = policy.idle_timeout_minutes
@@ -303,12 +291,12 @@ async fn autolock_loop(
                 && state.is_idle_expired(idle_min)
             {
                 tracing::info!(
-                    backend = %backend_id,
+                    provider = %provider_id,
                     idle_minutes = idle_min,
-                    "idle timeout expired, locking backend"
+                    "idle timeout expired, locking provider"
                 );
-                if let Err(e) = state.auto_lock_backend(&backend_id).await {
-                    tracing::warn!(backend = %backend_id, "auto-lock failed: {e}");
+                if let Err(e) = state.auto_lock_backend(&provider_id).await {
+                    tracing::warn!(provider = %provider_id, "auto-lock failed: {e}");
                 } else {
                     any_locked = true;
                 }
@@ -318,15 +306,15 @@ async fn autolock_loop(
             // Check max-unlocked timeout (0 means disabled).
             if let Some(max_min) = policy.max_unlocked_minutes
                 && max_min != 0
-                && state.is_backend_max_unlocked_expired(&backend_id, max_min)
+                && state.is_backend_max_unlocked_expired(&provider_id, max_min)
             {
                 tracing::info!(
-                    backend = %backend_id,
+                    provider = %provider_id,
                     max_minutes = max_min,
-                    "max-unlocked timeout expired, locking backend"
+                    "max-unlocked timeout expired, locking provider"
                 );
-                if let Err(e) = state.auto_lock_backend(&backend_id).await {
-                    tracing::warn!(backend = %backend_id, "auto-lock failed: {e}");
+                if let Err(e) = state.auto_lock_backend(&provider_id).await {
+                    tracing::warn!(provider = %provider_id, "auto-lock failed: {e}");
                 } else {
                     any_locked = true;
                 }
@@ -346,24 +334,24 @@ async fn autolock_loop(
 ///
 /// Logs warnings for the first 3 failures, a suppression notice on the 4th,
 /// and silently skips further warnings. Errors starting with `"locked::"` are
-/// logged at debug level since they indicate an expected locked-backend state.
+/// logged at debug level since they indicate an expected locked-provider state.
 fn log_background_failure(
     consecutive: &mut u32,
-    backend_id: &str,
+    provider_id: &str,
     operation: &str,
     error: &dyn std::fmt::Display,
 ) {
     let err_str = error.to_string();
     if err_str.starts_with("locked::") {
-        tracing::debug!(backend = %backend_id, "background {operation} skipped — backend locked");
+        tracing::debug!(provider = %provider_id, "background {operation} skipped — provider locked");
         return;
     }
     *consecutive += 1;
     if *consecutive <= 3 {
-        tracing::warn!(backend = %backend_id, attempt = *consecutive, "background {operation} failed: {error}");
+        tracing::warn!(provider = %provider_id, attempt = *consecutive, "background {operation} failed: {error}");
     } else if *consecutive == 4 {
         tracing::warn!(
-            backend = %backend_id,
+            provider = %provider_id,
             "background {operation} has failed {} times, suppressing further warnings",
             *consecutive
         );
@@ -446,6 +434,9 @@ async fn shutdown_signal() {
 /// - `SessionRemoved` on `org.freedesktop.login1.Manager` → lock if on_logout
 ///
 /// The function runs until an unrecoverable error occurs (e.g. system bus disconnected).
+///
+/// Each signal handler iterates providers and checks their effective autolock
+/// policies before locking.
 async fn logind_watcher(
     state: Arc<rosec_secret_service::ServiceState>,
     ssh_manager: Option<Arc<ssh::SshManager>>,
@@ -537,7 +528,7 @@ async fn logind_watcher(
                         if let Ok(going_to_sleep) = msg.body().deserialize::<(bool,)>()
                             && going_to_sleep.0
                         {
-                            tracing::info!("logind: PrepareForSleep — locking all backends");
+                            tracing::info!("logind: PrepareForSleep — locking all providers");
                             if let Some(ref sm) = ssh_manager {
                                 sm.clear();
                             }
@@ -562,19 +553,19 @@ async fn logind_watcher(
                         if let Ok(body) = msg.body().deserialize::<(String, zbus::zvariant::OwnedObjectPath)>() {
                             let removed_id = body.0;
                             if session_id.as_deref() == Some(&removed_id) {
-                                // Check per-backend on_logout policies.
+                                // Check per-provider on_logout policies.
                                 let mut any_locked = false;
-                                for backend in state.backends_ordered() {
-                                    let bid = backend.id().to_string();
-                                    let policy = state.effective_autolock_policy(&bid);
+                                for provider in state.backends_ordered() {
+                                    let pid = provider.id().to_string();
+                                    let policy = state.effective_autolock_policy(&pid);
                                     if policy.on_logout {
                                         tracing::info!(
                                             session = %removed_id,
-                                            backend = %bid,
-                                            "logind: our session removed — locking backend"
+                                            provider = %pid,
+                                            "logind: our session removed — locking provider"
                                         );
-                                        if let Err(e) = state.auto_lock_backend(&bid).await {
-                                            tracing::warn!(backend = %bid, "auto-lock on logout failed: {e}");
+                                        if let Err(e) = state.auto_lock_backend(&pid).await {
+                                            tracing::warn!(provider = %pid, "auto-lock on logout failed: {e}");
                                         } else {
                                             any_locked = true;
                                         }
@@ -600,18 +591,18 @@ async fn logind_watcher(
             msg = poll_lock_stream(&mut lock_stream_opt), if lock_stream_opt.is_some() => {
                 match msg {
                     Some(Ok(_)) => {
-                        // Check per-backend on_session_lock policies.
+                        // Check per-provider on_session_lock policies.
                         let mut any_locked = false;
-                        for backend in state.backends_ordered() {
-                            let bid = backend.id().to_string();
-                            let policy = state.effective_autolock_policy(&bid);
+                        for provider in state.backends_ordered() {
+                            let pid = provider.id().to_string();
+                            let policy = state.effective_autolock_policy(&pid);
                             if policy.on_session_lock {
                                 tracing::info!(
-                                    backend = %bid,
-                                    "logind: session Lock signal — locking backend"
+                                    provider = %pid,
+                                    "logind: session Lock signal — locking provider"
                                 );
-                                if let Err(e) = state.auto_lock_backend(&bid).await {
-                                    tracing::warn!(backend = %bid, "auto-lock on session lock failed: {e}");
+                                if let Err(e) = state.auto_lock_backend(&pid).await {
+                                    tracing::warn!(provider = %pid, "auto-lock on session lock failed: {e}");
                                 } else {
                                     any_locked = true;
                                 }
@@ -649,48 +640,59 @@ async fn poll_lock_stream(
     }
 }
 
-/// Register lifecycle event callbacks on every backend, and SignalR nudge
-/// callbacks on Bitwarden backends specifically.
+/// Register lifecycle and nudge event callbacks on every provider.
+///
+/// Remote nudge callbacks (sync / lock) are set as fields on
+/// [`ProviderCallbacks`] before calling `set_event_callbacks()`.  Providers
+/// that support remote push notifications (e.g. Bitwarden PM) wire these
+/// into their internal SignalR handler.
 ///
 /// Called once after `state` and `ssh_manager` are created, and again after
-/// each hot-reload that adds a new backend.
-fn wire_backend_callbacks(
+/// each hot-reload that adds a new provider.
+fn wire_provider_callbacks(
     state: &Arc<rosec_secret_service::ServiceState>,
     ssh_manager: &Option<Arc<ssh::SshManager>>,
 ) {
-    use rosec_core::BackendCallbacks;
+    use rosec_core::ProviderCallbacks;
 
-    for backend in state.backends_ordered() {
-        let backend_id = backend.id().to_string();
+    for provider in state.backends_ordered() {
+        let provider_id = provider.id().to_string();
 
-        // --- Lifecycle event callbacks (all backends via trait) ---
+        // --- Lifecycle event callbacks (all providers via trait) ---
 
         let ssh_unlocked = ssh_manager.clone();
         let ssh_synced = ssh_manager.clone();
         let ssh_locked = ssh_manager.clone();
-        let backends_for_unlock = Arc::clone(state);
-        let backends_for_sync = Arc::clone(state);
-        let locked_id = backend_id.clone();
-        let synced_id = backend_id.clone();
+        let providers_for_unlock = Arc::clone(state);
+        let providers_for_sync = Arc::clone(state);
+        let locked_id = provider_id.clone();
+        let synced_id = provider_id.clone();
+        let failed_id = provider_id.clone();
 
-        let callbacks = BackendCallbacks {
+        // --- Remote nudge callbacks (e.g. Bitwarden SignalR) ---
+        let sync_state = Arc::clone(state);
+        let lock_state = Arc::clone(state);
+        let nudge_sync_id = provider_id.clone();
+        let nudge_lock_id = provider_id.clone();
+
+        let callbacks = ProviderCallbacks {
             on_unlocked: Some(Arc::new(move || {
                 // Trigger an immediate SSH key rebuild so keys appear as soon
-                // as the vault is unlocked — no need to wait for the next
+                // as the provider is unlocked — no need to wait for the next
                 // background timer tick.
                 let sm = ssh_unlocked.clone();
-                let s = Arc::clone(&backends_for_unlock);
+                let s = Arc::clone(&providers_for_unlock);
                 tokio::spawn(async move {
                     if let Some(ref sm) = sm {
-                        let backends = s.backends_ordered();
-                        sm.rebuild(&backends).await;
+                        let providers = s.backends_ordered();
+                        sm.rebuild(&providers).await;
                     }
                 });
             })),
             on_locked: Some(Arc::new(move || {
-                // Evict only this backend's keys; other backends stay available.
+                // Evict only this provider's keys; other providers stay available.
                 if let Some(ref sm) = ssh_locked {
-                    sm.remove_backend(&locked_id);
+                    sm.remove_provider(&locked_id);
                 }
             })),
             on_sync_succeeded: Some(Arc::new(move |changed| {
@@ -698,124 +700,110 @@ fn wire_backend_callbacks(
                     return; // Nothing new — skip the rebuild.
                 }
                 let sm = ssh_synced.clone();
-                let s = Arc::clone(&backends_for_sync);
+                let s = Arc::clone(&providers_for_sync);
                 let id = synced_id.clone();
                 tokio::spawn(async move {
                     if let Some(ref sm) = sm {
-                        let backends = s.backends_ordered();
-                        tracing::debug!(backend = %id, "sync changed vault — rebuilding SSH keys");
-                        sm.rebuild(&backends).await;
+                        let providers = s.backends_ordered();
+                        tracing::debug!(provider = %id, "sync changed vault — rebuilding SSH keys");
+                        sm.rebuild(&providers).await;
                     }
                 });
             })),
             on_sync_failed: Some(Arc::new(move || {
-                tracing::debug!(backend = %backend_id, "sync failed (SSH keys unchanged)");
+                tracing::debug!(provider = %failed_id, "sync failed (SSH keys unchanged)");
+            })),
+            on_remote_sync_nudge: Some(Arc::new(move || {
+                let s = Arc::clone(&sync_state);
+                let id = nudge_sync_id.clone();
+                tokio::spawn(async move {
+                    match s.try_sync_backend(&id).await {
+                        Ok(true) => tracing::debug!(provider = %id, "remote nudge: sync triggered"),
+                        Ok(false) => {
+                            tracing::debug!(provider = %id, "remote nudge: sync already in progress")
+                        }
+                        Err(e) => {
+                            tracing::debug!(provider = %id, error = %e, "remote nudge: sync trigger failed")
+                        }
+                    }
+                });
+            })),
+            on_remote_lock_nudge: Some(Arc::new(move || {
+                let s = Arc::clone(&lock_state);
+                let id = nudge_lock_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = s.auto_lock().await {
+                        tracing::warn!(provider = %id, error = %e, "remote nudge: auto-lock failed");
+                    }
+                });
             })),
         };
 
-        if let Err(e) = backend.set_event_callbacks(callbacks) {
-            tracing::warn!(backend = %backend.id(), error = %e, "failed to set event callbacks (lock poisoned)");
-        }
-
-        // --- SignalR nudge callbacks (Bitwarden-PM only, via downcast) ---
-        if let Some(bw) = backend
-            .as_any()
-            .downcast_ref::<rosec_bitwarden::BitwardenBackend>()
-        {
-            let sync_state = Arc::clone(state);
-            let lock_state = Arc::clone(state);
-            let bw_id = bw.id().to_string();
-            let lock_id = bw_id.clone();
-
-            if let Err(e) = bw.set_signalr_callbacks(
-                Arc::new(move || {
-                    let s = Arc::clone(&sync_state);
-                    let id = bw_id.clone();
-                    tokio::spawn(async move {
-                        match s.try_sync_backend(&id).await {
-                            Ok(true) => tracing::debug!(backend = %id, "SignalR: sync triggered"),
-                            Ok(false) => tracing::debug!(backend = %id, "SignalR: sync already in progress"),
-                            Err(e) => tracing::debug!(backend = %id, error = %e, "SignalR: sync trigger failed"),
-                        }
-                    });
-                }),
-                Arc::new(move || {
-                    let s = Arc::clone(&lock_state);
-                    let id = lock_id.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = s.auto_lock().await {
-                            tracing::warn!(backend = %id, error = %e, "SignalR: auto-lock failed");
-                        }
-                    });
-                }),
-            ) {
-                tracing::warn!(backend = %bw.id(), error = %e, "failed to set SignalR callbacks (lock poisoned)");
-            }
+        if let Err(e) = provider.set_event_callbacks(callbacks) {
+            tracing::warn!(provider = %provider.id(), error = %e, "failed to set event callbacks (lock poisoned)");
         }
     }
 }
 
-/// Build all configured backends (both vaults and external backends), in order.
+/// Build all configured providers, in order.
 ///
-/// Vaults are built first (from `[[vault]]` config entries), then external
-/// backends (from `[[backend]]` entries).  Both go through the same
-/// `VaultBackend` trait — the distinction is user-facing only.
-async fn build_backends(config: &Config) -> Result<Vec<Arc<dyn VaultBackend>>> {
-    let total = config.vault.len() + config.backend.len();
-    if total == 0 {
-        tracing::warn!("no vaults or backends configured");
+/// Local vaults (`kind = "local"`) and external providers (`kind = "bitwarden"`,
+/// etc.) are built from the unified `[[provider]]` config entries.  Both go
+/// through the same `Provider` trait.
+async fn build_providers(config: &Config) -> Result<Vec<Arc<dyn Provider>>> {
+    if config.provider.is_empty() {
+        tracing::warn!("no providers configured");
         return Ok(Vec::new());
     }
 
-    let mut backends: Vec<Arc<dyn VaultBackend>> = Vec::with_capacity(total);
+    let mut providers: Vec<Arc<dyn Provider>> = Vec::with_capacity(config.provider.len());
 
-    // Build vault backends.
-    for entry in &config.vault {
-        let backend = build_vault_backend(entry);
-        tracing::info!(
-            vault_id = %entry.id,
-            path = %entry.path,
-            "vault initialized"
-        );
-        backends.push(backend);
-    }
-
-    // Build external backends.
-    for entry in &config.backend {
-        match build_single_backend(entry).await {
-            Ok(backend) => {
+    for entry in &config.provider {
+        match entry.kind.as_str() {
+            "local" => {
+                let provider = build_vault_provider(entry);
                 tracing::info!(
-                    backend_id = %entry.id,
-                    backend_kind = %entry.kind,
-                    "backend initialized"
+                    vault_id = %entry.id,
+                    path = %entry.path.as_deref().unwrap_or(""),
+                    "vault initialized"
                 );
-                backends.push(backend);
+                providers.push(provider);
             }
-            Err(e) if e.to_string().starts_with("unknown backend kind") => {
-                tracing::warn!(
-                    backend_id = %entry.id,
-                    backend_kind = %entry.kind,
-                    "unknown backend type; skipping"
-                );
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "failed to initialize backend '{}': {e}",
-                    entry.id
-                ));
-            }
+            _ => match build_single_provider(entry).await {
+                Ok(provider) => {
+                    tracing::info!(
+                        provider_id = %entry.id,
+                        provider_kind = %entry.kind,
+                        "provider initialized"
+                    );
+                    providers.push(provider);
+                }
+                Err(e) if e.to_string().starts_with("unknown provider kind") => {
+                    tracing::warn!(
+                        provider_id = %entry.id,
+                        provider_kind = %entry.kind,
+                        "unknown provider type; skipping"
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to initialize provider '{}': {e}",
+                        entry.id
+                    ));
+                }
+            },
         }
     }
 
-    Ok(backends)
+    Ok(providers)
 }
 
-/// Construct a vault backend from a `[[vault]]` config entry.
+/// Construct a vault provider from a `[[provider]]` config entry with `kind = "local"`.
 ///
 /// The path undergoes `~` expansion and, if relative, is resolved against
 /// `$XDG_DATA_HOME/rosec/vaults/`.
-fn build_vault_backend(entry: &rosec_core::config::VaultEntry) -> Arc<dyn VaultBackend> {
-    let path = expand_vault_path(&entry.path);
+fn build_vault_provider(entry: &rosec_core::config::ProviderEntry) -> Arc<dyn Provider> {
+    let path = expand_vault_path(entry.path.as_deref().unwrap_or(""));
     Arc::new(rosec_vault::LocalVault::new(&entry.id, path))
 }
 
@@ -847,12 +835,13 @@ fn expand_vault_path(raw: &str) -> PathBuf {
     }
 }
 
-/// Compute a stable fingerprint string for a backend config entry.
+/// Compute a stable fingerprint string for a provider config entry.
 ///
-/// The fingerprint covers `kind`, all `options` (sorted), `return_attr`, and
-/// `match_attr`.  Two entries are considered identical iff their fingerprints
-/// are equal, so hot-reload only removes/re-adds backends that materially changed.
-fn backend_fingerprint(entry: &rosec_core::config::BackendEntry) -> String {
+/// The fingerprint covers `kind`, `path` (for local vaults), all `options`
+/// (sorted), `return_attr`, `match_attr`, and `collection`.  Two entries are
+/// considered identical iff their fingerprints are equal, so hot-reload only
+/// removes/re-adds providers that materially changed.
+fn provider_fingerprint(entry: &rosec_core::config::ProviderEntry) -> String {
     let mut opts: Vec<String> = entry
         .options
         .iter()
@@ -860,6 +849,7 @@ fn backend_fingerprint(entry: &rosec_core::config::BackendEntry) -> String {
         .collect();
     opts.sort();
 
+    let path = entry.path.as_deref().unwrap_or("");
     let return_attr = entry
         .return_attr
         .as_deref()
@@ -870,41 +860,30 @@ fn backend_fingerprint(entry: &rosec_core::config::BackendEntry) -> String {
         .as_deref()
         .map(|v| v.join(","))
         .unwrap_or_default();
+    let collection = entry.collection.as_deref().unwrap_or_default();
 
     format!(
-        "{}:{}:return_attr={}:match_attr={}",
+        "{}:path={}:{}:return_attr={}:match_attr={}:collection={}",
         entry.kind,
+        path,
         opts.join(","),
         return_attr,
         match_attr,
+        collection,
     )
 }
 
-/// Compute a stable fingerprint string for a vault config entry.
-fn vault_fingerprint(entry: &rosec_core::config::VaultEntry) -> String {
-    let return_attr = entry
-        .return_attr
-        .as_deref()
-        .map(|v| v.join(","))
-        .unwrap_or_default();
-    let collection = entry.collection.as_deref().unwrap_or_default();
-    format!(
-        "vault:path={}:return_attr={return_attr}:collection={collection}",
-        entry.path
-    )
-}
-
-/// Watch the config file and hot-reload backends when it changes.
+/// Watch the config file and hot-reload providers when it changes.
 ///
 /// Uses `notify` (inotify on Linux) to detect writes/renames, debounces
-/// rapid events with a 500 ms quiet period, then diffs the backend list:
-/// - New backend IDs → construct and hot-add
-/// - Removed backend IDs → lock then hot-remove
+/// rapid events with a 500 ms quiet period, then diffs the provider list:
+/// - New provider IDs → construct and hot-add
+/// - Removed provider IDs → lock then hot-remove
 /// - Changed options for an existing ID → treat as remove + add
 ///
 /// `initial_config` is the config that was active when the daemon started (or
 /// last reloaded).  It is used to seed the fingerprint so the first comparison
-/// is against actual config values rather than bare backend IDs.
+/// is against actual config values rather than bare provider IDs.
 ///
 /// Parse errors are logged as warnings; the running config is left intact.
 async fn config_watcher(
@@ -955,18 +934,11 @@ async fn config_watcher(
     tracing::info!(path = %config_path.display(), "config watcher started");
 
     // Seed `known` from the initial config fingerprints so the first diff
-    // compares actual config values — not bare backend IDs.
-    // Include both vault entries and backend entries.
+    // compares actual config values — not bare provider IDs.
     let mut known: Vec<(String, String)> = initial_config
-        .vault
+        .provider
         .iter()
-        .map(|entry| (entry.id.clone(), vault_fingerprint(entry)))
-        .chain(
-            initial_config
-                .backend
-                .iter()
-                .map(|entry| (entry.id.clone(), backend_fingerprint(entry))),
-        )
+        .map(|entry| (entry.id.clone(), provider_fingerprint(entry)))
         .collect();
 
     loop {
@@ -998,17 +970,11 @@ async fn config_watcher(
             }
         };
 
-        // Build fingerprints for the new config (vaults + backends).
+        // Build fingerprints for the new config.
         let new_fingerprints: Vec<(String, String)> = new_config
-            .vault
+            .provider
             .iter()
-            .map(|entry| (entry.id.clone(), vault_fingerprint(entry)))
-            .chain(
-                new_config
-                    .backend
-                    .iter()
-                    .map(|entry| (entry.id.clone(), backend_fingerprint(entry))),
-            )
+            .map(|entry| (entry.id.clone(), provider_fingerprint(entry)))
             .collect();
 
         if new_fingerprints == known {
@@ -1016,7 +982,7 @@ async fn config_watcher(
             continue;
         }
 
-        tracing::info!(path = %config_path.display(), "config changed, hot-reloading backends");
+        tracing::info!(path = %config_path.display(), "config changed, hot-reloading providers");
 
         let known_ids: HashSet<&str> = known.iter().map(|(id, _)| id.as_str()).collect();
 
@@ -1035,60 +1001,52 @@ async fn config_watcher(
                 .get(id)
                 .is_none_or(|new_fp| known_map.get(id) != Some(new_fp));
             if changed && state.hotreload_remove_backend(id).await {
-                tracing::info!(backend_id = id, "hot-reload: removed backend");
-                // Evict this backend's SSH keys immediately.
+                tracing::info!(provider_id = id, "hot-reload: removed provider");
+                // Evict this provider's SSH keys immediately.
                 if let Some(ref sm) = ssh_manager {
-                    sm.remove_backend(id);
+                    sm.remove_provider(id);
                 }
             }
         }
 
-        // Add vaults and backends that are new or changed.
+        // Add providers that are new or changed.
         let mut added_any = false;
 
-        // Add new/changed vaults.
-        for entry in &new_config.vault {
+        for entry in &new_config.provider {
             let id = entry.id.as_str();
             let is_new = !known_ids.contains(id);
             let is_changed = known_map
                 .get(id)
                 .is_some_and(|old_fp| new_map.get(id).is_some_and(|new_fp| old_fp != new_fp));
             if is_new || is_changed {
-                let backend = build_vault_backend(entry);
-                state.hotreload_add_backend(backend);
-                tracing::info!(vault_id = id, "hot-reload: added vault");
-                added_any = true;
-            }
-        }
-
-        // Add new/changed external backends.
-        for entry in &new_config.backend {
-            let id = entry.id.as_str();
-            let is_new = !known_ids.contains(id);
-            let is_changed = known_map
-                .get(id)
-                .is_some_and(|old_fp| new_map.get(id).is_some_and(|new_fp| old_fp != new_fp));
-            if is_new || is_changed {
-                match build_single_backend(entry).await {
-                    Ok(backend) => {
-                        state.hotreload_add_backend(backend);
-                        tracing::info!(backend_id = id, "hot-reload: added backend");
+                match entry.kind.as_str() {
+                    "local" => {
+                        let provider = build_vault_provider(entry);
+                        state.hotreload_add_backend(provider);
+                        tracing::info!(vault_id = id, "hot-reload: added vault");
                         added_any = true;
                     }
-                    Err(e) => {
-                        tracing::warn!(backend_id = id, error = %e, "hot-reload: failed to construct backend");
-                    }
+                    _ => match build_single_provider(entry).await {
+                        Ok(provider) => {
+                            state.hotreload_add_backend(provider);
+                            tracing::info!(provider_id = id, "hot-reload: added provider");
+                            added_any = true;
+                        }
+                        Err(e) => {
+                            tracing::warn!(provider_id = id, error = %e, "hot-reload: failed to construct provider");
+                        }
+                    },
                 }
             }
         }
 
-        // Re-wire callbacks after hot-reload so new backends get their event
-        // callbacks and SignalR nudge callbacks registered immediately.
+        // Re-wire callbacks after hot-reload so new providers get their event
+        // callbacks and nudge callbacks registered immediately.
         if added_any {
-            wire_backend_callbacks(&state, &ssh_manager);
+            wire_provider_callbacks(&state, &ssh_manager);
         }
 
-        // ── Hot-reload non-backend config sections ─────────────────────────
+        // ── Hot-reload non-provider config sections ────────────────────────
         // These are live-updated in ServiceState and the Router so background
         // tasks pick up the new values on their next tick without a restart.
         let old_config = state.live_config();
@@ -1138,7 +1096,7 @@ async fn config_watcher(
 
         known = new_fingerprints;
         tracing::info!(
-            "hot-reload complete ({} backends active)",
+            "hot-reload complete ({} providers active)",
             state.backend_count()
         );
     }
@@ -1146,16 +1104,16 @@ async fn config_watcher(
     Ok(())
 }
 
-/// Construct a single backend from a config entry.
+/// Construct a single provider from a config entry.
 ///
-/// Extracted from `build_backends` so the hot-reload watcher can reuse it
+/// Extracted from `build_providers` so the hot-reload watcher can reuse it
 /// without re-parsing the whole config.
 ///
-/// All backends are returned locked; the daemon unlocks them via `AuthBackend`
+/// All providers are returned locked; the daemon unlocks them via `AuthBackend`
 /// D-Bus calls once the user supplies credentials interactively.
-async fn build_single_backend(
-    entry: &rosec_core::config::BackendEntry,
-) -> anyhow::Result<Arc<dyn VaultBackend>> {
+async fn build_single_provider(
+    entry: &rosec_core::config::ProviderEntry,
+) -> anyhow::Result<Arc<dyn Provider>> {
     match entry.kind.as_str() {
         "bitwarden" => {
             let email = entry
@@ -1163,7 +1121,7 @@ async fn build_single_backend(
                 .get("email")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    anyhow::anyhow!("bitwarden backend '{}' requires 'email' option", entry.id)
+                    anyhow::anyhow!("bitwarden provider '{}' requires 'email' option", entry.id)
                 })?
                 .to_string();
 
@@ -1215,7 +1173,7 @@ async fn build_single_backend(
 
             Ok(Arc::new(
                 rosec_bitwarden::BitwardenBackend::new(bw_config)
-                    .map_err(|e| anyhow::anyhow!("bitwarden backend '{}': {e}", entry.id))?,
+                    .map_err(|e| anyhow::anyhow!("bitwarden provider '{}': {e}", entry.id))?,
             ))
         }
         "bitwarden-sm" => {
@@ -1225,7 +1183,7 @@ async fn build_single_backend(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "bitwarden-sm backend '{}' requires 'organization_id' option",
+                        "bitwarden-sm provider '{}' requires 'organization_id' option",
                         entry.id
                     )
                 })?
@@ -1254,7 +1212,7 @@ async fn build_single_backend(
                 sm_config,
             )))
         }
-        other => anyhow::bail!("unknown backend kind '{other}'"),
+        other => anyhow::bail!("unknown provider kind '{other}'"),
     }
 }
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use rosec_core::BackendError;
+use rosec_core::ProviderError;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 use zvariant::Value;
@@ -50,7 +50,7 @@ impl SessionManager {
         &self,
         algorithm: &str,
         input: &Value<'_>,
-    ) -> Result<(Value<'static>, String), BackendError> {
+    ) -> Result<(Value<'static>, String), ProviderError> {
         let algo = SessionAlgorithm::parse(algorithm)?;
 
         let id = Uuid::new_v4().simple().to_string();
@@ -72,13 +72,13 @@ impl SessionManager {
                         .iter()
                         .map(|v| match v {
                             Value::U8(b) => Ok(*b),
-                            _ => Err(BackendError::Unavailable(
+                            _ => Err(ProviderError::Unavailable(
                                 "DH input must be Array<Byte>".to_string(),
                             )),
                         })
                         .collect::<Result<Vec<u8>, _>>()?,
                     _ => {
-                        return Err(BackendError::Unavailable(
+                        return Err(ProviderError::Unavailable(
                             "DH session requires Array<Byte> input (client public key)".to_string(),
                         ));
                     }
@@ -101,54 +101,59 @@ impl SessionManager {
         }
     }
 
-    fn insert(&self, path: String, info: SessionInfo) -> Result<(), BackendError> {
+    fn insert(&self, path: String, info: SessionInfo) -> Result<(), ProviderError> {
         let mut sessions = self
             .sessions
             .lock()
-            .map_err(|_| BackendError::Unavailable("session lock poisoned".to_string()))?;
+            .map_err(|_| ProviderError::Unavailable("session lock poisoned".to_string()))?;
         sessions.insert(path, info);
         Ok(())
     }
 
-    pub fn close_session(&self, path: &str) -> Result<(), BackendError> {
+    pub fn close_session(&self, path: &str) -> Result<(), ProviderError> {
         let mut sessions = self
             .sessions
             .lock()
-            .map_err(|_| BackendError::Unavailable("session lock poisoned".to_string()))?;
+            .map_err(|_| ProviderError::Unavailable("session lock poisoned".to_string()))?;
         sessions.remove(path);
         Ok(())
     }
 
-    pub fn is_valid(&self, path: &str) -> Result<bool, BackendError> {
+    pub fn is_valid(&self, path: &str) -> Result<bool, ProviderError> {
         let sessions = self
             .sessions
             .lock()
-            .map_err(|_| BackendError::Unavailable("session lock poisoned".to_string()))?;
+            .map_err(|_| ProviderError::Unavailable("session lock poisoned".to_string()))?;
         Ok(sessions.contains_key(path))
     }
 
     /// Validate that a session path is non-empty, not root, and refers to a
     /// known open session. Returns an error describing the failure.
-    pub fn validate(&self, session: &str) -> Result<(), BackendError> {
+    pub fn validate(&self, session: &str) -> Result<(), ProviderError> {
         if session.is_empty() || session == "/" {
-            return Err(BackendError::Unavailable("no session provided".to_string()));
+            return Err(ProviderError::Unavailable(
+                "no session provided".to_string(),
+            ));
         }
         let valid = self.is_valid(session)?;
         if valid {
             Ok(())
         } else {
-            Err(BackendError::Unavailable("invalid session".to_string()))
+            Err(ProviderError::Unavailable("invalid session".to_string()))
         }
     }
 
     /// Return a copy of the AES-128 session key for a DH-encrypted session.
     ///
     /// Returns `None` for plain sessions or unknown session paths.
-    pub fn get_session_key(&self, path: &str) -> Result<Option<Zeroizing<[u8; 16]>>, BackendError> {
+    pub fn get_session_key(
+        &self,
+        path: &str,
+    ) -> Result<Option<Zeroizing<[u8; 16]>>, ProviderError> {
         let sessions = self
             .sessions
             .lock()
-            .map_err(|_| BackendError::Unavailable("session lock poisoned".to_string()))?;
+            .map_err(|_| ProviderError::Unavailable("session lock poisoned".to_string()))?;
         let info = match sessions.get(path) {
             Some(i) => i,
             None => return Ok(None),
@@ -156,11 +161,11 @@ impl SessionManager {
         Ok(info.aes_key.as_ref().map(|k| Zeroizing::new(**k)))
     }
 
-    pub fn count(&self) -> Result<usize, BackendError> {
+    pub fn count(&self) -> Result<usize, ProviderError> {
         let sessions = self
             .sessions
             .lock()
-            .map_err(|_| BackendError::Unavailable("session lock poisoned".to_string()))?;
+            .map_err(|_| ProviderError::Unavailable("session lock poisoned".to_string()))?;
         Ok(sessions.len())
     }
 }
@@ -292,7 +297,7 @@ mod tests {
         let mgr = SessionManager::new();
         let err = mgr.validate("").unwrap_err();
         match err {
-            BackendError::Unavailable(msg) => assert!(msg.contains("no session")),
+            ProviderError::Unavailable(msg) => assert!(msg.contains("no session")),
             other => panic!("expected Unavailable, got {other:?}"),
         }
     }
@@ -302,7 +307,7 @@ mod tests {
         let mgr = SessionManager::new();
         let err = mgr.validate("/").unwrap_err();
         match err {
-            BackendError::Unavailable(msg) => assert!(msg.contains("no session")),
+            ProviderError::Unavailable(msg) => assert!(msg.contains("no session")),
             other => panic!("expected Unavailable, got {other:?}"),
         }
     }
@@ -314,7 +319,7 @@ mod tests {
             .validate("/org/freedesktop/secrets/session/nonexistent")
             .unwrap_err();
         match err {
-            BackendError::Unavailable(msg) => assert!(msg.contains("invalid session")),
+            ProviderError::Unavailable(msg) => assert!(msg.contains("invalid session")),
             other => panic!("expected Unavailable, got {other:?}"),
         }
     }
@@ -338,7 +343,7 @@ mod tests {
 
         let err = mgr.validate(&path).unwrap_err();
         match err {
-            BackendError::Unavailable(msg) => assert!(msg.contains("invalid session")),
+            ProviderError::Unavailable(msg) => assert!(msg.contains("invalid session")),
             other => panic!("expected Unavailable, got {other:?}"),
         }
     }

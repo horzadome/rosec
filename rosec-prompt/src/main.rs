@@ -5,7 +5,7 @@
 //! **stdin**: a single JSON object:
 //! ```json
 //! {
-//!   "t": "Unlock backend",
+//!   "t": "Unlock provider",
 //!   "m": "Enter credentials",
 //!   "h": "Backend: my-vault",
 //!   "backend": "my-vault",
@@ -215,7 +215,7 @@ fn main() -> Result<()> {
 
     let request: PromptRequest = if raw.trim().is_empty() {
         PromptRequest {
-            title: "Unlock backend".to_string(),
+            title: "Unlock provider".to_string(),
             message: "Enter your credentials".to_string(),
             hint: String::new(),
             backend: String::new(),
@@ -465,7 +465,7 @@ impl GuiApp {
         let input_text = parse_color(&req.theme.input_text, fg);
         let font = font_from_string(&req.theme.font_family);
         let hint = if req.hint.trim().is_empty() && !req.backend.is_empty() {
-            format!("Backend: {}", req.backend)
+            format!("Provider: {}", req.backend)
         } else {
             req.hint
         };

@@ -4,7 +4,7 @@
 //! `expose_authtok` option, which provides the user's login password on
 //! stdin (null-terminated).
 //!
-//! It connects to the D-Bus session bus, enumerates locked vault backends,
+//! It connects to the D-Bus session bus, enumerates locked vault providers,
 //! and attempts to unlock each one using the login password via the
 //! `AuthBackendFromPipe` method on `org.rosec.Daemon`.  The password is
 //! passed through a pipe fd (SCM_RIGHTS), never as a D-Bus message payload,

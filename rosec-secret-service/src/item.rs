@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use rosec_core::{BackendError, VaultBackend, VaultItemMeta};
+use rosec_core::{Capability, ItemMeta, Provider, ProviderError};
 use tracing::info;
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
@@ -14,18 +14,18 @@ use crate::state::map_backend_error;
 
 #[derive(Clone)]
 pub struct ItemState {
-    pub meta: VaultItemMeta,
+    pub meta: ItemMeta,
     pub path: String,
-    pub backend: Arc<dyn VaultBackend>,
+    pub backend: Arc<dyn Provider>,
     pub sessions: Arc<SessionManager>,
     /// Ordered glob patterns for selecting which sensitive attribute to return
-    /// from `GetSecret`.  Derived from the backend's `return_attr` config.
+    /// from `GetSecret`.  Derived from the provider's `return_attr` config.
     pub return_attr_patterns: Vec<String>,
     /// Tokio runtime handle — required to bridge zbus's async-io executor with
-    /// backend futures that depend on the Tokio reactor (e.g. reqwest).
+    /// provider futures that depend on the Tokio reactor (e.g. reqwest).
     pub tokio_handle: tokio::runtime::Handle,
     /// Reference to service state for cache updates.
-    pub items_cache: Arc<std::sync::Mutex<HashMap<String, VaultItemMeta>>>,
+    pub items_cache: Arc<std::sync::Mutex<HashMap<String, ItemMeta>>>,
 }
 
 pub struct SecretItem {
@@ -110,16 +110,14 @@ impl SecretItem {
                             if let Some(matched) = ia.secret_names.iter().find(|n| wm.matches(n)) {
                                 match backend.get_secret_attr(&item_id, matched).await {
                                     Ok(s) => return Ok(s),
-                                    Err(BackendError::NotFound) => continue,
+                                    Err(ProviderError::NotFound) => continue,
                                     Err(e) => return Err(e),
                                 }
                             }
                         }
-                        // No pattern matched — fall back.
-                        backend.get_secret(&item_id).await
+                        // No pattern matched — fall back to primary_secret.
+                        rosec_core::primary_secret(&*backend, &item_id).await
                     }
-                    // Backend doesn't support attribute model — use legacy path.
-                    Err(BackendError::NotSupported) => backend.get_secret(&item_id).await,
                     Err(e) => Err(e),
                 }
             })
@@ -137,9 +135,14 @@ impl SecretItem {
     }
 
     async fn delete(&self) -> Result<OwnedObjectPath, FdoError> {
-        if !self.state.backend.supports_writes() {
+        if !self
+            .state
+            .backend
+            .capabilities()
+            .contains(&Capability::Write)
+        {
             return Err(FdoError::NotSupported(
-                "backend does not support write operations".to_string(),
+                "provider does not support write operations".to_string(),
             ));
         }
 
@@ -177,18 +180,14 @@ mod tests {
     use super::*;
 
     use rosec_core::{
-        Attributes, BackendError, BackendStatus, SecretBytes, UnlockInput, VaultItem,
+        Attributes, ItemMeta, Provider, ProviderError, ProviderStatus, SecretBytes, UnlockInput,
     };
 
     #[derive(Debug)]
     struct MockBackend;
 
     #[async_trait::async_trait]
-    impl VaultBackend for MockBackend {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
+    impl Provider for MockBackend {
         fn id(&self) -> &str {
             "mock"
         }
@@ -201,50 +200,57 @@ mod tests {
             "mock"
         }
 
-        async fn status(&self) -> Result<BackendStatus, BackendError> {
-            Ok(BackendStatus {
+        async fn status(&self) -> Result<ProviderStatus, ProviderError> {
+            Ok(ProviderStatus {
                 locked: false,
                 last_sync: None,
             })
         }
 
-        async fn unlock(&self, _input: UnlockInput) -> Result<(), BackendError> {
+        async fn unlock(&self, _input: UnlockInput) -> Result<(), ProviderError> {
             Ok(())
         }
 
-        async fn lock(&self) -> Result<(), BackendError> {
+        async fn lock(&self) -> Result<(), ProviderError> {
             Ok(())
         }
 
-        async fn list_items(&self) -> Result<Vec<VaultItemMeta>, BackendError> {
+        async fn list_items(&self) -> Result<Vec<ItemMeta>, ProviderError> {
             Ok(Vec::new())
         }
 
-        async fn get_item(&self, _id: &str) -> Result<VaultItem, BackendError> {
-            Err(BackendError::NotFound)
-        }
-
-        async fn get_secret(&self, id: &str) -> Result<SecretBytes, BackendError> {
-            Ok(SecretBytes::new(format!("secret-{id}").into_bytes()))
-        }
-
-        async fn search(&self, _attrs: &Attributes) -> Result<Vec<VaultItemMeta>, BackendError> {
+        async fn search(&self, _attrs: &Attributes) -> Result<Vec<ItemMeta>, ProviderError> {
             Ok(Vec::new())
         }
 
-        // Return NotSupported so the get_secret fallback path is exercised.
         async fn get_item_attributes(
             &self,
             _id: &str,
-        ) -> Result<rosec_core::ItemAttributes, BackendError> {
-            Err(BackendError::NotSupported)
+        ) -> Result<rosec_core::ItemAttributes, ProviderError> {
+            // Return a "secret" attr so primary_secret fallback works
+            Ok(rosec_core::ItemAttributes {
+                public: Attributes::new(),
+                secret_names: vec!["secret".to_string()],
+            })
+        }
+
+        async fn get_secret_attr(
+            &self,
+            id: &str,
+            attr: &str,
+        ) -> Result<SecretBytes, ProviderError> {
+            if attr == "secret" {
+                Ok(SecretBytes::new(format!("secret-{id}").into_bytes()))
+            } else {
+                Err(ProviderError::NotFound)
+            }
         }
     }
 
-    fn meta(locked: bool) -> VaultItemMeta {
-        VaultItemMeta {
+    fn meta(locked: bool) -> ItemMeta {
+        ItemMeta {
             id: "item-1".to_string(),
-            backend_id: "mock".to_string(),
+            provider_id: "mock".to_string(),
             label: "one".to_string(),
             attributes: Attributes::new(),
             created: None,

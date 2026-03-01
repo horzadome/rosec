@@ -13,34 +13,7 @@ pub struct Config {
     #[serde(default)]
     pub prompt: PromptConfig,
     #[serde(default)]
-    pub vault: Vec<VaultEntry>,
-    #[serde(default)]
-    pub backend: Vec<BackendEntry>,
-}
-
-/// A local vault configuration entry.
-///
-/// Vaults are rosec's own encrypted local stores, managed via `rosec vault`
-/// CLI commands. Each vault maps to a single encrypted file on disk.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VaultEntry {
-    /// Unique identifier for this vault (used as the backend ID internally).
-    pub id: String,
-    /// Path to the vault file on disk.
-    ///
-    /// Supports `~` expansion. If relative, resolved relative to
-    /// `$XDG_DATA_HOME/rosec/vaults/`.
-    pub path: String,
-    /// Optional collection label for grouping items.
-    #[serde(default)]
-    pub collection: Option<String>,
-    /// Glob patterns for secret attribute selection (same as backend return_attr).
-    #[serde(default)]
-    pub return_attr: Option<Vec<String>>,
-    /// Per-vault autolock overrides.  Fields not set here inherit from the
-    /// global `[autolock]` section.
-    #[serde(default)]
-    pub autolock: Option<AutoLockOverride>,
+    pub provider: Vec<ProviderEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,8 +24,8 @@ pub struct ServiceConfig {
     pub dedup_time_fallback: DedupTimeFallback,
     #[serde(default)]
     pub refresh_interval_secs: Option<u64>,
-    /// Backend ID for write operations (create_item, update_item, delete_item).
-    /// If not set, defaults to the first backend that supports writes.
+    /// Provider ID for write operations (create_item, update_item, delete_item).
+    /// If not set, defaults to the first provider that supports writes.
     #[serde(default)]
     pub write_backend: Option<String>,
     /// Allowed executable paths for `AuthBackendFromPipe` callers.
@@ -153,15 +126,31 @@ impl Default for PromptTheme {
     }
 }
 
-/// A backend configuration entry.
+/// A unified provider configuration entry.
+///
+/// Covers both local vaults (`kind = "local"`) and external backends
+/// (`kind = "bitwarden"`, `"bitwarden-sm"`, etc.).
 ///
 /// `Debug` is manually implemented to redact known sensitive option keys
 /// (passwords, tokens, secrets) so they don't appear in logs.
 #[derive(Clone, Serialize, Deserialize)]
-pub struct BackendEntry {
+pub struct ProviderEntry {
+    /// Unique identifier for this provider.
     pub id: String,
-    #[serde(rename = "type")]
+
+    /// Provider type: `"local"`, `"bitwarden"`, `"bitwarden-sm"`, etc.
     pub kind: String,
+
+    /// Path to the vault file on disk (required for `kind = "local"`).
+    ///
+    /// Supports `~` expansion.  If relative, resolved relative to
+    /// `$XDG_DATA_HOME/rosec/vaults/`.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Backend-specific options (e.g. `email`, `base_url`, `organization_id`).
+    ///
+    /// Not used by `kind = "local"` providers.
     #[serde(default)]
     pub options: HashMap<String, serde_json::Value>,
 
@@ -188,23 +177,23 @@ pub struct BackendEntry {
     #[serde(default)]
     pub match_attr: Option<Vec<String>>,
 
-    /// Optional collection label stamped onto every item from this backend as
+    /// Optional collection label stamped onto every item from this provider as
     /// the `"collection"` attribute.
     ///
-    /// Useful for grouping items across multiple backends in a multi-backend
+    /// Useful for grouping items across multiple providers in a multi-provider
     /// setup (e.g. `collection = "work"` on a work SM org and a work PM vault).
     /// Clients can then filter with `rosec search collection=work`.
     ///
     /// ```toml
-    /// [[backend]]
-    /// id     = "work-sm"
-    /// type   = "bitwarden-sm"
+    /// [[provider]]
+    /// id         = "work-sm"
+    /// kind       = "bitwarden-sm"
     /// collection = "work"
     /// ```
     #[serde(default)]
     pub collection: Option<String>,
 
-    /// Per-backend autolock overrides.  Fields not set here inherit from the
+    /// Per-provider autolock overrides.  Fields not set here inherit from the
     /// global `[autolock]` section.
     #[serde(default)]
     pub autolock: Option<AutoLockOverride>,
@@ -222,7 +211,7 @@ const SENSITIVE_OPTION_KEYS: &[&str] = &[
     "passphrase",
 ];
 
-impl std::fmt::Debug for BackendEntry {
+impl std::fmt::Debug for ProviderEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let redacted: HashMap<&str, &str> = self
             .options
@@ -239,9 +228,10 @@ impl std::fmt::Debug for BackendEntry {
                 (k.as_str(), v)
             })
             .collect();
-        f.debug_struct("BackendEntry")
+        f.debug_struct("ProviderEntry")
             .field("id", &self.id)
             .field("kind", &self.kind)
+            .field("path", &self.path)
             .field("options", &redacted)
             .field("return_attr", &self.return_attr)
             .field("match_attr", &self.match_attr)
@@ -352,8 +342,7 @@ mod tests {
         assert!(cfg.service.refresh_interval_secs.is_none());
         assert_eq!(cfg.prompt.backend, "builtin");
         assert!(cfg.prompt.args.is_empty());
-        assert!(cfg.vault.is_empty());
-        assert!(cfg.backend.is_empty());
+        assert!(cfg.provider.is_empty());
         assert!(cfg.autolock.on_logout);
         assert!(!cfg.autolock.on_session_lock);
         assert!(cfg.autolock.idle_timeout_minutes.is_none());
@@ -377,26 +366,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_entries() {
+    fn parse_bitwarden_provider_entries() {
         let toml_str = r#"
-            [[backend]]
+            [[provider]]
             id = "bw1"
-            type = "bitwarden"
+            kind = "bitwarden"
 
-            [backend.options]
+            [provider.options]
             email = "test@example.com"
             base_url = "https://vault.example.com"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.backend.len(), 1);
-        assert_eq!(cfg.backend[0].id, "bw1");
-        assert_eq!(cfg.backend[0].kind, "bitwarden");
+        assert_eq!(cfg.provider.len(), 1);
+        assert_eq!(cfg.provider[0].id, "bw1");
+        assert_eq!(cfg.provider[0].kind, "bitwarden");
         assert_eq!(
-            cfg.backend[0].options.get("email").and_then(|v| v.as_str()),
+            cfg.provider[0]
+                .options
+                .get("email")
+                .and_then(|v| v.as_str()),
             Some("test@example.com")
         );
         assert_eq!(
-            cfg.backend[0]
+            cfg.provider[0]
                 .options
                 .get("base_url")
                 .and_then(|v| v.as_str()),
@@ -474,40 +466,40 @@ mod tests {
     }
 
     #[test]
-    fn multiple_backends() {
+    fn multiple_providers() {
         let toml_str = r#"
-            [[backend]]
+            [[provider]]
             id = "bw1"
-            type = "bitwarden"
+            kind = "bitwarden"
 
-            [[backend]]
+            [[provider]]
             id = "bw2"
-            type = "bitwarden"
+            kind = "bitwarden"
 
-            [backend.options]
+            [provider.options]
             email = "other@example.com"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.backend.len(), 2);
-        assert_eq!(cfg.backend[0].id, "bw1");
-        assert_eq!(cfg.backend[1].id, "bw2");
+        assert_eq!(cfg.provider.len(), 2);
+        assert_eq!(cfg.provider[0].id, "bw1");
+        assert_eq!(cfg.provider[1].id, "bw2");
     }
 
     #[test]
-    fn parse_bitwarden_sm_backend_entry() {
+    fn parse_bitwarden_sm_provider_entry() {
         let toml_str = r#"
-            [[backend]]
+            [[provider]]
             id = "my-sm"
-            type = "bitwarden-sm"
+            kind = "bitwarden-sm"
 
-            [backend.options]
+            [provider.options]
             access_token    = "0.uuid.secret:key"
             organization_id = "00000000-0000-0000-0000-000000000000"
             server_url      = "https://vault.example.com"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.backend.len(), 1);
-        let entry = &cfg.backend[0];
+        assert_eq!(cfg.provider.len(), 1);
+        let entry = &cfg.provider[0];
         assert_eq!(entry.id, "my-sm");
         assert_eq!(entry.kind, "bitwarden-sm");
         assert_eq!(
@@ -549,17 +541,17 @@ mod tests {
     #[test]
     fn parse_return_attr_and_match_attr() {
         let toml_str = r#"
-            [[backend]]
+            [[provider]]
             id = "bw1"
-            type = "bitwarden"
+            kind = "bitwarden"
             return_attr = ["password", "totp", "number", "notes"]
             match_attr = ["username", "uri"]
 
-            [backend.options]
+            [provider.options]
             email = "test@example.com"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        let entry = &cfg.backend[0];
+        let entry = &cfg.provider[0];
         assert_eq!(
             entry.return_attr.as_deref(),
             Some(&["password", "totp", "number", "notes"][..])
@@ -577,75 +569,84 @@ mod tests {
     #[test]
     fn return_attr_defaults_to_none() {
         let toml_str = r#"
-            [[backend]]
+            [[provider]]
             id = "bw1"
-            type = "bitwarden"
+            kind = "bitwarden"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert!(cfg.backend[0].return_attr.is_none());
-        assert!(cfg.backend[0].match_attr.is_none());
+        assert!(cfg.provider[0].return_attr.is_none());
+        assert!(cfg.provider[0].match_attr.is_none());
     }
 
     #[test]
-    fn parse_vault_entries() {
+    fn parse_local_provider_entries() {
         let toml_str = r#"
-            [[vault]]
+            [[provider]]
             id = "personal"
+            kind = "local"
             path = "~/.local/share/rosec/vaults/personal.vault"
 
-            [[vault]]
+            [[provider]]
             id = "work"
+            kind = "local"
             path = "/mnt/syncthing/work.vault"
             collection = "work"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.vault.len(), 2);
-        assert_eq!(cfg.vault[0].id, "personal");
+        assert_eq!(cfg.provider.len(), 2);
+        assert_eq!(cfg.provider[0].id, "personal");
+        assert_eq!(cfg.provider[0].kind, "local");
         assert_eq!(
-            cfg.vault[0].path,
-            "~/.local/share/rosec/vaults/personal.vault"
+            cfg.provider[0].path.as_deref(),
+            Some("~/.local/share/rosec/vaults/personal.vault")
         );
-        assert!(cfg.vault[0].collection.is_none());
+        assert!(cfg.provider[0].collection.is_none());
 
-        assert_eq!(cfg.vault[1].id, "work");
-        assert_eq!(cfg.vault[1].path, "/mnt/syncthing/work.vault");
-        assert_eq!(cfg.vault[1].collection.as_deref(), Some("work"));
+        assert_eq!(cfg.provider[1].id, "work");
+        assert_eq!(cfg.provider[1].kind, "local");
+        assert_eq!(
+            cfg.provider[1].path.as_deref(),
+            Some("/mnt/syncthing/work.vault")
+        );
+        assert_eq!(cfg.provider[1].collection.as_deref(), Some("work"));
     }
 
     #[test]
-    fn mixed_vault_and_backend_entries() {
+    fn mixed_local_and_external_providers() {
         let toml_str = r#"
-            [[vault]]
+            [[provider]]
             id = "local"
+            kind = "local"
             path = "~/.local/share/rosec/vaults/local.vault"
 
-            [[backend]]
+            [[provider]]
             id = "bw1"
-            type = "bitwarden"
+            kind = "bitwarden"
 
-            [backend.options]
+            [provider.options]
             email = "test@example.com"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.vault.len(), 1);
-        assert_eq!(cfg.backend.len(), 1);
-        assert_eq!(cfg.vault[0].id, "local");
-        assert_eq!(cfg.backend[0].id, "bw1");
+        assert_eq!(cfg.provider.len(), 2);
+        assert_eq!(cfg.provider[0].id, "local");
+        assert_eq!(cfg.provider[0].kind, "local");
+        assert_eq!(cfg.provider[1].id, "bw1");
+        assert_eq!(cfg.provider[1].kind, "bitwarden");
     }
 
     #[test]
-    fn parse_backend_autolock_override() {
+    fn parse_provider_autolock_override() {
         let toml_str = r#"
-            [[backend]]
+            [[provider]]
             id = "bw1"
-            type = "bitwarden"
+            kind = "bitwarden"
 
-            [backend.autolock]
+            [provider.autolock]
             idle_timeout_minutes = 5
             on_session_lock = true
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        let entry = &cfg.backend[0];
+        let entry = &cfg.provider[0];
         let al = entry.autolock.as_ref().unwrap();
         assert_eq!(al.idle_timeout_minutes, Some(5));
         assert_eq!(al.on_session_lock, Some(true));
@@ -655,18 +656,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_vault_autolock_override() {
+    fn parse_local_provider_autolock_override() {
         let toml_str = r#"
-            [[vault]]
+            [[provider]]
             id = "work"
+            kind = "local"
             path = "/tmp/work.vault"
 
-            [vault.autolock]
+            [provider.autolock]
             max_unlocked_minutes = 60
             on_logout = false
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        let entry = &cfg.vault[0];
+        let entry = &cfg.provider[0];
         let al = entry.autolock.as_ref().unwrap();
         assert_eq!(al.max_unlocked_minutes, Some(60));
         assert_eq!(al.on_logout, Some(false));
@@ -675,29 +677,30 @@ mod tests {
     }
 
     #[test]
-    fn backend_autolock_defaults_to_none() {
+    fn provider_autolock_defaults_to_none() {
         let toml_str = r#"
-            [[backend]]
+            [[provider]]
             id = "bw1"
-            type = "bitwarden"
+            kind = "bitwarden"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert!(cfg.backend[0].autolock.is_none());
+        assert!(cfg.provider[0].autolock.is_none());
     }
 
     #[test]
-    fn vault_autolock_defaults_to_none() {
+    fn local_provider_autolock_defaults_to_none() {
         let toml_str = r#"
-            [[vault]]
+            [[provider]]
             id = "local"
+            kind = "local"
             path = "/tmp/test.vault"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
-        assert!(cfg.vault[0].autolock.is_none());
+        assert!(cfg.provider[0].autolock.is_none());
     }
 
     #[test]
-    fn backend_autolock_zero_disables_via_merge() {
+    fn provider_autolock_zero_disables_via_merge() {
         use crate::AutoLockOverride;
 
         let toml_str = r#"
@@ -705,17 +708,17 @@ mod tests {
             idle_timeout_minutes = 15
             max_unlocked_minutes = 240
 
-            [[backend]]
+            [[provider]]
             id = "bw1"
-            type = "bitwarden"
+            kind = "bitwarden"
 
-            [backend.autolock]
+            [provider.autolock]
             idle_timeout_minutes = 0
             max_unlocked_minutes = 0
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         let global = &cfg.autolock;
-        let overrides: &AutoLockOverride = cfg.backend[0].autolock.as_ref().unwrap();
+        let overrides: &AutoLockOverride = cfg.provider[0].autolock.as_ref().unwrap();
         let merged = global.merge(overrides);
         // 0 in override → None in merged (disabled)
         assert!(merged.idle_timeout_minutes.is_none());

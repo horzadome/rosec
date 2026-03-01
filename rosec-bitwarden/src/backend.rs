@@ -1,12 +1,11 @@
-//! VaultBackend implementation for Bitwarden.
+//! Provider implementation for Bitwarden.
 
-use std::sync::Arc;
 use std::time::SystemTime;
 
 use rosec_core::{
-    AttributeDescriptor, Attributes, AuthField, AuthFieldKind, BackendCallbacks, BackendError,
-    BackendStatus, ItemAttributes, RegistrationInfo, SecretBytes, SshKeyMeta,
-    SshPrivateKeyMaterial, UnlockInput, VaultBackend, VaultItem, VaultItemMeta,
+    AttributeDescriptor, Attributes, AuthField, AuthFieldKind, Capability, ItemAttributes,
+    ItemMeta, Provider, ProviderCallbacks, ProviderError, ProviderStatus, RegistrationInfo,
+    SecretBytes, SshKeyMeta, SshPrivateKeyMaterial, UnlockInput,
 };
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -323,7 +322,7 @@ struct NotificationsHandle {
 
 /// Bitwarden vault backend for rosec.
 ///
-/// Implements the `VaultBackend` trait to provide read-only access to
+/// Implements the `Provider` trait to provide read-only access to
 /// a Bitwarden vault. Authentication requires a master password provided
 /// via the `unlock` method.
 pub struct BitwardenBackend {
@@ -334,13 +333,7 @@ pub struct BitwardenBackend {
     /// `realtime_sync = false`.  Replaced on each unlock.
     notifications: Mutex<Option<NotificationsHandle>>,
     /// Lifecycle event callbacks registered by `rosecd` after construction.
-    callbacks: std::sync::RwLock<BackendCallbacks>,
-    /// SignalR nudge callbacks: fired when the server pushes a sync/lock event.
-    /// These are *not* the same as `BackendCallbacks` — they trigger external
-    /// actions (ServiceState sync / auto-lock) rather than reporting backend
-    /// state changes.
-    on_sync_nudge: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
-    on_lock_nudge: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
+    callbacks: std::sync::RwLock<ProviderCallbacks>,
 }
 
 /// Internal authenticated state.
@@ -401,41 +394,8 @@ impl BitwardenBackend {
             api,
             state: Mutex::new(None),
             notifications: Mutex::new(None),
-            callbacks: std::sync::RwLock::new(BackendCallbacks::default()),
-            on_sync_nudge: std::sync::Mutex::new(None),
-            on_lock_nudge: std::sync::Mutex::new(None),
+            callbacks: std::sync::RwLock::new(ProviderCallbacks::default()),
         })
-    }
-
-    /// Set the SignalR nudge callbacks used by the real-time notifications task.
-    ///
-    /// - `on_sync_nudge` — called when the Bitwarden server pushes a cipher-update
-    ///   event; typically calls `ServiceState::try_sync_backend`.
-    /// - `on_lock_nudge` — called on a `LogOut` event; typically calls
-    ///   `ServiceState::auto_lock`.
-    ///
-    /// These are separate from the `BackendCallbacks` registered via
-    /// `set_event_callbacks` on the `VaultBackend` trait.  The nudge callbacks
-    /// trigger *external* actions; the event callbacks report *backend* state changes.
-    ///
-    /// Must be called after construction, once `ServiceState` is available.
-    /// Safe to call even when `realtime_sync = false` (stored but never used).
-    pub fn set_signalr_callbacks(
-        &self,
-        on_sync_nudge: Arc<dyn Fn() + Send + Sync + 'static>,
-        on_lock_nudge: Arc<dyn Fn() + Send + Sync + 'static>,
-    ) -> Result<(), BackendError> {
-        let mut sync_guard = self
-            .on_sync_nudge
-            .lock()
-            .map_err(|_| BackendError::Other(anyhow::anyhow!("on_sync_nudge mutex poisoned")))?;
-        let mut lock_guard = self
-            .on_lock_nudge
-            .lock()
-            .map_err(|_| BackendError::Other(anyhow::anyhow!("on_lock_nudge mutex poisoned")))?;
-        *sync_guard = Some(on_sync_nudge);
-        *lock_guard = Some(on_lock_nudge);
-        Ok(())
     }
 
     /// Perform the full authentication + sync flow.
@@ -690,23 +650,23 @@ impl BitwardenBackend {
         }
     }
 
-    /// Map a decrypted cipher to a VaultItemMeta.
+    /// Map a decrypted cipher to an [`ItemMeta`].
     ///
-    /// Takes `backend_id` explicitly so multiple Bitwarden instances attribute
+    /// Takes `provider_id` explicitly so multiple Bitwarden instances attribute
     /// their items to the correct instance ID rather than a hardcoded string.
     ///
     /// Only populates **public** attributes — no sensitive data appears here.
     /// Sensitive attribute names are available via `build_item_attributes()`.
-    fn cipher_to_meta(backend_id: &str, dc: &DecryptedCipher) -> VaultItemMeta {
+    fn cipher_to_meta(provider_id: &str, dc: &DecryptedCipher) -> ItemMeta {
         let mut attributes = Attributes::new();
         Self::populate_public_attrs(&mut attributes, dc);
 
         let created = dc.creation_date.as_ref().and_then(|s| parse_iso8601(s));
         let modified = dc.revision_date.as_ref().and_then(|s| parse_iso8601(s));
 
-        VaultItemMeta {
+        ItemMeta {
             id: dc.id.clone(),
-            backend_id: backend_id.to_string(),
+            provider_id: provider_id.to_string(),
             label: dc.name.clone(),
             attributes,
             created,
@@ -720,6 +680,11 @@ impl BitwardenBackend {
     ///
     /// Returns the secret bytes wrapped in `SecretBytes` (zeroized on drop).
     /// Uses `Zeroizing<Vec<u8>>` internally to avoid any plain-text intermediate buffer.
+    ///
+    /// Note: this is no longer called from the `Provider` trait impl (the old
+    /// `get_item`/`get_secret` methods were removed).  It remains available for
+    /// the `rosec_core::primary_secret` free function and for tests.
+    #[cfg(test)]
     fn get_primary_secret(dc: &DecryptedCipher) -> Option<SecretBytes> {
         // Helper: borrow a Zeroizing<String> and produce a Zeroizing<Vec<u8>>
         // without going through a plain intermediate buffer.
@@ -764,15 +729,15 @@ impl BitwardenBackend {
     ///
     /// Duplicate custom field names are suffixed: `custom.ssh-host`,
     /// `custom.ssh-host.1`, `custom.ssh-host.2`, etc.
-    fn build_item_attributes(backend_id: &str, dc: &DecryptedCipher) -> ItemAttributes {
+    fn build_item_attributes(provider_id: &str, dc: &DecryptedCipher) -> ItemAttributes {
         let mut public = Attributes::new();
         let mut secret_names = Vec::new();
 
         // Shared public attributes (schema, type, folder, org, login, card, ssh, custom fields)
         Self::populate_public_attrs(&mut public, dc);
 
-        // backend_id is only in ItemAttributes, not VaultItemMeta
-        public.insert("backend_id".to_string(), backend_id.to_string());
+        // provider_id is only in ItemAttributes, not ItemMeta
+        public.insert("provider_id".to_string(), provider_id.to_string());
 
         // notes — always sensitive
         if dc.notes.is_some() {
@@ -1029,7 +994,7 @@ impl BitwardenBackend {
 
     /// Build an [`SshKeyMeta`] for a cipher that has discoverable SSH key
     /// material, or `None` if the cipher has none.
-    fn cipher_to_ssh_key_meta(backend_id: &str, dc: &DecryptedCipher) -> Option<SshKeyMeta> {
+    fn cipher_to_ssh_key_meta(provider_id: &str, dc: &DecryptedCipher) -> Option<SshKeyMeta> {
         // Does this cipher have any SSH key material?
         let has_native_key = dc
             .ssh_key
@@ -1080,7 +1045,7 @@ impl BitwardenBackend {
         Some(SshKeyMeta {
             item_id: dc.id.clone(),
             item_name: dc.name.clone(),
-            backend_id: backend_id.to_string(),
+            provider_id: provider_id.to_string(),
             public_key_openssh,
             fingerprint,
             ssh_hosts,
@@ -1092,11 +1057,7 @@ impl BitwardenBackend {
 }
 
 #[async_trait::async_trait]
-impl VaultBackend for BitwardenBackend {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
+impl Provider for BitwardenBackend {
     /// Returns the instance ID from config (e.g. `"personal"`, `"work"`).
     /// This is what distinguishes multiple Bitwarden accounts from each other.
     fn id(&self) -> &str {
@@ -1113,11 +1074,19 @@ impl VaultBackend for BitwardenBackend {
         "bitwarden"
     }
 
-    fn set_event_callbacks(&self, callbacks: BackendCallbacks) -> Result<(), BackendError> {
+    fn capabilities(&self) -> &'static [Capability] {
+        &[
+            Capability::Sync,
+            Capability::Ssh,
+            Capability::PasswordChange,
+        ]
+    }
+
+    fn set_event_callbacks(&self, callbacks: ProviderCallbacks) -> Result<(), ProviderError> {
         *self
             .callbacks
             .write()
-            .map_err(|_| BackendError::Other(anyhow::anyhow!("callbacks lock poisoned")))? =
+            .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))? =
             callbacks;
         Ok(())
     }
@@ -1158,21 +1127,21 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         Some(INFO)
     }
 
-    async fn status(&self) -> Result<BackendStatus, BackendError> {
+    async fn status(&self) -> Result<ProviderStatus, ProviderError> {
         let guard = self.state.lock().await;
         match &*guard {
-            Some(state) => Ok(BackendStatus {
+            Some(state) => Ok(ProviderStatus {
                 locked: false,
                 last_sync: state.vault.last_sync(),
             }),
-            None => Ok(BackendStatus {
+            None => Ok(ProviderStatus {
                 locked: true,
                 last_sync: None,
             }),
         }
     }
 
-    async fn unlock(&self, input: UnlockInput) -> Result<(), BackendError> {
+    async fn unlock(&self, input: UnlockInput) -> Result<(), ProviderError> {
         let (password, registration) = match input {
             UnlockInput::Password(p) => (p, None),
             UnlockInput::WithRegistration {
@@ -1186,13 +1155,13 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         if let Some(reg_fields) = registration {
             self.register_and_save(&password, reg_fields)
                 .await
-                .map_err(BackendError::from)?;
+                .map_err(ProviderError::from)?;
         }
 
         let auth_state = self
             .authenticate(&password, None)
             .await
-            .map_err(BackendError::from)?;
+            .map_err(ProviderError::from)?;
 
         let ciphers = auth_state.vault.ciphers().len();
 
@@ -1201,23 +1170,14 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         let notifications_handle = if self.config.realtime_sync {
             let access_token = auth_state.access_token.clone();
             let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(());
-            let on_sync_nudge = match self.on_sync_nudge.lock() {
-                Ok(guard) => guard.clone(),
-                Err(e) => {
-                    tracing::error!("on_sync_nudge mutex poisoned: {e}");
-                    return Err(BackendError::Other(anyhow::anyhow!(
-                        "on_sync_nudge mutex poisoned"
-                    )));
-                }
-            };
-            let on_lock_nudge = match self.on_lock_nudge.lock() {
-                Ok(guard) => guard.clone(),
-                Err(e) => {
-                    tracing::error!("on_lock_nudge mutex poisoned: {e}");
-                    return Err(BackendError::Other(anyhow::anyhow!(
-                        "on_lock_nudge mutex poisoned"
-                    )));
-                }
+            let (on_sync_nudge, on_lock_nudge) = {
+                let cb = self.callbacks.read().map_err(|_| {
+                    ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned"))
+                })?;
+                (
+                    cb.on_remote_sync_nudge.clone(),
+                    cb.on_remote_lock_nudge.clone(),
+                )
             };
             let task = notifications::start(NotificationsConfig {
                 notifications_url: self.api.notifications_url().to_string(),
@@ -1249,7 +1209,7 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         if let Some(f) = self
             .callbacks
             .read()
-            .map_err(|_| BackendError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
+            .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
             .on_unlocked
             .clone()
         {
@@ -1259,7 +1219,7 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         Ok(())
     }
 
-    async fn lock(&self) -> Result<(), BackendError> {
+    async fn lock(&self) -> Result<(), ProviderError> {
         // Stop the notifications task first (drop cancels it).
         let mut notif_guard = self.notifications.lock().await;
         *notif_guard = None;
@@ -1273,7 +1233,7 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         if let Some(f) = self
             .callbacks
             .read()
-            .map_err(|_| BackendError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
+            .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
             .on_locked
             .clone()
         {
@@ -1283,9 +1243,9 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         Ok(())
     }
 
-    async fn sync(&self) -> Result<(), BackendError> {
+    async fn sync(&self) -> Result<(), ProviderError> {
         let mut guard = self.state.lock().await;
-        let state = guard.as_mut().ok_or(BackendError::Locked)?;
+        let state = guard.as_mut().ok_or(ProviderError::Locked)?;
 
         // Snapshot cipher fingerprints before sync to detect material changes.
         let before: std::collections::HashSet<(String, Option<String>)> = state
@@ -1297,14 +1257,14 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
 
         let result = Self::resync(state, &self.api)
             .await
-            .map_err(BackendError::from);
+            .map_err(ProviderError::from);
 
         // Read callbacks before dropping the guard (we need `state` above).
         let (on_sync_succeeded, on_sync_failed) = {
             let cb = self
                 .callbacks
                 .read()
-                .map_err(|_| BackendError::Other(anyhow::anyhow!("callbacks lock poisoned")))?;
+                .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))?;
             (cb.on_sync_succeeded.clone(), cb.on_sync_failed.clone())
         };
         drop(guard);
@@ -1339,12 +1299,12 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         result
     }
 
-    async fn list_items(&self) -> Result<Vec<VaultItemMeta>, BackendError> {
+    async fn list_items(&self) -> Result<Vec<ItemMeta>, ProviderError> {
         let guard = self.state.lock().await;
-        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+        let state = guard.as_ref().ok_or(ProviderError::Locked)?;
         let backend_id = &self.config.id;
 
-        let items: Vec<VaultItemMeta> = state
+        let items: Vec<ItemMeta> = state
             .vault
             .ciphers()
             .iter()
@@ -1354,36 +1314,12 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         Ok(items)
     }
 
-    async fn get_item(&self, id: &str) -> Result<VaultItem, BackendError> {
+    async fn search(&self, attrs: &Attributes) -> Result<Vec<ItemMeta>, ProviderError> {
         let guard = self.state.lock().await;
-        let state = guard.as_ref().ok_or(BackendError::Locked)?;
-
-        let dc = state.vault.cipher_by_id(id).ok_or(BackendError::NotFound)?;
-
-        let secret = Self::get_primary_secret(dc);
-
-        Ok(VaultItem {
-            meta: Self::cipher_to_meta(&self.config.id, dc),
-            secret,
-        })
-    }
-
-    async fn get_secret(&self, id: &str) -> Result<SecretBytes, BackendError> {
-        let guard = self.state.lock().await;
-        let state = guard.as_ref().ok_or(BackendError::Locked)?;
-
-        let dc = state.vault.cipher_by_id(id).ok_or(BackendError::NotFound)?;
-
-        Self::get_primary_secret(dc)
-            .ok_or_else(|| BackendError::Other(anyhow::anyhow!("no secret for cipher {id}")))
-    }
-
-    async fn search(&self, attrs: &Attributes) -> Result<Vec<VaultItemMeta>, BackendError> {
-        let guard = self.state.lock().await;
-        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+        let state = guard.as_ref().ok_or(ProviderError::Locked)?;
         let backend_id = &self.config.id;
 
-        let items: Vec<VaultItemMeta> = state
+        let items: Vec<ItemMeta> = state
             .vault
             .ciphers()
             .iter()
@@ -1407,31 +1343,37 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         BITWARDEN_ATTRIBUTES
     }
 
-    async fn get_item_attributes(&self, id: &str) -> Result<ItemAttributes, BackendError> {
+    async fn get_item_attributes(&self, id: &str) -> Result<ItemAttributes, ProviderError> {
         let guard = self.state.lock().await;
-        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+        let state = guard.as_ref().ok_or(ProviderError::Locked)?;
 
-        let dc = state.vault.cipher_by_id(id).ok_or(BackendError::NotFound)?;
+        let dc = state
+            .vault
+            .cipher_by_id(id)
+            .ok_or(ProviderError::NotFound)?;
 
         Ok(Self::build_item_attributes(&self.config.id, dc))
     }
 
-    async fn get_secret_attr(&self, id: &str, attr: &str) -> Result<SecretBytes, BackendError> {
+    async fn get_secret_attr(&self, id: &str, attr: &str) -> Result<SecretBytes, ProviderError> {
         let guard = self.state.lock().await;
-        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+        let state = guard.as_ref().ok_or(ProviderError::Locked)?;
 
-        let dc = state.vault.cipher_by_id(id).ok_or(BackendError::NotFound)?;
+        let dc = state
+            .vault
+            .cipher_by_id(id)
+            .ok_or(ProviderError::NotFound)?;
 
-        Self::resolve_secret_attr(dc, attr).ok_or_else(|| BackendError::NotFound)
+        Self::resolve_secret_attr(dc, attr).ok_or_else(|| ProviderError::NotFound)
     }
 
     // -----------------------------------------------------------------------
     // SSH agent interface
     // -----------------------------------------------------------------------
 
-    async fn list_ssh_keys(&self) -> Result<Vec<SshKeyMeta>, BackendError> {
+    async fn list_ssh_keys(&self) -> Result<Vec<SshKeyMeta>, ProviderError> {
         let guard = self.state.lock().await;
-        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+        let state = guard.as_ref().ok_or(ProviderError::Locked)?;
         let backend_id = self.config.id.clone();
 
         let keys = state
@@ -1444,15 +1386,18 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
         Ok(keys)
     }
 
-    async fn get_ssh_private_key(&self, id: &str) -> Result<SshPrivateKeyMaterial, BackendError> {
+    async fn get_ssh_private_key(&self, id: &str) -> Result<SshPrivateKeyMaterial, ProviderError> {
         let guard = self.state.lock().await;
-        let state = guard.as_ref().ok_or(BackendError::Locked)?;
+        let state = guard.as_ref().ok_or(ProviderError::Locked)?;
 
-        let dc = state.vault.cipher_by_id(id).ok_or(BackendError::NotFound)?;
+        let dc = state
+            .vault
+            .cipher_by_id(id)
+            .ok_or(ProviderError::NotFound)?;
 
         Self::extract_pem(dc)
             .map(|pem| SshPrivateKeyMaterial { pem })
-            .ok_or(BackendError::NotFound)
+            .ok_or(ProviderError::NotFound)
     }
 }
 
@@ -1765,7 +1710,7 @@ mod tests {
 
         let meta = BitwardenBackend::cipher_to_meta("test-backend", &dc);
         assert_eq!(meta.id, "test-id-123");
-        assert_eq!(meta.backend_id, "test-backend");
+        assert_eq!(meta.provider_id, "test-backend");
         assert_eq!(meta.label, "Test Item");
         assert!(!meta.locked);
         assert_eq!(meta.attributes.get("type"), Some(&"login".to_string()));
@@ -2100,7 +2045,7 @@ mod tests {
             attrs.public.get("uri"),
             Some(&"https://example.com".to_string())
         );
-        assert_eq!(attrs.public.get("backend_id"), Some(&"bw".to_string()));
+        assert_eq!(attrs.public.get("provider_id"), Some(&"bw".to_string()));
         // Sensitive attrs must NOT be in public
         assert!(!attrs.public.contains_key("password"));
         assert!(!attrs.public.contains_key("totp"));

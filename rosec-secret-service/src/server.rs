@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rosec_core::VaultBackend;
+use rosec_core::Provider;
 use rosec_core::config::{Config, PromptConfig};
 use rosec_core::router::Router;
 use zbus::Connection;
@@ -35,20 +35,20 @@ impl Default for ObjectPaths {
 
 pub async fn register_objects(
     conn: &Connection,
-    backends: Vec<Arc<dyn VaultBackend>>,
+    backends: Vec<Arc<dyn Provider>>,
     router: Arc<Router>,
     sessions: Arc<SessionManager>,
 ) -> zbus::Result<Arc<ServiceState>> {
     register_objects_with_config(conn, backends, router, sessions, HashMap::new()).await
 }
 
-/// Like `register_objects`, but also accepts per-backend `return_attr` patterns
+/// Like `register_objects`, but also accepts per-provider `return_attr` patterns
 /// and `PromptConfig` from the config.
-/// `return_attr_map` maps backend ID → ordered glob patterns.
-/// Backends not present in the map fall back to the service-level default.
+/// `return_attr_map` maps provider ID → ordered glob patterns.
+/// Providers not present in the map fall back to the service-level default.
 pub async fn register_objects_with_config(
     conn: &Connection,
-    backends: Vec<Arc<dyn VaultBackend>>,
+    backends: Vec<Arc<dyn Provider>>,
     router: Arc<Router>,
     sessions: Arc<SessionManager>,
     return_attr_map: HashMap<String, Vec<String>>,
@@ -71,7 +71,7 @@ pub async fn register_objects_with_config(
 #[allow(clippy::too_many_arguments)]
 pub async fn register_objects_with_full_config(
     conn: &Connection,
-    backends: Vec<Arc<dyn VaultBackend>>,
+    backends: Vec<Arc<dyn Provider>>,
     router: Arc<Router>,
     sessions: Arc<SessionManager>,
     return_attr_map: HashMap<String, Vec<String>>,
@@ -81,8 +81,7 @@ pub async fn register_objects_with_full_config(
 ) -> zbus::Result<Arc<ServiceState>> {
     let paths = ObjectPaths::new();
     // Keep a reference to all backends for the CollectionState before consuming `backends`
-    let backends_for_collection: Vec<Arc<dyn VaultBackend>> =
-        backends.iter().map(Arc::clone).collect();
+    let backends_for_collection: Vec<Arc<dyn Provider>> = backends.iter().map(Arc::clone).collect();
     let tokio_handle = tokio::runtime::Handle::current();
     let sessions_clone = Arc::clone(&sessions);
     let tokio_handle_clone = tokio_handle.clone();

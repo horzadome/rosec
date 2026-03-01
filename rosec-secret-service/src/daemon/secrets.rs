@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rosec_core::BackendError;
+use rosec_core::ProviderError;
 use tracing::debug;
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
@@ -81,7 +81,7 @@ impl RosecSecrets {
             .run_on_tokio(async move { backend.get_secret_attr(&item_id, &attr_name).await })
             .await?
             .map_err(|e| match e {
-                BackendError::NotFound => {
+                ProviderError::NotFound => {
                     FdoError::Failed(format!("attribute '{attr_name_for_err}' not found"))
                 }
                 other => map_backend_error(other),

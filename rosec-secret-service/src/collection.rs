@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rosec_core::{NewItem, SecretBytes, VaultBackend, VaultItemMeta};
+use rosec_core::{ItemMeta, NewItem, Provider, SecretBytes};
 use tracing::info;
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
@@ -15,8 +15,8 @@ use crate::state::{ServiceState, map_backend_error};
 #[derive(Clone)]
 pub struct CollectionState {
     pub label: String,
-    pub items: Arc<Mutex<HashMap<String, VaultItemMeta>>>,
-    pub backends: Vec<Arc<dyn VaultBackend>>,
+    pub items: Arc<Mutex<HashMap<String, ItemMeta>>>,
+    pub backends: Vec<Arc<dyn Provider>>,
     pub service_state: Arc<ServiceState>,
     pub sessions: Arc<SessionManager>,
     pub tokio_handle: tokio::runtime::Handle,
@@ -142,9 +142,9 @@ impl SecretCollection {
 
         let item_path = format!("/org/freedesktop/secrets/item/{}/{}", backend_id, id);
 
-        let meta = rosec_core::VaultItemMeta {
+        let meta = rosec_core::ItemMeta {
             id: id.clone(),
-            backend_id: backend_id.clone(),
+            provider_id: backend_id.clone(),
             label: item.label.clone(),
             attributes: item.attributes.clone(),
             created: Some(std::time::SystemTime::now()),

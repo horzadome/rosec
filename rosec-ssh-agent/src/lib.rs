@@ -1,16 +1,16 @@
 //! SSH agent for rosec.
 //!
-//! Exposes SSH keys from unlocked vault backends over the standard OpenSSH
+//! Exposes SSH keys from unlocked providers over the standard OpenSSH
 //! agent protocol.  Backed by a shared [`KeyStore`] that `rosecd` populates
-//! and clears as backends are locked/unlocked.
+//! and clears as providers are locked/unlocked.
 //!
 //! # Architecture
 //!
 //! ```text
 //! rosecd  ─────── KeyStore (Arc<RwLock<…>>) ──────► SshAgent (listen)
 //!  │                   ▲                                   │
-//!  │  backend unlocked │                            UnixListener
-//!  └──────── populate_from_backends()                      │
+//!  │  provider unlocked │                            UnixListener
+//!  └──────── populate_from_providers()                      │
 //!                                                   per-connection
 //!                                              AgentSession (clone of store)
 //! ```

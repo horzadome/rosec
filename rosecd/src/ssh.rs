@@ -9,10 +9,10 @@
 //! 1. [`SshManager::start`] — allocates paths, starts the agent socket listener,
 //!    mounts the FUSE filesystem, returns the manager handle.
 //! 2. [`SshManager::rebuild`] — called after each sync / unlock event; fetches
-//!    all SSH keys from all provided backends, repopulates the key store, and
+//!    all SSH keys from all provided providers, repopulates the key store, and
 //!    refreshes the FUSE snapshot.
-//! 3. [`SshManager::remove_backend`] — called when a backend is locked or
-//!    removed; evicts that backend's keys from the store and refreshes FUSE.
+//! 3. [`SshManager::remove_provider`] — called when a provider is locked or
+//!    removed; evicts that provider's keys from the store and refreshes FUSE.
 //! 4. [`SshManager::clear`] — evicts all keys (called on global lock / shutdown).
 //! 5. Drop of [`SshManager`] unmounts the FUSE filesystem and closes the agent
 //!    socket (both handled by their respective RAII wrappers).
@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
 
-use rosec_core::VaultBackend;
+use rosec_core::Provider;
 use rosec_fuse::MountHandle;
 use rosec_ssh_agent::keystore::{KeyStore, build_entry};
 use rosec_ssh_agent::session::SshAgent;
@@ -108,53 +108,53 @@ impl SshManager {
         })
     }
 
-    /// Rebuild the key store from the given set of backends.
+    /// Rebuild the key store from the given set of providers.
     ///
-    /// For each backend that is unlocked:
+    /// For each provider that is unlocked:
     /// 1. Call `list_ssh_keys()` to discover available keys.
     /// 2. Call `get_ssh_private_key(item_id)` for each key.
     /// 3. Parse the PEM and build a [`KeyEntry`].
     ///
-    /// Keys from backends that are locked or that return errors are skipped
-    /// with a debug log.  After all backends are processed the FUSE snapshot
+    /// Keys from providers that are locked or that return errors are skipped
+    /// with a debug log.  After all providers are processed the FUSE snapshot
     /// is refreshed atomically.
-    pub async fn rebuild(&self, backends: &[Arc<dyn VaultBackend>]) {
+    pub async fn rebuild(&self, providers: &[Arc<dyn Provider>]) {
         let mut new_entries = Vec::new();
 
-        for backend in backends {
-            let backend_id = backend.id().to_string();
+        for provider in providers {
+            let provider_id = provider.id().to_string();
 
-            // Skip locked backends — no keys are available while locked.
-            let locked = match backend.status().await {
+            // Skip locked providers — no keys are available while locked.
+            let locked = match provider.status().await {
                 Ok(s) => s.locked,
                 Err(e) => {
-                    debug!(backend = %backend_id, error = %e, "ssh rebuild: status check failed, skipping");
+                    debug!(provider = %provider_id, error = %e, "ssh rebuild: status check failed, skipping");
                     continue;
                 }
             };
             if locked {
-                debug!(backend = %backend_id, "ssh rebuild: backend locked, skipping");
+                debug!(provider = %provider_id, "ssh rebuild: provider locked, skipping");
                 continue;
             }
 
             // Discover keys.
-            let metas = match backend.list_ssh_keys().await {
+            let metas = match provider.list_ssh_keys().await {
                 Ok(m) => m,
                 Err(e) => {
-                    debug!(backend = %backend_id, error = %e, "ssh rebuild: list_ssh_keys failed");
+                    debug!(provider = %provider_id, error = %e, "ssh rebuild: list_ssh_keys failed");
                     continue;
                 }
             };
 
-            debug!(backend = %backend_id, count = metas.len(), "ssh rebuild: discovered keys");
+            debug!(provider = %provider_id, count = metas.len(), "ssh rebuild: discovered keys");
 
             for meta in metas {
                 // Fetch private key material.
-                let material = match backend.get_ssh_private_key(&meta.item_id).await {
+                let material = match provider.get_ssh_private_key(&meta.item_id).await {
                     Ok(m) => m,
                     Err(e) => {
                         debug!(
-                            backend = %backend_id,
+                            provider = %provider_id,
                             item_id = %meta.item_id,
                             error = %e,
                             "ssh rebuild: get_ssh_private_key failed, skipping"
@@ -168,7 +168,7 @@ impl SshManager {
                     Ok(k) => k,
                     Err(e) => {
                         debug!(
-                            backend = %backend_id,
+                            provider = %provider_id,
                             item = %meta.item_name,
                             error = %e,
                             "ssh rebuild: PEM parse failed, skipping"
@@ -184,7 +184,7 @@ impl SshManager {
                 match build_entry(
                     private_key,
                     meta.item_name.clone(),
-                    backend_id.clone(),
+                    provider_id.clone(),
                     meta.ssh_hosts.clone(),
                     meta.ssh_user.clone(),
                     meta.require_confirm,
@@ -200,7 +200,7 @@ impl SshManager {
                     }
                     None => {
                         warn!(
-                            backend = %backend_id,
+                            provider = %provider_id,
                             item = %meta.item_name,
                             "ssh rebuild: failed to build key entry (serialisation error)"
                         );
@@ -231,14 +231,14 @@ impl SshManager {
         self.refresh_fuse();
     }
 
-    /// Remove all keys belonging to `backend_id` from the store and refresh FUSE.
+    /// Remove all keys belonging to `provider_id` from the store and refresh FUSE.
     ///
-    /// Called when a backend is locked or hot-removed.
-    pub fn remove_backend(&self, backend_id: &str) {
+    /// Called when a provider is locked or hot-removed.
+    pub fn remove_provider(&self, provider_id: &str) {
         match self.store.write() {
-            Ok(mut guard) => guard.remove_backend(backend_id),
+            Ok(mut guard) => guard.remove_provider(provider_id),
             Err(e) => {
-                warn!("SSH key store lock poisoned in remove_backend: {e}");
+                warn!("SSH key store lock poisoned in remove_provider: {e}");
                 return;
             }
         }

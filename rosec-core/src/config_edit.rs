@@ -1,7 +1,7 @@
 //! Structure-preserving edits to `config.toml`.
 //!
 //! Uses `toml_edit` so that existing comments, formatting, and unrelated
-//! sections are left untouched when adding or removing backend entries.
+//! sections are left untouched when adding or removing provider entries.
 
 use std::path::Path;
 
@@ -12,12 +12,16 @@ use toml_edit::{DocumentMut, Item, Table, value};
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Add a new `[[backend]]` entry to the config file.
+/// Add a new `[[provider]]` entry to the config file.
 ///
 /// `id` must be unique within the file; returns an error if it is already
-/// present.  `kind` is the backend type string (e.g. `"bitwarden"`).
-/// `options` is a list of `key=value` pairs stored under `[backend.options]`.
-pub fn add_backend(
+/// present.  `kind` is the provider type string (e.g. `"bitwarden"`,
+/// `"bitwarden-sm"`, `"local"`).
+///
+/// For `kind = "local"`, `path` should be provided as an option with key
+/// `"path"`.  The `"path"` and `"collection"` keys are written as top-level
+/// fields on the provider entry; all other options go under `[provider.options]`.
+pub fn add_provider(
     config_path: &Path,
     id: &str,
     kind: &str,
@@ -27,61 +31,76 @@ pub fn add_backend(
     let mut doc: DocumentMut = raw.parse().context("failed to parse config as TOML")?;
 
     // Reject duplicate IDs.
-    if backend_ids(&doc).any(|existing| existing == id) {
-        bail!("backend '{id}' already exists in {}", config_path.display());
+    if provider_ids(&doc).any(|existing| existing == id) {
+        bail!(
+            "provider '{id}' already exists in {}",
+            config_path.display()
+        );
     }
 
-    // Separate top-level fields ("collection") from backend options.
-    // "collection" is written as a top-level key, not inside [options].
+    // Top-level fields that go directly on the provider entry, not in [options].
+    const TOP_LEVEL_KEYS: &[&str] = &["collection", "path"];
+
     let collection: Option<&str> = options
         .iter()
         .find(|(k, _)| k == "collection")
         .map(|(_, v)| v.as_str());
-    let backend_options: Vec<_> = options.iter().filter(|(k, _)| k != "collection").collect();
+    let path: Option<&str> = options
+        .iter()
+        .find(|(k, _)| k == "path")
+        .map(|(_, v)| v.as_str());
+    let provider_options: Vec<_> = options
+        .iter()
+        .filter(|(k, _)| !TOP_LEVEL_KEYS.contains(&k.as_str()))
+        .collect();
 
     // Build the new table entry.
     let mut entry = Table::new();
     entry.set_implicit(false);
     entry["id"] = value(id);
-    entry["type"] = value(kind);
+    entry["kind"] = value(kind);
+
+    if let Some(p) = path {
+        entry["path"] = value(p);
+    }
 
     if let Some(col) = collection {
         entry["collection"] = value(col);
     }
 
-    if !backend_options.is_empty() {
+    if !provider_options.is_empty() {
         let mut opts = Table::new();
-        for (k, v) in &backend_options {
+        for (k, v) in &provider_options {
             opts[k.as_str()] = value(v.as_str());
         }
         entry["options"] = Item::Table(opts);
     }
 
-    // Append to the `backend` array-of-tables.
-    let backends = doc
-        .entry("backend")
+    // Append to the `provider` array-of-tables.
+    let providers = doc
+        .entry("provider")
         .or_insert_with(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
         .as_array_of_tables_mut()
-        .context("`backend` key is not an array-of-tables")?;
+        .context("`provider` key is not an array-of-tables")?;
 
-    backends.push(entry);
+    providers.push(entry);
 
     write_doc(config_path, &doc)
 }
 
-/// Remove a `[[backend]]` entry by id.
+/// Remove a `[[provider]]` entry by id.
 ///
 /// Returns an error if no entry with that id exists.
-pub fn remove_backend(config_path: &Path, id: &str) -> Result<()> {
+pub fn remove_provider(config_path: &Path, id: &str) -> Result<()> {
     let raw = read_or_empty(config_path)?;
     let mut doc: DocumentMut = raw.parse().context("failed to parse config as TOML")?;
-    remove_array_entry(&mut doc, "backend", id, config_path)?;
+    remove_array_entry(&mut doc, "provider", id, config_path)?;
     write_doc(config_path, &doc)
 }
 
-/// Return the known required option keys for a given backend type.
+/// Return the known required option keys for a given provider kind.
 ///
-/// Used by `rosec backend add` to prompt for missing options interactively.
+/// Used by `rosec provider add` to prompt for missing options interactively.
 pub fn required_options_for_kind(kind: &str) -> &'static [(&'static str, &'static str)] {
     match kind {
         "bitwarden" => &[("email", "Bitwarden account email")],
@@ -90,7 +109,7 @@ pub fn required_options_for_kind(kind: &str) -> &'static [(&'static str, &'stati
     }
 }
 
-/// Return the optional option keys for a given backend type.
+/// Return the optional option keys for a given provider kind.
 pub fn optional_options_for_kind(kind: &str) -> &'static [(&'static str, &'static str)] {
     match kind {
         "bitwarden" => &[
@@ -124,8 +143,8 @@ pub fn optional_options_for_kind(kind: &str) -> &'static [(&'static str, &'stati
     }
 }
 
-/// The list of backend type strings the daemon knows about.
-pub const KNOWN_KINDS: &[&str] = &["bitwarden", "bitwarden-sm"];
+/// The list of provider kind strings the daemon knows about.
+pub const KNOWN_KINDS: &[&str] = &["local", "bitwarden", "bitwarden-sm"];
 
 /// Set a single dotted-path value in the config file.
 ///
@@ -173,71 +192,21 @@ fn parse_toml_value(s: &str) -> Item {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Vault config editing
-// ---------------------------------------------------------------------------
-
-/// Add a new `[[vault]]` entry to the config file.
+/// Convenience wrapper: add a `kind = "local"` provider entry.
 ///
-/// `id` must be unique across both vaults and backends; returns an error if it
-/// is already present.  `path` is the on-disk vault file path.
-pub fn add_vault(
+/// This is a thin wrapper over [`add_provider`] that constructs the
+/// appropriate option list for a local vault.
+pub fn add_local_provider(
     config_path: &Path,
     id: &str,
     vault_path: &str,
     collection: Option<&str>,
 ) -> Result<()> {
-    let raw = read_or_empty(config_path)?;
-    let mut doc: DocumentMut = raw.parse().context("failed to parse config as TOML")?;
-
-    // Reject duplicate IDs (check both vaults and backends).
-    if vault_ids(&doc).any(|existing| existing == id) {
-        bail!("vault '{id}' already exists in {}", config_path.display());
-    }
-    if backend_ids(&doc).any(|existing| existing == id) {
-        bail!(
-            "a backend with id '{id}' already exists in {}",
-            config_path.display()
-        );
-    }
-
-    let mut entry = Table::new();
-    entry.set_implicit(false);
-    entry["id"] = value(id);
-    entry["path"] = value(vault_path);
-
+    let mut options: Vec<(String, String)> = vec![("path".into(), vault_path.into())];
     if let Some(col) = collection {
-        entry["collection"] = value(col);
+        options.push(("collection".into(), col.into()));
     }
-
-    let vaults = doc
-        .entry("vault")
-        .or_insert_with(|| Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
-        .as_array_of_tables_mut()
-        .context("`vault` key is not an array-of-tables")?;
-
-    vaults.push(entry);
-
-    write_doc(config_path, &doc)
-}
-
-/// Remove a `[[vault]]` entry by id.
-///
-/// Returns an error if no entry with that id exists.
-pub fn remove_vault(config_path: &Path, id: &str) -> Result<()> {
-    let raw = read_or_empty(config_path)?;
-    let mut doc: DocumentMut = raw.parse().context("failed to parse config as TOML")?;
-    remove_array_entry(&mut doc, "vault", id, config_path)?;
-    write_doc(config_path, &doc)
-}
-
-/// Iterate over the vault IDs present in a parsed config document.
-fn vault_ids(doc: &DocumentMut) -> impl Iterator<Item = &str> {
-    doc.get("vault")
-        .and_then(|item| item.as_array_of_tables())
-        .into_iter()
-        .flat_map(|aot| aot.iter())
-        .filter_map(|t| t.get("id")?.as_str())
+    add_provider(config_path, id, "local", &options)
 }
 
 // ---------------------------------------------------------------------------
@@ -330,8 +299,9 @@ fn write_doc(path: &Path, doc: &DocumentMut) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
-fn backend_ids(doc: &DocumentMut) -> impl Iterator<Item = &str> {
-    doc.get("backend")
+/// Iterate over the provider IDs present in a parsed config document.
+pub fn provider_ids(doc: &DocumentMut) -> impl Iterator<Item = &str> {
+    doc.get("provider")
         .and_then(|item| item.as_array_of_tables())
         .into_iter()
         .flat_map(|aot| aot.iter())
@@ -353,10 +323,10 @@ mod tests {
     }
 
     #[test]
-    fn add_backend_creates_file() {
+    fn add_provider_creates_file() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_backend(
+        add_provider(
             &path,
             "bw1",
             "bitwarden",
@@ -365,31 +335,31 @@ mod tests {
         .unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("id = \"bw1\""));
-        assert!(contents.contains("type = \"bitwarden\""));
+        assert!(contents.contains("kind = \"bitwarden\""));
         assert!(contents.contains("email = \"a@b.com\""));
     }
 
     #[test]
-    fn add_backend_rejects_duplicate_id() {
+    fn add_provider_rejects_duplicate_id() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_backend(&path, "bw1", "bitwarden", &[]).unwrap();
-        let err = add_backend(&path, "bw1", "bitwarden", &[]).unwrap_err();
+        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
+        let err = add_provider(&path, "bw1", "bitwarden", &[]).unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
 
     #[test]
-    fn add_multiple_backends_same_kind() {
+    fn add_multiple_providers_same_kind() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_backend(
+        add_provider(
             &path,
             "bw1",
             "bitwarden",
             &[("email".into(), "a@b.com".into())],
         )
         .unwrap();
-        add_backend(
+        add_provider(
             &path,
             "bw2",
             "bitwarden",
@@ -402,34 +372,34 @@ mod tests {
     }
 
     #[test]
-    fn remove_backend_by_id() {
+    fn remove_provider_by_id() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_backend(&path, "bw1", "bitwarden", &[]).unwrap();
-        add_backend(&path, "bw2", "bitwarden", &[]).unwrap();
-        remove_backend(&path, "bw1").unwrap();
+        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
+        add_provider(&path, "bw2", "bitwarden", &[]).unwrap();
+        remove_provider(&path, "bw1").unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(!contents.contains("id = \"bw1\""));
         assert!(contents.contains("id = \"bw2\""));
     }
 
     #[test]
-    fn remove_last_backend_cleans_key() {
+    fn remove_last_provider_cleans_key() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_backend(&path, "bw1", "bitwarden", &[]).unwrap();
-        remove_backend(&path, "bw1").unwrap();
+        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
+        remove_provider(&path, "bw1").unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(!contents.contains("bw1"));
-        assert!(!contents.contains("[[backend]]"));
+        assert!(!contents.contains("[[provider]]"));
     }
 
     #[test]
-    fn remove_nonexistent_backend_errors() {
+    fn remove_nonexistent_provider_errors() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        let err = remove_backend(&path, "ghost").unwrap_err();
-        assert!(err.to_string().contains("not found") || err.to_string().contains("no backends"));
+        let err = remove_provider(&path, "ghost").unwrap_err();
+        assert!(err.to_string().contains("not found") || err.to_string().contains("no providers"));
     }
 
     #[test]
@@ -441,7 +411,7 @@ mod tests {
             "# my comment\n[service]\ndedup_strategy = \"priority\"\n",
         )
         .unwrap();
-        add_backend(&path, "bw1", "bitwarden", &[]).unwrap();
+        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("# my comment"));
         assert!(contents.contains("dedup_strategy = \"priority\""));
@@ -449,14 +419,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Vault config editing tests
+    // Local provider (vault) config editing tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn add_vault_creates_file() {
+    fn add_local_provider_creates_file() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_vault(
+        add_local_provider(
             &path,
             "personal",
             "~/.local/share/rosec/vaults/personal.vault",
@@ -464,75 +434,76 @@ mod tests {
         )
         .unwrap();
         let contents = fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("[[vault]]"));
+        assert!(contents.contains("[[provider]]"));
         assert!(contents.contains("id = \"personal\""));
+        assert!(contents.contains("kind = \"local\""));
         assert!(contents.contains("path = \"~/.local/share/rosec/vaults/personal.vault\""));
     }
 
     #[test]
-    fn add_vault_with_collection() {
+    fn add_local_provider_with_collection() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_vault(&path, "work", "/mnt/work.vault", Some("work")).unwrap();
+        add_local_provider(&path, "work", "/mnt/work.vault", Some("work")).unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("collection = \"work\""));
     }
 
     #[test]
-    fn add_vault_rejects_duplicate_id() {
+    fn add_local_provider_rejects_duplicate_id() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_vault(&path, "v1", "/tmp/v1.vault", None).unwrap();
-        let err = add_vault(&path, "v1", "/tmp/v1b.vault", None).unwrap_err();
+        add_local_provider(&path, "v1", "/tmp/v1.vault", None).unwrap();
+        let err = add_local_provider(&path, "v1", "/tmp/v1b.vault", None).unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
 
     #[test]
-    fn add_vault_rejects_id_colliding_with_backend() {
+    fn add_local_provider_rejects_id_colliding_with_external() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_backend(&path, "shared-id", "bitwarden", &[]).unwrap();
-        let err = add_vault(&path, "shared-id", "/tmp/v.vault", None).unwrap_err();
+        add_provider(&path, "shared-id", "bitwarden", &[]).unwrap();
+        let err = add_local_provider(&path, "shared-id", "/tmp/v.vault", None).unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
 
     #[test]
-    fn remove_vault_by_id() {
+    fn remove_local_provider_by_id() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_vault(&path, "v1", "/tmp/v1.vault", None).unwrap();
-        add_vault(&path, "v2", "/tmp/v2.vault", None).unwrap();
-        remove_vault(&path, "v1").unwrap();
+        add_local_provider(&path, "v1", "/tmp/v1.vault", None).unwrap();
+        add_local_provider(&path, "v2", "/tmp/v2.vault", None).unwrap();
+        remove_provider(&path, "v1").unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(!contents.contains("id = \"v1\""));
         assert!(contents.contains("id = \"v2\""));
     }
 
     #[test]
-    fn remove_last_vault_cleans_key() {
+    fn remove_last_local_provider_cleans_key() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_vault(&path, "v1", "/tmp/v1.vault", None).unwrap();
-        remove_vault(&path, "v1").unwrap();
+        add_local_provider(&path, "v1", "/tmp/v1.vault", None).unwrap();
+        remove_provider(&path, "v1").unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(!contents.contains("v1"));
-        assert!(!contents.contains("[[vault]]"));
+        assert!(!contents.contains("[[provider]]"));
     }
 
     #[test]
-    fn remove_nonexistent_vault_errors() {
+    fn remove_nonexistent_local_provider_errors() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        let err = remove_vault(&path, "ghost").unwrap_err();
-        assert!(err.to_string().contains("not found") || err.to_string().contains("no vaults"));
+        let err = remove_provider(&path, "ghost").unwrap_err();
+        assert!(err.to_string().contains("not found") || err.to_string().contains("no providers"));
     }
 
     #[test]
-    fn mixed_vault_and_backend_preserved() {
+    fn mixed_local_and_external_providers_preserved() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_vault(&path, "local", "/tmp/local.vault", None).unwrap();
-        add_backend(
+        add_local_provider(&path, "local", "/tmp/local.vault", None).unwrap();
+        add_provider(
             &path,
             "bw1",
             "bitwarden",
@@ -540,16 +511,14 @@ mod tests {
         )
         .unwrap();
         let contents = fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("[[vault]]"));
-        assert!(contents.contains("[[backend]]"));
+        assert!(contents.contains("[[provider]]"));
         assert!(contents.contains("id = \"local\""));
         assert!(contents.contains("id = \"bw1\""));
 
-        // Remove the vault, backend should remain.
-        remove_vault(&path, "local").unwrap();
+        // Remove the local provider, external should remain.
+        remove_provider(&path, "local").unwrap();
         let contents = fs::read_to_string(&path).unwrap();
-        assert!(!contents.contains("[[vault]]"));
-        assert!(contents.contains("[[backend]]"));
+        assert!(contents.contains("[[provider]]"));
         assert!(contents.contains("id = \"bw1\""));
     }
 }

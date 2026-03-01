@@ -537,7 +537,7 @@ impl RosecManagement {
         self.state
             .run_on_tokio(async move {
                 backend
-                    .vault_add_password(&password, label)
+                    .add_password(&password, label)
                     .await
                     .map_err(|e| FdoError::Failed(format!("add_password failed: {e}")))
             })
@@ -564,7 +564,7 @@ impl RosecManagement {
         self.state
             .run_on_tokio(async move {
                 backend
-                    .vault_remove_password(&entry_id)
+                    .remove_password(&entry_id)
                     .await
                     .map_err(|e| FdoError::Failed(format!("remove_password failed: {e}")))
             })
@@ -591,7 +591,7 @@ impl RosecManagement {
             .state
             .run_on_tokio(async move {
                 backend
-                    .vault_list_passwords()
+                    .list_passwords()
                     .await
                     .map_err(|e| FdoError::Failed(format!("list_passwords failed: {e}")))
             })
