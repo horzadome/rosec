@@ -3435,7 +3435,6 @@ dependencies = [
  "futures-util",
  "libc",
  "rosec-core",
- "rosec-vault",
  "serde",
  "serde_json",
  "sha2",

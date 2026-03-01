@@ -9,7 +9,6 @@ use zbus::Connection;
 use zeroize::Zeroizing;
 use zvariant::{OwnedObjectPath, OwnedValue};
 
-use rosec_core::Provider as _;
 use rosec_core::config::Config;
 use rosec_core::config_edit;
 
@@ -59,7 +58,7 @@ COMMANDS:
     provider <subcommand>               Manage providers (alias: providers)
       list                              List all configured providers and their state
       add <kind> [options]              Add a provider to the config file
-      remove <id>                       Remove a provider from the config file
+      remove <id>                       Remove a provider (local vaults: offers to delete the file)
       attach --path <file> [--id <id>]  Attach an existing vault file to the config
       detach <id>                       Remove provider from config (file stays on disk)
       add-password <id>                 Add a new unlock password to a local vault provider
@@ -123,7 +122,7 @@ EXAMPLES:
     rosec provider add-password personal                    # add a second unlock password
     rosec provider remove-password personal <entry-id>      # remove a password
     rosec provider detach work                              # remove from config (file stays)
-    rosec provider remove old-vault                         # remove from config AND delete file
+    rosec provider remove old-vault                         # remove provider (prompts to delete vault file)
 
     rosec provider add bitwarden email=you@example.com      # ID auto-generated from email
     rosec provider add bitwarden-sm organization_id=uuid
@@ -231,10 +230,7 @@ SUBCOMMANDS:
     kinds                             List available provider kinds
     auth <id> [--force]               Authenticate/unlock a provider
     add <kind> [options]              Add a provider to config.toml
-    remove <id>                       Remove a provider from config.toml
-    create [--id <id>] [--path <p>] [--collection <c>]
-                                      Create a new local vault (prompts for password)
-    destroy <id>                      Remove provider from config AND delete the vault file
+    remove <id>                       Remove a provider (local vaults: offers to delete the file)
     attach --path <file> [--id <id>]  Attach an existing vault file to the config
     detach <id>                       Remove provider from config (file stays on disk)
     add-password <id> [--label <l>]   Add a new unlock password to a local vault provider
@@ -826,8 +822,6 @@ async fn cmd_provider(args: &[String]) -> Result<()> {
         "auth" => cmd_provider_auth(&args[1..]).await,
         "add" => cmd_provider_add(&args[1..]).await,
         "remove" | "rm" => cmd_provider_remove(&args[1..]).await,
-        "create" => cmd_provider_create(&args[1..]).await,
-        "destroy" => cmd_provider_destroy(&args[1..]).await,
         "attach" => cmd_provider_attach(&args[1..]).await,
         "detach" => cmd_provider_detach(&args[1..]).await,
         "add-password" => cmd_provider_add_password(&args[1..]).await,
@@ -991,8 +985,10 @@ async fn cmd_provider_add(args: &[String]) -> Result<()> {
         );
     }
 
-    // Parse --id <id> and key=value pairs from remaining args.
+    // Parse --id, --path, --collection flags and key=value pairs from remaining args.
     let mut custom_id: Option<String> = None;
+    let mut custom_path: Option<String> = None;
+    let mut collection: Option<String> = None;
     let mut options: Vec<(String, String)> = Vec::new();
     let mut i = 1usize;
     while i < args.len() {
@@ -1006,10 +1002,33 @@ async fn cmd_provider_add(args: &[String]) -> Result<()> {
             );
         } else if let Some(id_val) = arg.strip_prefix("--id=") {
             custom_id = Some(id_val.to_string());
+        } else if arg == "--path" {
+            i += 1;
+            custom_path = Some(
+                args.get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--path requires a value"))?
+                    .clone(),
+            );
+        } else if let Some(p) = arg.strip_prefix("--path=") {
+            custom_path = Some(p.to_string());
+        } else if arg == "--collection" {
+            i += 1;
+            collection = Some(
+                args.get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--collection requires a value"))?
+                    .clone(),
+            );
+        } else if let Some(c) = arg.strip_prefix("--collection=") {
+            collection = Some(c.to_string());
         } else if let Some((k, v)) = arg.split_once('=')
             && !k.starts_with("--config")
         {
-            options.push((k.to_string(), v.to_string()));
+            // Also capture path= and collection= as key=value syntax.
+            match k {
+                "path" => custom_path = Some(v.to_string()),
+                "collection" => collection = Some(v.to_string()),
+                _ => options.push((k.to_string(), v.to_string())),
+            }
         }
         i += 1;
     }
@@ -1056,6 +1075,44 @@ async fn cmd_provider_add(args: &[String]) -> Result<()> {
                 options.push((key.to_string(), s));
             }
         }
+    }
+
+    // Inject --path and --collection into options if they were supplied as flags.
+    if let Some(ref p) = custom_path {
+        options.push(("path".to_string(), p.clone()));
+    }
+    if let Some(ref c) = collection {
+        options.push(("collection".to_string(), c.clone()));
+    }
+
+    // For local vaults, ensure a path is present — derive one from the ID if
+    // the user did not supply an explicit --path or path= argument.
+    if kind == "local" && custom_path.is_none() {
+        let path = default_vault_path(&id);
+        options.push(("path".to_string(), path));
+    }
+
+    // Resolve the vault path for local providers so we can check for conflicts.
+    if kind == "local" {
+        let path_value = options
+            .iter()
+            .find(|(k, _)| k == "path")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let resolved = expand_tilde(path_value);
+        if std::path::Path::new(&resolved).exists() {
+            bail!(
+                "a vault file already exists at {resolved}\n\
+                 Use `rosec provider attach --path {resolved}` to attach an existing vault."
+            );
+        }
+    }
+
+    // Check for duplicate ID early (add_provider also checks, but this gives
+    // a friendlier message before we touch the config file).
+    let cfg_data = load_config();
+    if cfg_data.provider.iter().any(|p| p.id == id) {
+        bail!("provider '{id}' already exists. Use --id to choose a different name.");
     }
 
     let cfg = config_path();
@@ -1114,133 +1171,49 @@ fn derive_provider_id(kind: &str, options: &[(String, String)]) -> String {
 }
 
 /// `rosec provider remove <id>`
+///
+/// For external providers, removes the config entry.
+/// For local vaults, also offers to delete the vault file from disk.
 async fn cmd_provider_remove(args: &[String]) -> Result<()> {
     let id = args
         .first()
         .ok_or_else(|| anyhow::anyhow!("usage: rosec provider remove <id>"))?;
+
     let cfg = config_path();
+
+    // Check if this is a local vault with a path — if so, offer to delete the file.
+    let cfg_data = load_config();
+    let vault_path = cfg_data
+        .provider
+        .iter()
+        .find(|p| p.id == *id && p.kind == "local")
+        .and_then(|p| p.path.as_deref())
+        .map(expand_tilde);
+
     config_edit::remove_provider(&cfg, id)?;
     println!("Removed provider '{id}' from {}", cfg.display());
+
+    if let Some(ref path) = vault_path
+        && std::path::Path::new(path).exists()
+    {
+        let confirm = prompt_field(
+            &format!("Also delete the vault file at {path}? (yes/no)"),
+            "no",
+            "text",
+        )
+        .await?;
+        if confirm.as_str() == "yes" {
+            match std::fs::remove_file(path) {
+                Ok(()) => println!("Deleted vault file: {path}"),
+                Err(e) => eprintln!("warning: could not delete vault file {path}: {e}"),
+            }
+        } else {
+            println!("Vault file kept at {path}.");
+            println!("Use `rosec provider attach --path {path}` to re-attach later.");
+        }
+    }
+
     println!("rosecd will hot-reload the config automatically if it is running.");
-    Ok(())
-}
-
-/// `rosec provider create [--id <id>] [--path <path>] [--collection <c>]`
-///
-/// Creates a new vault file on disk and adds a `[[vault]]` entry to the config.
-/// Prompts for the initial password interactively.
-async fn cmd_provider_create(args: &[String]) -> Result<()> {
-    let mut custom_id: Option<String> = None;
-    let mut custom_path: Option<String> = None;
-    let mut collection: Option<String> = None;
-    let mut i = 0usize;
-
-    while i < args.len() {
-        let arg = &args[i];
-        match arg.as_str() {
-            "--id" => {
-                i += 1;
-                custom_id = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--id requires a value"))?
-                        .clone(),
-                );
-            }
-            a if a.starts_with("--id=") => {
-                custom_id = Some(a.strip_prefix("--id=").unwrap_or(a).to_string());
-            }
-            "--path" => {
-                i += 1;
-                custom_path = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--path requires a value"))?
-                        .clone(),
-                );
-            }
-            a if a.starts_with("--path=") => {
-                custom_path = Some(a.strip_prefix("--path=").unwrap_or(a).to_string());
-            }
-            "--collection" => {
-                i += 1;
-                collection = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--collection requires a value"))?
-                        .clone(),
-                );
-            }
-            a if a.starts_with("--collection=") => {
-                collection = Some(a.strip_prefix("--collection=").unwrap_or(a).to_string());
-            }
-            "--help" | "-h" => {
-                print_provider_help();
-                return Ok(());
-            }
-            other => bail!("unexpected argument: {other}"),
-        }
-        i += 1;
-    }
-
-    // Derive ID from path or generate a default.
-    let id = match custom_id {
-        Some(id) => id,
-        None => {
-            let v = prompt_field("Vault ID", "personal", "text").await?;
-            let s = v.as_str().to_string();
-            if s.is_empty() {
-                "personal".to_string()
-            } else {
-                s
-            }
-        }
-    };
-
-    // Derive path from ID or use custom.
-    let vault_path = match custom_path {
-        Some(p) => p,
-        None => default_vault_path(&id),
-    };
-
-    // Prompt for the initial vault password.
-    let pw = prompt_field("Vault password", "", "password").await?;
-    if pw.is_empty() {
-        bail!("password cannot be empty");
-    }
-    let pw_confirm = prompt_field("Confirm password", "", "password").await?;
-    if pw.as_str() != pw_confirm.as_str() {
-        bail!("passwords do not match");
-    }
-
-    // Create the vault file on disk.
-    let local_vault = rosec_vault::LocalVault::new(&id, &vault_path);
-    local_vault
-        .unlock(rosec_core::UnlockInput::Password(Zeroizing::new(
-            pw.as_str().to_string(),
-        )))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to create vault: {e}"))?;
-
-    // Add the vault to config.toml.
-    let cfg = config_path();
-    config_edit::add_local_provider(&cfg, &id, &vault_path, collection.as_deref())?;
-
-    println!("Created vault '{id}' at {vault_path}");
-    println!("Added to {}", cfg.display());
-
-    // If rosecd is running, wait for it to hot-reload the new vault then
-    // immediately kick off the auth flow so the user doesn't have to run
-    // `rosec provider auth <id>` manually as a separate step.
-    if let Some(proxy) = wait_for_daemon_reload(&id).await {
-        println!("rosecd picked up the new vault — starting authentication.");
-        let tty_fd = open_tty_owned_fd()?;
-        let _: () = proxy
-            .call("AuthProviderWithTty", &(id.as_str(), tty_fd))
-            .await?;
-        println!("Vault '{id}' authenticated.");
-    } else {
-        println!("rosecd will hot-reload the config automatically if it is running.");
-        println!("Run `rosec provider auth {id}` to authenticate.");
-    }
-
     Ok(())
 }
 
@@ -1330,62 +1303,8 @@ async fn cmd_provider_detach(args: &[String]) -> Result<()> {
     config_edit::remove_provider(&cfg, id)?;
     println!("Detached vault '{id}' from {}", cfg.display());
     println!(
-        "The vault file was NOT deleted. Use `rosec provider destroy` to also delete the file."
+        "The vault file was NOT deleted. Use `rosec provider remove` to also delete the file."
     );
-    println!("rosecd will hot-reload the config automatically if it is running.");
-    Ok(())
-}
-
-/// `rosec provider destroy <id>`
-///
-/// Removes the vault from the config AND deletes the vault file from disk.
-async fn cmd_provider_destroy(args: &[String]) -> Result<()> {
-    let id = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider destroy <id>"))?;
-
-    // Look up the path from config before removing the entry.
-    let cfg_data = load_config();
-    let vault_entry = cfg_data
-        .provider
-        .iter()
-        .find(|v| v.kind == "local" && v.id == *id)
-        .ok_or_else(|| anyhow::anyhow!("vault '{id}' not found in config"))?;
-    let vault_path = expand_tilde(
-        vault_entry
-            .path
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("vault '{id}' has no path configured"))?,
-    );
-
-    // Confirm destruction.
-    let confirm = prompt_field(
-        &format!("Destroy vault '{id}' and delete {vault_path}? (yes/no)"),
-        "",
-        "text",
-    )
-    .await?;
-    if confirm.as_str() != "yes" {
-        println!("Cancelled.");
-        return Ok(());
-    }
-
-    // Remove from config.
-    let cfg = config_path();
-    config_edit::remove_provider(&cfg, id)?;
-
-    // Delete the vault file.
-    match std::fs::remove_file(&vault_path) {
-        Ok(()) => println!("Deleted vault file: {vault_path}"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("Vault file already absent: {vault_path}");
-        }
-        Err(e) => {
-            eprintln!("warning: could not delete vault file {vault_path}: {e}");
-        }
-    }
-
-    println!("Removed vault '{id}' from {}", cfg.display());
     println!("rosecd will hot-reload the config automatically if it is running.");
     Ok(())
 }
