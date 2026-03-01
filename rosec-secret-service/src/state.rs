@@ -1894,18 +1894,18 @@ mod tests {
     use rosec_core::{ProviderStatus, SecretBytes, UnlockInput};
 
     #[derive(Debug)]
-    struct MockBackend {
+    struct MockProvider {
         items: Vec<ItemMeta>,
     }
 
-    impl MockBackend {
+    impl MockProvider {
         fn new(items: Vec<ItemMeta>) -> Self {
             Self { items }
         }
     }
 
     #[async_trait::async_trait]
-    impl Provider for MockBackend {
+    impl Provider for MockProvider {
         fn id(&self) -> &str {
             "mock"
         }
@@ -1987,7 +1987,7 @@ mod tests {
     }
 
     async fn new_state(items: Vec<ItemMeta>) -> Arc<ServiceState> {
-        let provider = Arc::new(MockBackend::new(items));
+        let provider = Arc::new(MockProvider::new(items));
         let router = Arc::new(Router::new(RouterConfig {
             dedup_strategy: rosec_core::DedupStrategy::Newest,
             dedup_time_fallback: rosec_core::DedupTimeFallback::Created,
@@ -2117,7 +2117,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_primary_secret_custom_pattern_selects_totp() {
         // Configure the state with totp as the first return_attr for "mock".
-        let provider = Arc::new(MockBackend::new(vec![meta("rich-item", "rich", false)]));
+        let provider = Arc::new(MockProvider::new(vec![meta("rich-item", "rich", false)]));
         let router = Arc::new(Router::new(RouterConfig {
             dedup_strategy: rosec_core::DedupStrategy::Newest,
             dedup_time_fallback: rosec_core::DedupTimeFallback::Created,

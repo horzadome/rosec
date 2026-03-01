@@ -22,7 +22,7 @@ use crate::vault::{CipherType, DecryptedCipher, DecryptedField, VaultState};
 // Attribute catalogue
 // ---------------------------------------------------------------------------
 
-/// Static catalogue of all attributes the Bitwarden backend can produce.
+/// Static catalogue of all attributes the Bitwarden provider can produce.
 ///
 /// Each entry documents whether the attribute is sensitive and which item
 /// types it applies to.  The service layer uses this for `return_attr` glob
@@ -266,7 +266,7 @@ impl BitwardenRegion {
     }
 }
 
-/// Configuration for the Bitwarden backend.
+/// Configuration for the Bitwarden provider.
 ///
 /// URL resolution priority (highest to lowest):
 /// 1. Both `api_url` **and** `identity_url` explicitly set — used directly.
@@ -275,8 +275,8 @@ impl BitwardenRegion {
 /// 4. Default — official US cloud.
 #[derive(Debug, Clone)]
 pub struct BitwardenConfig {
-    /// Unique instance identifier (from the `id` field in `[[backend]]` config).
-    /// Used as the D-Bus identity for this backend instance; allows multiple
+    /// Unique instance identifier (from the `id` field in `[[provider]]` config).
+    /// Used as the D-Bus identity for this provider instance; allows multiple
     /// Bitwarden accounts (e.g. `"personal"`, `"work"`) to coexist.
     pub id: String,
     /// User email address (required).
@@ -296,7 +296,7 @@ pub struct BitwardenConfig {
     pub identity_url: Option<String>,
     /// Enable real-time sync via SignalR WebSocket (default: `true`).
     ///
-    /// When `true`, the backend connects to the Bitwarden notifications hub
+    /// When `true`, the provider connects to the Bitwarden notifications hub
     /// (`/notifications/hub`) on unlock and listens for server-push events.
     /// On receiving a cipher-update or sync nudge, the `on_sync` callback is
     /// invoked.  Set to `false` to fall back to polling-only behaviour.
@@ -320,12 +320,12 @@ struct NotificationsHandle {
     _task: tokio::task::JoinHandle<()>,
 }
 
-/// Bitwarden vault backend for rosec.
+/// Bitwarden vault provider for rosec.
 ///
 /// Implements the `Provider` trait to provide read-only access to
 /// a Bitwarden vault. Authentication requires a master password provided
 /// via the `unlock` method.
-pub struct BitwardenBackend {
+pub struct BitwardenProvider {
     config: BitwardenConfig,
     api: ApiClient,
     state: Mutex<Option<AuthState>>,
@@ -343,9 +343,9 @@ struct AuthState {
     vault: VaultState,
 }
 
-impl std::fmt::Debug for BitwardenBackend {
+impl std::fmt::Debug for BitwardenProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BitwardenBackend")
+        f.debug_struct("BitwardenProvider")
             .field("id", &self.config.id)
             .field("email", &self.config.email)
             .field("region", &self.config.region)
@@ -354,8 +354,8 @@ impl std::fmt::Debug for BitwardenBackend {
     }
 }
 
-impl BitwardenBackend {
-    /// Create a new Bitwarden backend with the given configuration.
+impl BitwardenProvider {
+    /// Create a new Bitwarden provider with the given configuration.
     ///
     /// URL resolution priority:
     /// 1. Both `api_url` and `identity_url` set → use directly.
@@ -426,13 +426,13 @@ impl BitwardenBackend {
                 match oauth_cred::load_and_decrypt(&self.config.id, &master_key, email) {
                     Ok(Some(cred)) => {
                         info!(
-                            backend = %self.config.id,
+                            provider = %self.config.id,
                             "device not registered; attempting auto-registration with stored API key"
                         );
                         self.api
                             .register_device(email, &cred.client_id, &cred.client_secret)
                             .await?;
-                        info!(backend = %self.config.id, "device registered; retrying login");
+                        info!(provider = %self.config.id, "device registered; retrying login");
                         self.api.login_password(email, &hash_b64, None).await?
                     }
                     Ok(None) => {
@@ -447,14 +447,14 @@ impl BitwardenBackend {
                         // stale credential and fall through to registration so
                         // the client can re-prompt.
                         warn!(
-                            backend = %self.config.id,
+                            provider = %self.config.id,
                             error = %e,
                             "stored OAuth credential could not be decrypted \
                              (master password may have changed); removing stale credential"
                         );
                         if let Err(rm_err) = rosec_core::oauth::clear(&self.config.id) {
                             warn!(
-                                backend = %self.config.id,
+                                provider = %self.config.id,
                                 error = %rm_err,
                                 "failed to remove stale credential file"
                             );
@@ -524,7 +524,7 @@ impl BitwardenBackend {
         )?;
 
         info!(
-            "device registered and API key saved for backend '{}'",
+            "device registered and API key saved for provider '{}'",
             self.config.id
         );
         Ok(())
@@ -1057,7 +1057,7 @@ impl BitwardenBackend {
 }
 
 #[async_trait::async_trait]
-impl Provider for BitwardenBackend {
+impl Provider for BitwardenProvider {
     /// Returns the instance ID from config (e.g. `"personal"`, `"work"`).
     /// This is what distinguishes multiple Bitwarden accounts from each other.
     fn id(&self) -> &str {
@@ -1182,7 +1182,7 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
             let task = notifications::start(NotificationsConfig {
                 notifications_url: self.api.notifications_url().to_string(),
                 access_token,
-                backend_id: self.config.id.clone(),
+                provider_id: self.config.id.clone(),
                 on_sync_nudge,
                 on_lock_nudge,
                 cancel_rx,
@@ -1302,13 +1302,13 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
     async fn list_items(&self) -> Result<Vec<ItemMeta>, ProviderError> {
         let guard = self.state.lock().await;
         let state = guard.as_ref().ok_or(ProviderError::Locked)?;
-        let backend_id = &self.config.id;
+        let provider_id = &self.config.id;
 
         let items: Vec<ItemMeta> = state
             .vault
             .ciphers()
             .iter()
-            .map(|dc| Self::cipher_to_meta(backend_id, dc))
+            .map(|dc| Self::cipher_to_meta(provider_id, dc))
             .collect();
 
         Ok(items)
@@ -1317,14 +1317,14 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
     async fn search(&self, attrs: &Attributes) -> Result<Vec<ItemMeta>, ProviderError> {
         let guard = self.state.lock().await;
         let state = guard.as_ref().ok_or(ProviderError::Locked)?;
-        let backend_id = &self.config.id;
+        let provider_id = &self.config.id;
 
         let items: Vec<ItemMeta> = state
             .vault
             .ciphers()
             .iter()
             .filter_map(|dc| {
-                let meta = Self::cipher_to_meta(backend_id, dc);
+                let meta = Self::cipher_to_meta(provider_id, dc);
                 if attrs
                     .iter()
                     .all(|(key, value)| meta.attributes.get(key) == Some(value))
@@ -1374,13 +1374,13 @@ Find it at: Bitwarden web vault → Account Settings → Security → Keys → V
     async fn list_ssh_keys(&self) -> Result<Vec<SshKeyMeta>, ProviderError> {
         let guard = self.state.lock().await;
         let state = guard.as_ref().ok_or(ProviderError::Locked)?;
-        let backend_id = self.config.id.clone();
+        let provider_id = self.config.id.clone();
 
         let keys = state
             .vault
             .ciphers()
             .iter()
-            .filter_map(|dc| Self::cipher_to_ssh_key_meta(&backend_id, dc))
+            .filter_map(|dc| Self::cipher_to_ssh_key_meta(&provider_id, dc))
             .collect();
 
         Ok(keys)
@@ -1524,7 +1524,7 @@ mod tests {
         assert_eq!(BitwardenRegion::parse(""), None);
     }
 
-    // --- URL resolution via BitwardenBackend::new ---
+    // --- URL resolution via BitwardenProvider::new ---
 
     fn make_config(id: &str, email: &str) -> BitwardenConfig {
         BitwardenConfig {
@@ -1542,20 +1542,20 @@ mod tests {
     #[test]
     fn url_resolution_default_is_us() {
         // No region/base_url/explicit URLs → official US cloud
-        let backend = BitwardenBackend::new(make_config("personal", "a@b.com")).unwrap();
+        let provider = BitwardenProvider::new(make_config("personal", "a@b.com")).unwrap();
         // We can't inspect private fields directly, but we can verify it constructs without error.
         // The URL used is validated indirectly by other tests; just confirm construction succeeds.
-        assert_eq!(backend.id(), "personal");
-        assert_eq!(backend.name(), "a@b.com");
-        assert_eq!(backend.kind(), "bitwarden");
+        assert_eq!(provider.id(), "personal");
+        assert_eq!(provider.name(), "a@b.com");
+        assert_eq!(provider.kind(), "bitwarden");
     }
 
     #[test]
     fn url_resolution_eu_region() {
         let mut config = make_config("work-eu", "b@c.com");
         config.region = Some(BitwardenRegion::Eu);
-        let backend = BitwardenBackend::new(config).unwrap();
-        assert_eq!(backend.id(), "work-eu");
+        let provider = BitwardenProvider::new(config).unwrap();
+        assert_eq!(provider.id(), "work-eu");
     }
 
     #[test]
@@ -1563,8 +1563,8 @@ mod tests {
         let mut config = make_config("selfhosted", "c@d.com");
         config.region = Some(BitwardenRegion::Eu); // should be ignored
         config.base_url = Some("https://vault.example.com".to_string());
-        let backend = BitwardenBackend::new(config).unwrap();
-        assert_eq!(backend.id(), "selfhosted");
+        let provider = BitwardenProvider::new(config).unwrap();
+        assert_eq!(provider.id(), "selfhosted");
     }
 
     #[test]
@@ -1574,8 +1574,8 @@ mod tests {
         config.base_url = Some("https://vault.example.com".to_string()); // ignored
         config.api_url = Some("https://api.custom.example.com".to_string());
         config.identity_url = Some("https://identity.custom.example.com".to_string());
-        let backend = BitwardenBackend::new(config).unwrap();
-        assert_eq!(backend.id(), "custom");
+        let provider = BitwardenProvider::new(config).unwrap();
+        assert_eq!(provider.id(), "custom");
     }
 
     #[test]
@@ -1585,14 +1585,14 @@ mod tests {
         config.base_url = Some("https://vault.example.com".to_string());
         config.api_url = Some("https://api.custom.example.com".to_string());
         // identity_url is None → explicit pair incomplete → uses base_url
-        let backend = BitwardenBackend::new(config).unwrap();
-        assert_eq!(backend.id(), "partial");
+        let provider = BitwardenProvider::new(config).unwrap();
+        assert_eq!(provider.id(), "partial");
     }
 
     #[test]
     fn multiple_instances_have_distinct_ids() {
-        let b1 = BitwardenBackend::new(make_config("personal", "alice@example.com")).unwrap();
-        let b2 = BitwardenBackend::new(make_config("work", "alice@corp.com")).unwrap();
+        let b1 = BitwardenProvider::new(make_config("personal", "alice@example.com")).unwrap();
+        let b2 = BitwardenProvider::new(make_config("work", "alice@corp.com")).unwrap();
         assert_ne!(b1.id(), b2.id());
         assert_eq!(b1.id(), "personal");
         assert_eq!(b2.id(), "work");
@@ -1708,7 +1708,7 @@ mod tests {
             uris: vec!["https://example.com".to_string()],
         });
 
-        let meta = BitwardenBackend::cipher_to_meta("test-backend", &dc);
+        let meta = BitwardenProvider::cipher_to_meta("test-backend", &dc);
         assert_eq!(meta.id, "test-id-123");
         assert_eq!(meta.provider_id, "test-backend");
         assert_eq!(meta.label, "Test Item");
@@ -1730,7 +1730,7 @@ mod tests {
     #[test]
     fn cipher_to_meta_secure_note_schema() {
         let dc = make_cipher(CipherType::SecureNote);
-        let meta = BitwardenBackend::cipher_to_meta("test-backend", &dc);
+        let meta = BitwardenProvider::cipher_to_meta("test-backend", &dc);
         assert_eq!(
             meta.attributes.get("xdg:schema"),
             Some(&"org.freedesktop.Secret.Note".to_string())
@@ -1750,7 +1750,7 @@ mod tests {
             code: Some(Zeroizing::new("123".to_string())),
         });
 
-        let meta = BitwardenBackend::cipher_to_meta("test-backend", &dc);
+        let meta = BitwardenProvider::cipher_to_meta("test-backend", &dc);
         assert_eq!(meta.attributes.get("type"), Some(&"card".to_string()));
         // brand is public
         assert_eq!(meta.attributes.get("brand"), Some(&"Visa".to_string()));
@@ -1769,7 +1769,7 @@ mod tests {
         dc.folder_name = Some("Work".to_string());
         dc.organization_id = Some("org-abc".to_string());
 
-        let meta = BitwardenBackend::cipher_to_meta("test-backend", &dc);
+        let meta = BitwardenProvider::cipher_to_meta("test-backend", &dc);
         assert_eq!(meta.attributes.get("folder"), Some(&"Work".to_string()));
         assert_eq!(meta.attributes.get("org_id"), Some(&"org-abc".to_string()));
     }
@@ -1795,7 +1795,7 @@ mod tests {
             },
         ];
 
-        let meta = BitwardenBackend::cipher_to_meta("test-backend", &dc);
+        let meta = BitwardenProvider::cipher_to_meta("test-backend", &dc);
         // Text fields exposed with custom. prefix
         assert_eq!(
             meta.attributes.get("custom.api_key_label"),
@@ -1820,7 +1820,7 @@ mod tests {
         dc.creation_date = None;
         dc.revision_date = None;
 
-        let meta = BitwardenBackend::cipher_to_meta("test-backend", &dc);
+        let meta = BitwardenProvider::cipher_to_meta("test-backend", &dc);
         assert!(meta.created.is_none());
         assert!(meta.modified.is_none());
     }
@@ -1837,7 +1837,7 @@ mod tests {
             uris: Vec::new(),
         });
 
-        let secret = BitwardenBackend::get_primary_secret(&dc);
+        let secret = BitwardenProvider::get_primary_secret(&dc);
         assert!(secret.is_some());
         assert_eq!(secret.unwrap().as_slice(), b"my-password");
     }
@@ -1852,7 +1852,7 @@ mod tests {
             uris: Vec::new(),
         });
 
-        assert!(BitwardenBackend::get_primary_secret(&dc).is_none());
+        assert!(BitwardenProvider::get_primary_secret(&dc).is_none());
     }
 
     #[test]
@@ -1860,7 +1860,7 @@ mod tests {
         let mut dc = make_cipher(CipherType::SecureNote);
         dc.notes = Some(Zeroizing::new("my secret note".to_string()));
 
-        let secret = BitwardenBackend::get_primary_secret(&dc);
+        let secret = BitwardenProvider::get_primary_secret(&dc);
         assert!(secret.is_some());
         assert_eq!(secret.unwrap().as_slice(), b"my secret note");
     }
@@ -1877,7 +1877,7 @@ mod tests {
             code: None,
         });
 
-        let secret = BitwardenBackend::get_primary_secret(&dc);
+        let secret = BitwardenProvider::get_primary_secret(&dc);
         assert!(secret.is_some());
         assert_eq!(secret.unwrap().as_slice(), b"4111111111111111");
     }
@@ -1893,7 +1893,7 @@ mod tests {
             fingerprint: None,
         });
 
-        let secret = BitwardenBackend::get_primary_secret(&dc);
+        let secret = BitwardenProvider::get_primary_secret(&dc);
         assert!(secret.is_some());
         assert_eq!(
             secret.unwrap().as_slice(),
@@ -1911,7 +1911,7 @@ mod tests {
         });
         dc.notes = Some(Zeroizing::new("fallback note".to_string()));
 
-        let secret = BitwardenBackend::get_primary_secret(&dc);
+        let secret = BitwardenProvider::get_primary_secret(&dc);
         assert!(secret.is_some());
         assert_eq!(secret.unwrap().as_slice(), b"fallback note");
     }
@@ -1921,7 +1921,7 @@ mod tests {
         let mut dc = make_cipher(CipherType::Identity);
         dc.notes = Some(Zeroizing::new("identity notes".to_string()));
 
-        let secret = BitwardenBackend::get_primary_secret(&dc);
+        let secret = BitwardenProvider::get_primary_secret(&dc);
         assert!(secret.is_some());
         assert_eq!(secret.unwrap().as_slice(), b"identity notes");
     }
@@ -1930,7 +1930,7 @@ mod tests {
     fn get_primary_secret_none_when_empty() {
         let dc = make_cipher(CipherType::Login);
         // No login data at all
-        assert!(BitwardenBackend::get_primary_secret(&dc).is_none());
+        assert!(BitwardenProvider::get_primary_secret(&dc).is_none());
     }
 
     #[test]
@@ -1943,7 +1943,7 @@ mod tests {
             uris: Vec::new(),
         });
 
-        let secret = BitwardenBackend::get_primary_secret(&dc);
+        let secret = BitwardenProvider::get_primary_secret(&dc);
         assert!(secret.is_some());
         assert_eq!(secret.unwrap().as_slice(), b"otpauth://totp/test");
     }
@@ -1959,7 +1959,7 @@ mod tests {
         });
         dc.notes = Some(Zeroizing::new("login notes fallback".to_string()));
 
-        let secret = BitwardenBackend::get_primary_secret(&dc);
+        let secret = BitwardenProvider::get_primary_secret(&dc);
         assert!(secret.is_some());
         assert_eq!(secret.unwrap().as_slice(), b"login notes fallback");
     }
@@ -1975,7 +1975,7 @@ mod tests {
         });
         dc.notes = Some(Zeroizing::new("the-notes".to_string()));
 
-        let secret = BitwardenBackend::get_primary_secret(&dc);
+        let secret = BitwardenProvider::get_primary_secret(&dc);
         assert!(secret.is_some());
         assert_eq!(secret.unwrap().as_slice(), b"the-password");
     }
@@ -2036,7 +2036,7 @@ mod tests {
         });
         dc.notes = Some(Zeroizing::new("some notes".to_string()));
 
-        let attrs = BitwardenBackend::build_item_attributes("bw", &dc);
+        let attrs = BitwardenProvider::build_item_attributes("bw", &dc);
 
         // Public attrs
         assert_eq!(attrs.public.get("type"), Some(&"login".to_string()));
@@ -2069,7 +2069,7 @@ mod tests {
             uris: Vec::new(),
         });
 
-        let attrs = BitwardenBackend::build_item_attributes("bw", &dc);
+        let attrs = BitwardenProvider::build_item_attributes("bw", &dc);
         assert_eq!(attrs.public.get("type"), Some(&"login".to_string()));
         assert!(!attrs.public.contains_key("username"));
         assert!(!attrs.public.contains_key("uri"));
@@ -2088,7 +2088,7 @@ mod tests {
             code: Some(Zeroizing::new("123".to_string())),
         });
 
-        let attrs = BitwardenBackend::build_item_attributes("bw", &dc);
+        let attrs = BitwardenProvider::build_item_attributes("bw", &dc);
 
         // brand is public
         assert_eq!(attrs.public.get("brand"), Some(&"Visa".to_string()));
@@ -2117,7 +2117,7 @@ mod tests {
             fingerprint: Some("SHA256:abc123".to_string()),
         });
 
-        let attrs = BitwardenBackend::build_item_attributes("bw", &dc);
+        let attrs = BitwardenProvider::build_item_attributes("bw", &dc);
 
         // public_key and fingerprint are public
         assert_eq!(
@@ -2157,7 +2157,7 @@ mod tests {
             country: Some(Zeroizing::new("US".to_string())),
         });
 
-        let attrs = BitwardenBackend::build_item_attributes("bw", &dc);
+        let attrs = BitwardenProvider::build_item_attributes("bw", &dc);
 
         // ALL identity fields are sensitive — none in public
         assert!(!attrs.public.contains_key("title"));
@@ -2201,7 +2201,7 @@ mod tests {
         let mut dc = make_cipher(CipherType::SecureNote);
         dc.notes = Some(Zeroizing::new("my secret note".to_string()));
 
-        let attrs = BitwardenBackend::build_item_attributes("bw", &dc);
+        let attrs = BitwardenProvider::build_item_attributes("bw", &dc);
 
         assert_eq!(
             attrs.public.get("xdg:schema"),
@@ -2238,7 +2238,7 @@ mod tests {
             },
         ];
 
-        let attrs = BitwardenBackend::build_item_attributes("bw", &dc);
+        let attrs = BitwardenProvider::build_item_attributes("bw", &dc);
 
         // Text field → public
         assert_eq!(
@@ -2268,7 +2268,7 @@ mod tests {
         dc.organization_id = Some("org-abc".to_string());
         dc.organization_name = Some("Acme Corp".to_string());
 
-        let attrs = BitwardenBackend::build_item_attributes("bw", &dc);
+        let attrs = BitwardenProvider::build_item_attributes("bw", &dc);
         assert_eq!(attrs.public.get("folder"), Some(&"Work".to_string()));
         assert_eq!(attrs.public.get("org_id"), Some(&"org-abc".to_string()));
         assert_eq!(attrs.public.get("org"), Some(&"Acme Corp".to_string()));
@@ -2281,7 +2281,7 @@ mod tests {
         let mut dc = make_cipher(CipherType::Login);
         dc.notes = Some(Zeroizing::new("my notes".to_string()));
 
-        let result = BitwardenBackend::resolve_secret_attr(&dc, "notes");
+        let result = BitwardenProvider::resolve_secret_attr(&dc, "notes");
         assert!(result.is_some());
         assert_eq!(result.unwrap().as_slice(), b"my notes");
     }
@@ -2289,7 +2289,7 @@ mod tests {
     #[test]
     fn resolve_secret_attr_notes_missing() {
         let dc = make_cipher(CipherType::Login);
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "notes").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "notes").is_none());
     }
 
     #[test]
@@ -2302,7 +2302,7 @@ mod tests {
             uris: Vec::new(),
         });
 
-        let result = BitwardenBackend::resolve_secret_attr(&dc, "password");
+        let result = BitwardenProvider::resolve_secret_attr(&dc, "password");
         assert_eq!(result.unwrap().as_slice(), b"pw123");
     }
 
@@ -2316,7 +2316,7 @@ mod tests {
             uris: Vec::new(),
         });
 
-        let result = BitwardenBackend::resolve_secret_attr(&dc, "totp");
+        let result = BitwardenProvider::resolve_secret_attr(&dc, "totp");
         assert_eq!(result.unwrap().as_slice(), b"otpauth://totp/test");
     }
 
@@ -2331,7 +2331,7 @@ mod tests {
             uris: Vec::new(),
         });
 
-        let result = BitwardenBackend::resolve_secret_attr(&dc, "username");
+        let result = BitwardenProvider::resolve_secret_attr(&dc, "username");
         assert_eq!(result.unwrap().as_slice(), b"alice");
     }
 
@@ -2345,8 +2345,8 @@ mod tests {
             uris: Vec::new(),
         });
 
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "number").is_none());
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "bogus").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "number").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "bogus").is_none());
     }
 
     #[test]
@@ -2362,37 +2362,37 @@ mod tests {
         });
 
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "cardholder")
+            BitwardenProvider::resolve_secret_attr(&dc, "cardholder")
                 .unwrap()
                 .as_slice(),
             b"Jane Doe"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "number")
+            BitwardenProvider::resolve_secret_attr(&dc, "number")
                 .unwrap()
                 .as_slice(),
             b"4111111111111111"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "exp_month")
+            BitwardenProvider::resolve_secret_attr(&dc, "exp_month")
                 .unwrap()
                 .as_slice(),
             b"06"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "exp_year")
+            BitwardenProvider::resolve_secret_attr(&dc, "exp_year")
                 .unwrap()
                 .as_slice(),
             b"2030"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "code")
+            BitwardenProvider::resolve_secret_attr(&dc, "code")
                 .unwrap()
                 .as_slice(),
             b"999"
         );
         // brand is not a secret attr (public only)
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "brand").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "brand").is_none());
     }
 
     #[test]
@@ -2407,14 +2407,14 @@ mod tests {
         });
 
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "private_key")
+            BitwardenProvider::resolve_secret_attr(&dc, "private_key")
                 .unwrap()
                 .as_slice(),
             b"-----BEGIN OPENSSH PRIVATE KEY-----"
         );
         // public_key and fingerprint are not secret attrs
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "public_key").is_none());
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "fingerprint").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "public_key").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "fingerprint").is_none());
     }
 
     #[test]
@@ -2443,62 +2443,62 @@ mod tests {
 
         // Spot-check several identity PII fields
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "title")
+            BitwardenProvider::resolve_secret_attr(&dc, "title")
                 .unwrap()
                 .as_slice(),
             b"Dr"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "first_name")
+            BitwardenProvider::resolve_secret_attr(&dc, "first_name")
                 .unwrap()
                 .as_slice(),
             b"Alice"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "middle_name")
+            BitwardenProvider::resolve_secret_attr(&dc, "middle_name")
                 .unwrap()
                 .as_slice(),
             b"B"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "ssn")
+            BitwardenProvider::resolve_secret_attr(&dc, "ssn")
                 .unwrap()
                 .as_slice(),
             b"987-65-4321"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "passport_number")
+            BitwardenProvider::resolve_secret_attr(&dc, "passport_number")
                 .unwrap()
                 .as_slice(),
             b"AB123456"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "license_number")
+            BitwardenProvider::resolve_secret_attr(&dc, "license_number")
                 .unwrap()
                 .as_slice(),
             b"DL-789"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "address1")
+            BitwardenProvider::resolve_secret_attr(&dc, "address1")
                 .unwrap()
                 .as_slice(),
             b"456 Oak Ave"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "address2")
+            BitwardenProvider::resolve_secret_attr(&dc, "address2")
                 .unwrap()
                 .as_slice(),
             b"Suite 100"
         );
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "address3").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "address3").is_none());
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "city")
+            BitwardenProvider::resolve_secret_attr(&dc, "city")
                 .unwrap()
                 .as_slice(),
             b"Portland"
         );
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "country")
+            BitwardenProvider::resolve_secret_attr(&dc, "country")
                 .unwrap()
                 .as_slice(),
             b"US"
@@ -2511,13 +2511,13 @@ mod tests {
         dc.notes = Some(Zeroizing::new("top secret".to_string()));
 
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "notes")
+            BitwardenProvider::resolve_secret_attr(&dc, "notes")
                 .unwrap()
                 .as_slice(),
             b"top secret"
         );
         // No other attrs for secure notes
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "password").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "password").is_none());
     }
 
     #[test]
@@ -2538,22 +2538,22 @@ mod tests {
 
         // Text custom field — resolve by custom. prefix
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "custom.api_key")
+            BitwardenProvider::resolve_secret_attr(&dc, "custom.api_key")
                 .unwrap()
                 .as_slice(),
             b"text-val"
         );
         // Hidden custom field — also resolvable
         assert_eq!(
-            BitwardenBackend::resolve_secret_attr(&dc, "custom.secret_token")
+            BitwardenProvider::resolve_secret_attr(&dc, "custom.secret_token")
                 .unwrap()
                 .as_slice(),
             b"hidden-val"
         );
         // Non-existent custom field
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "custom.nope").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "custom.nope").is_none());
         // Bare name (without custom. prefix) should not resolve as custom
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "api_key").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "api_key").is_none());
     }
 
     #[test]
@@ -2569,8 +2569,8 @@ mod tests {
             code: None,
         });
 
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "password").is_none());
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "totp").is_none());
-        assert!(BitwardenBackend::resolve_secret_attr(&dc, "private_key").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "password").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "totp").is_none());
+        assert!(BitwardenProvider::resolve_secret_attr(&dc, "private_key").is_none());
     }
 }

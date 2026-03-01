@@ -271,7 +271,7 @@ impl Provider for LocalVault {
         let mut guard = self.state.write().await;
 
         if guard.is_some() {
-            debug!("backend already unlocked");
+            debug!("provider already unlocked");
             return Ok(());
         }
 
@@ -296,7 +296,7 @@ impl Provider for LocalVault {
             dirty: false,
         });
 
-        info!("backend unlocked");
+        info!("provider unlocked");
 
         let callbacks = self
             .callbacks
@@ -318,7 +318,7 @@ impl Provider for LocalVault {
         }
 
         *guard = None;
-        info!("backend locked");
+        info!("provider locked");
 
         let callbacks = self
             .callbacks
@@ -674,12 +674,12 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    fn create_test_backend() -> (LocalVault, NamedTempFile) {
+    fn create_test_provider() -> (LocalVault, NamedTempFile) {
         let temp = NamedTempFile::new().unwrap();
         let path = temp.path().to_path_buf();
         std::fs::remove_file(&path).unwrap();
-        let backend = LocalVault::new("test", path);
-        (backend, temp)
+        let provider = LocalVault::new("test", path);
+        (provider, temp)
     }
 
     #[tokio::test]
@@ -687,8 +687,8 @@ mod tests {
         let temp = NamedTempFile::new().unwrap();
         std::fs::remove_file(temp.path()).unwrap();
 
-        let backend = LocalVault::new("test", temp.path());
-        let result = backend
+        let provider = LocalVault::new("test", temp.path());
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "password".to_string(),
             )))
@@ -700,8 +700,8 @@ mod tests {
 
     #[tokio::test]
     async fn unlock_fails_with_empty_password() {
-        let (backend, _temp) = create_test_backend();
-        let result = backend
+        let (provider, _temp) = create_test_provider();
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new(String::new())))
             .await;
 
@@ -710,22 +710,22 @@ mod tests {
 
     #[tokio::test]
     async fn list_items_returns_empty_when_no_items() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "password".to_string(),
             )))
             .await
             .unwrap();
 
-        let items = backend.list_items().await.unwrap();
+        let items = provider.list_items().await.unwrap();
         assert!(items.is_empty());
     }
 
     #[tokio::test]
     async fn create_and_get_item() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "password".to_string(),
             )))
@@ -741,10 +741,10 @@ mod tests {
             secrets,
         };
 
-        let id = backend.create_item(item, false).await.unwrap();
+        let id = provider.create_item(item, false).await.unwrap();
 
-        let attrs = backend.get_item_attributes(&id).await.unwrap();
-        let items = backend.list_items().await.unwrap();
+        let attrs = provider.get_item_attributes(&id).await.unwrap();
+        let items = provider.list_items().await.unwrap();
         let meta = items.iter().find(|m| m.id == id).unwrap();
         assert_eq!(meta.label, "Test Item");
         assert!(attrs.secret_names.contains(&"secret".to_string()));
@@ -752,8 +752,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_item_already_exists() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "password".to_string(),
             )))
@@ -772,7 +772,7 @@ mod tests {
             secrets: secrets.clone(),
         };
 
-        backend.create_item(item, false).await.unwrap();
+        provider.create_item(item, false).await.unwrap();
 
         let item2 = NewItem {
             label: "Test2".to_string(),
@@ -780,14 +780,14 @@ mod tests {
             secrets,
         };
 
-        let result = backend.create_item(item2, false).await;
+        let result = provider.create_item(item2, false).await;
         assert!(matches!(result, Err(ProviderError::AlreadyExists)));
     }
 
     #[tokio::test]
     async fn create_item_replace() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "password".to_string(),
             )))
@@ -806,7 +806,7 @@ mod tests {
             secrets: secrets.clone(),
         };
 
-        let id1 = backend.create_item(item, false).await.unwrap();
+        let id1 = provider.create_item(item, false).await.unwrap();
 
         let item2 = NewItem {
             label: "Replaced".to_string(),
@@ -814,19 +814,19 @@ mod tests {
             secrets,
         };
 
-        let id2 = backend.create_item(item2, true).await.unwrap();
+        let id2 = provider.create_item(item2, true).await.unwrap();
 
         assert_eq!(id1, id2);
 
-        let items = backend.list_items().await.unwrap();
+        let items = provider.list_items().await.unwrap();
         let meta = items.iter().find(|m| m.id == id1).unwrap();
         assert_eq!(meta.label, "Replaced");
     }
 
     #[tokio::test]
     async fn update_item() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "password".to_string(),
             )))
@@ -842,7 +842,7 @@ mod tests {
             secrets,
         };
 
-        let id = backend.create_item(item, false).await.unwrap();
+        let id = provider.create_item(item, false).await.unwrap();
 
         let update = ItemUpdate {
             label: Some("Updated".to_string()),
@@ -850,17 +850,17 @@ mod tests {
             secrets: None,
         };
 
-        backend.update_item(&id, update).await.unwrap();
+        provider.update_item(&id, update).await.unwrap();
 
-        let items = backend.list_items().await.unwrap();
+        let items = provider.list_items().await.unwrap();
         let meta = items.iter().find(|m| m.id == id).unwrap();
         assert_eq!(meta.label, "Updated");
     }
 
     #[tokio::test]
     async fn update_item_reserved_attribute() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "password".to_string(),
             )))
@@ -876,7 +876,7 @@ mod tests {
             secrets,
         };
 
-        let id = backend.create_item(item, false).await.unwrap();
+        let id = provider.create_item(item, false).await.unwrap();
 
         let mut attrs = HashMap::new();
         attrs.insert("id".to_string(), "newid".to_string());
@@ -887,14 +887,14 @@ mod tests {
             secrets: None,
         };
 
-        let result = backend.update_item(&id, update).await;
+        let result = provider.update_item(&id, update).await;
         assert!(matches!(result, Err(ProviderError::InvalidInput(_))));
     }
 
     #[tokio::test]
     async fn delete_item() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "password".to_string(),
             )))
@@ -910,18 +910,18 @@ mod tests {
             secrets,
         };
 
-        let id = backend.create_item(item, false).await.unwrap();
+        let id = provider.create_item(item, false).await.unwrap();
 
-        backend.delete_item(&id).await.unwrap();
+        provider.delete_item(&id).await.unwrap();
 
-        let result = backend.get_item_attributes(&id).await;
+        let result = provider.get_item_attributes(&id).await;
         assert!(matches!(result, Err(ProviderError::NotFound)));
     }
 
     #[tokio::test]
     async fn search_items() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "password".to_string(),
             )))
@@ -950,25 +950,25 @@ mod tests {
             secrets,
         };
 
-        backend.create_item(item1, false).await.unwrap();
-        backend.create_item(item2, false).await.unwrap();
+        provider.create_item(item1, false).await.unwrap();
+        provider.create_item(item2, false).await.unwrap();
 
         let mut search_attrs = HashMap::new();
         search_attrs.insert("domain".to_string(), "example.com".to_string());
 
-        let results = backend.search(&search_attrs).await.unwrap();
+        let results = provider.search(&search_attrs).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].label, "Item1");
     }
 
     #[tokio::test]
     async fn operations_fail_when_locked() {
-        let (backend, _temp) = create_test_backend();
+        let (provider, _temp) = create_test_provider();
 
-        let result = backend.list_items().await;
+        let result = provider.list_items().await;
         assert!(matches!(result, Err(ProviderError::Locked)));
 
-        let result = backend.get_item_attributes("id").await;
+        let result = provider.get_item_attributes("id").await;
         assert!(matches!(result, Err(ProviderError::Locked)));
 
         let mut secrets = HashMap::new();
@@ -978,15 +978,15 @@ mod tests {
             attributes: HashMap::new(),
             secrets,
         };
-        let result = backend.create_item(item, false).await;
+        let result = provider.create_item(item, false).await;
         assert!(matches!(result, Err(ProviderError::Locked)));
     }
 
     #[tokio::test]
     async fn unlock_relock_roundtrip() {
-        let (backend, _temp) = create_test_backend();
+        let (provider, _temp) = create_test_provider();
 
-        backend
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "password".to_string(),
             )))
@@ -1002,51 +1002,51 @@ mod tests {
             secrets,
         };
 
-        let id = backend.create_item(item, false).await.unwrap();
+        let id = provider.create_item(item, false).await.unwrap();
 
-        backend.lock().await.unwrap();
+        provider.lock().await.unwrap();
 
-        let result = backend.get_item_attributes(&id).await;
+        let result = provider.get_item_attributes(&id).await;
         assert!(matches!(result, Err(ProviderError::Locked)));
 
-        backend
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "password".to_string(),
             )))
             .await
             .unwrap();
 
-        let items = backend.list_items().await.unwrap();
+        let items = provider.list_items().await.unwrap();
         let meta = items.iter().find(|m| m.id == id).unwrap();
         assert_eq!(meta.label, "Test");
     }
 
     #[tokio::test]
     async fn add_password_enables_second_unlock() {
-        let (backend, _temp) = create_test_backend();
+        let (provider, _temp) = create_test_provider();
 
         // Create vault with master password
-        backend
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new("master".to_string())))
             .await
             .unwrap();
 
         // Add a second password
-        let entry_id = backend
+        let entry_id = provider
             .add_password(b"login-password", "login".to_string())
             .await
             .unwrap();
         assert!(!entry_id.is_empty());
 
         // Verify we have 2 wrapping entries
-        let entries = backend.list_passwords().await.unwrap();
+        let entries = provider.list_passwords().await.unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].1.as_deref(), Some("master"));
         assert_eq!(entries[1].1.as_deref(), Some("login"));
 
         // Lock and unlock with the second password
-        backend.lock().await.unwrap();
-        let result = backend
+        provider.lock().await.unwrap();
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "login-password".to_string(),
             )))
@@ -1054,8 +1054,8 @@ mod tests {
         assert!(result.is_ok());
 
         // Lock and unlock with the original password still works
-        backend.lock().await.unwrap();
-        let result = backend
+        provider.lock().await.unwrap();
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new("master".to_string())))
             .await;
         assert!(result.is_ok());
@@ -1063,34 +1063,34 @@ mod tests {
 
     #[tokio::test]
     async fn remove_password_prevents_unlock() {
-        let (backend, _temp) = create_test_backend();
+        let (provider, _temp) = create_test_provider();
 
-        backend
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new("master".to_string())))
             .await
             .unwrap();
 
         // Add second password
-        let entry_id = backend
+        let entry_id = provider
             .add_password(b"second", "second".to_string())
             .await
             .unwrap();
 
         // Remove the second password
-        backend.remove_password(&entry_id).await.unwrap();
+        provider.remove_password(&entry_id).await.unwrap();
 
-        let entries = backend.list_passwords().await.unwrap();
+        let entries = provider.list_passwords().await.unwrap();
         assert_eq!(entries.len(), 1);
 
         // Lock and try the removed password — should fail
-        backend.lock().await.unwrap();
-        let result = backend
+        provider.lock().await.unwrap();
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new("second".to_string())))
             .await;
         assert!(result.is_err());
 
         // Original still works
-        let result = backend
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new("master".to_string())))
             .await;
         assert!(result.is_ok());
@@ -1098,70 +1098,72 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_remove_last_password() {
-        let (backend, _temp) = create_test_backend();
+        let (provider, _temp) = create_test_provider();
 
-        backend
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new("master".to_string())))
             .await
             .unwrap();
 
-        let entries = backend.list_passwords().await.unwrap();
+        let entries = provider.list_passwords().await.unwrap();
         assert_eq!(entries.len(), 1);
 
-        let result = backend.remove_password(&entries[0].0).await;
+        let result = provider.remove_password(&entries[0].0).await;
         assert!(matches!(result, Err(ProviderError::InvalidInput(_))));
     }
 
     #[tokio::test]
     async fn add_password_rejects_empty_label() {
-        let (backend, _temp) = create_test_backend();
+        let (provider, _temp) = create_test_provider();
 
-        backend
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new("master".to_string())))
             .await
             .unwrap();
 
-        let result = backend.add_password(b"another", String::new()).await;
+        let result = provider.add_password(b"another", String::new()).await;
         assert!(matches!(result, Err(ProviderError::InvalidInput(_))));
     }
 
     #[tokio::test]
     async fn add_password_rejects_duplicate_label() {
-        let (backend, _temp) = create_test_backend();
+        let (provider, _temp) = create_test_provider();
 
-        backend
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new("master".to_string())))
             .await
             .unwrap();
 
         // Add a password with label "login"
-        backend
+        provider
             .add_password(b"login-pw", "login".to_string())
             .await
             .unwrap();
 
         // Try to add another password with the same label — should fail
-        let result = backend.add_password(b"other-pw", "login".to_string()).await;
+        let result = provider
+            .add_password(b"other-pw", "login".to_string())
+            .await;
         assert!(matches!(result, Err(ProviderError::InvalidInput(_))));
 
         // Verify only 2 entries exist (master + login), not 3
-        let entries = backend.list_passwords().await.unwrap();
+        let entries = provider.list_passwords().await.unwrap();
         assert_eq!(entries.len(), 2);
     }
 
     #[tokio::test]
     async fn wrong_password_fails_to_unlock() {
-        let (backend, _temp) = create_test_backend();
+        let (provider, _temp) = create_test_provider();
 
         // Create vault
-        backend
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new("correct".to_string())))
             .await
             .unwrap();
-        backend.lock().await.unwrap();
+        provider.lock().await.unwrap();
 
         // Try wrong password
-        let result = backend
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new("wrong".to_string())))
             .await;
         assert!(result.is_err());
@@ -1173,15 +1175,15 @@ mod tests {
 
     #[tokio::test]
     async fn change_password_happy_path() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "old-pass".to_string(),
             )))
             .await
             .unwrap();
 
-        backend
+        provider
             .change_password(
                 Zeroizing::new("old-pass".to_string()),
                 Zeroizing::new("new-pass".to_string()),
@@ -1190,8 +1192,8 @@ mod tests {
             .unwrap();
 
         // Lock and unlock with new password.
-        backend.lock().await.unwrap();
-        let result = backend
+        provider.lock().await.unwrap();
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "new-pass".to_string(),
             )))
@@ -1199,8 +1201,8 @@ mod tests {
         assert!(result.is_ok());
 
         // Old password should no longer work.
-        backend.lock().await.unwrap();
-        let result = backend
+        provider.lock().await.unwrap();
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "old-pass".to_string(),
             )))
@@ -1210,15 +1212,15 @@ mod tests {
 
     #[tokio::test]
     async fn change_password_wrong_old_password() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "real-pass".to_string(),
             )))
             .await
             .unwrap();
 
-        let result = backend
+        let result = provider
             .change_password(
                 Zeroizing::new("wrong-pass".to_string()),
                 Zeroizing::new("new-pass".to_string()),
@@ -1229,8 +1231,8 @@ mod tests {
 
     #[tokio::test]
     async fn change_password_when_locked() {
-        let (backend, _temp) = create_test_backend();
-        let result = backend
+        let (provider, _temp) = create_test_provider();
+        let result = provider
             .change_password(
                 Zeroizing::new("old".to_string()),
                 Zeroizing::new("new".to_string()),
@@ -1241,8 +1243,8 @@ mod tests {
 
     #[tokio::test]
     async fn change_password_preserves_label() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "master-pw".to_string(),
             )))
@@ -1250,12 +1252,12 @@ mod tests {
             .unwrap();
 
         // The first wrapping entry has the label "master" by convention.
-        let entries_before = backend.list_passwords().await.unwrap();
+        let entries_before = provider.list_passwords().await.unwrap();
         assert_eq!(entries_before.len(), 1);
         assert_eq!(entries_before[0].1, Some("master".to_string()));
 
         // Change password — the new entry should inherit "master" label.
-        backend
+        provider
             .change_password(
                 Zeroizing::new("master-pw".to_string()),
                 Zeroizing::new("rotated-pw".to_string()),
@@ -1263,7 +1265,7 @@ mod tests {
             .await
             .unwrap();
 
-        let entries_after = backend.list_passwords().await.unwrap();
+        let entries_after = provider.list_passwords().await.unwrap();
         assert_eq!(entries_after.len(), 1);
         assert_eq!(entries_after[0].1, Some("master".to_string()));
 
@@ -1273,8 +1275,8 @@ mod tests {
 
     #[tokio::test]
     async fn change_password_only_affects_matched_entry() {
-        let (backend, _temp) = create_test_backend();
-        backend
+        let (provider, _temp) = create_test_provider();
+        provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "master-pw".to_string(),
             )))
@@ -1282,13 +1284,13 @@ mod tests {
             .unwrap();
 
         // Add a second password.
-        backend
+        provider
             .add_password(b"second-pw", "login".to_string())
             .await
             .unwrap();
 
         // Change only the master password.
-        backend
+        provider
             .change_password(
                 Zeroizing::new("master-pw".to_string()),
                 Zeroizing::new("rotated-master".to_string()),
@@ -1297,20 +1299,20 @@ mod tests {
             .unwrap();
 
         // Should still have 2 entries.
-        let entries = backend.list_passwords().await.unwrap();
+        let entries = provider.list_passwords().await.unwrap();
         assert_eq!(entries.len(), 2);
 
         // Lock and verify both passwords work.
-        backend.lock().await.unwrap();
-        let result = backend
+        provider.lock().await.unwrap();
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "rotated-master".to_string(),
             )))
             .await;
         assert!(result.is_ok());
 
-        backend.lock().await.unwrap();
-        let result = backend
+        provider.lock().await.unwrap();
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "second-pw".to_string(),
             )))
@@ -1318,8 +1320,8 @@ mod tests {
         assert!(result.is_ok());
 
         // Old master should fail.
-        backend.lock().await.unwrap();
-        let result = backend
+        provider.lock().await.unwrap();
+        let result = provider
             .unlock(UnlockInput::Password(Zeroizing::new(
                 "master-pw".to_string(),
             )))

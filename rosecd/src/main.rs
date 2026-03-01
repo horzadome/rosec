@@ -1172,7 +1172,7 @@ async fn build_single_provider(
             };
 
             Ok(Arc::new(
-                rosec_bitwarden::BitwardenBackend::new(bw_config)
+                rosec_bitwarden::BitwardenProvider::new(bw_config)
                     .map_err(|e| anyhow::anyhow!("bitwarden provider '{}': {e}", entry.id))?,
             ))
         }
@@ -1208,7 +1208,7 @@ async fn build_single_provider(
                 organization_id,
             };
 
-            Ok(Arc::new(rosec_bitwarden_sm::BitwardenSmBackend::new(
+            Ok(Arc::new(rosec_bitwarden_sm::BitwardenSmProvider::new(
                 sm_config,
             )))
         }

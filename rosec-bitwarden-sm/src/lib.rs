@@ -1,4 +1,4 @@
-//! Bitwarden Secrets Manager backend for rosec.
+//! Bitwarden Secrets Manager provider for rosec.
 //!
 //! Native implementation — no Bitwarden SDK dependency.  All HTTP requests
 //! and cryptographic operations are performed directly using the same
@@ -24,7 +24,7 @@
 //! This means:
 //! - A password is **always required** to unlock — there is no auto-unlock path.
 //! - The same password participates in the opportunistic unlock sweep alongside
-//!   Bitwarden PM backends, so users with a shared password only type it once.
+//!   Bitwarden PM providers, so users with a shared password only type it once.
 //! - Wrong password → wrong storage key → `ProviderError::AuthFailed` (re-prompt
 //!   for the correct password, not re-registration).
 //! - Changing the password or rotating the token requires re-running
@@ -35,7 +35,7 @@
 //! `unlock()` returns `ProviderError::RegistrationRequired` if no encrypted token
 //! is found on disk.  The auth flow then prompts for `registration_info()` fields
 //! (the access token itself) and retries with `UnlockInput::WithRegistration`.
-//! The backend derives the storage key from the password, encrypts the token, and
+//! The provider derives the storage key from the password, encrypts the token, and
 //! persists it.  Subsequent unlocks only need the password.
 //!
 //! # Configuration
@@ -87,7 +87,7 @@ pub enum SmRegion {
     Eu,
 }
 
-/// Configuration for the Bitwarden SM backend.
+/// Configuration for the Bitwarden SM provider.
 #[derive(Debug, Clone)]
 pub struct SmConfig {
     /// Provider instance ID (used as `Provider::id()`).
@@ -124,14 +124,14 @@ struct AuthState {
 }
 
 // ---------------------------------------------------------------------------
-// Backend
+// Provider
 // ---------------------------------------------------------------------------
 
-/// Bitwarden Secrets Manager backend.
+/// Bitwarden Secrets Manager provider.
 ///
 /// Starts locked.  Call `unlock(UnlockInput::Password(...))` to authenticate;
 /// the token is scrubbed from memory on drop.
-pub struct SmBackend {
+pub struct SmProvider {
     config: SmConfig,
     /// Access token stored Zeroizing so it is scrubbed on drop.
     access_token: Mutex<Option<Zeroizing<String>>>,
@@ -141,17 +141,17 @@ pub struct SmBackend {
     callbacks: RwLock<ProviderCallbacks>,
 }
 
-impl std::fmt::Debug for SmBackend {
+impl std::fmt::Debug for SmProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SmBackend")
+        f.debug_struct("SmProvider")
             .field("id", &self.config.id)
             .field("organization_id", &self.config.organization_id)
             .finish()
     }
 }
 
-impl SmBackend {
-    /// Create a new (locked) SM backend.
+impl SmProvider {
+    /// Create a new (locked) SM provider.
     pub fn new(config: SmConfig) -> Self {
         Self {
             config,
@@ -174,9 +174,9 @@ impl SmBackend {
         }
     }
 
-    /// Derive the 64-byte storage key for this SM backend.
+    /// Derive the 64-byte storage key for this SM provider.
     ///
-    /// Uses HKDF-SHA256 with the backend ID as salt and `machine_secret ||
+    /// Uses HKDF-SHA256 with the provider ID as salt and `machine_secret ||
     /// password` as IKM.  Both factors are required: the machine secret ties
     /// the ciphertext to this installation; the password provides the
     /// interactive access-control gate.  Neither alone is sufficient.
@@ -215,7 +215,7 @@ impl SmBackend {
             .await
             .map_err(|e| ProviderError::Unavailable(format!("SM login/fetch: {e}")))?;
 
-        debug!(backend = %self.config.id, count = secrets.len(), "SM unlock complete");
+        debug!(provider = %self.config.id, count = secrets.len(), "SM unlock complete");
 
         let now = Utc::now();
         Ok(AuthState {
@@ -228,7 +228,7 @@ impl SmBackend {
 }
 
 #[async_trait::async_trait]
-impl Provider for SmBackend {
+impl Provider for SmProvider {
     fn id(&self) -> &str {
         &self.config.id
     }
@@ -268,7 +268,7 @@ impl Provider for SmBackend {
     /// The unlock password for SM is not the access token — it is a
     /// user-chosen passphrase used to derive the storage key that protects
     /// the encrypted access token on disk.  The same password participates in
-    /// the opportunistic unlock sweep alongside PM backends.
+    /// the opportunistic unlock sweep alongside PM providers.
     fn password_field(&self) -> AuthField {
         AuthField {
             id: "password",
@@ -292,7 +292,7 @@ impl Provider for SmBackend {
         }];
         Some(RegistrationInfo {
             instructions: "\
-This backend needs a Bitwarden Secrets Manager access token to complete setup.\n\n\
+This provider needs a Bitwarden Secrets Manager access token to complete setup.\n\n\
 Generate a machine account access token in the Bitwarden Secrets Manager web app \
 and paste it below.  The token will be encrypted with your unlock password and \
 stored locally — you will not need to enter it again.",
@@ -300,7 +300,7 @@ stored locally — you will not need to enter it again.",
         })
     }
 
-    /// Authenticate the SM backend.
+    /// Authenticate the SM provider.
     ///
     /// Two cases:
     ///
@@ -345,7 +345,7 @@ stored locally — you will not need to enter it again.",
                 new_token.as_str(),
             )
             .map_err(|e| ProviderError::Unavailable(format!("failed to save SM token: {e}")))?;
-            info!(backend = %self.config.id, "SM access token saved (encrypted)");
+            info!(provider = %self.config.id, "SM access token saved (encrypted)");
             new_token
         } else {
             // Normal unlock: derive key from password and decrypt stored token.
@@ -359,7 +359,7 @@ stored locally — you will not need to enter it again.",
                     // it.  Return AuthFailed so the unlock sweep re-prompts
                     // for the correct password instead of entering the
                     // registration flow.
-                    debug!(backend = %self.config.id,
+                    debug!(provider = %self.config.id,
                         "credential decryption failed (wrong password): {e}");
                     return Err(ProviderError::AuthFailed);
                 }
@@ -393,18 +393,18 @@ stored locally — you will not need to enter it again.",
     ///
     /// Decrypts the stored token using the old-password-derived storage key,
     /// then re-encrypts it with the new-password-derived key and persists the
-    /// result.  The backend must be unlocked so we can verify the old password
+    /// result.  The provider must be unlocked so we can verify the old password
     /// against the in-memory token (defence-in-depth: even if the MAC passes,
     /// the decrypted token must match what we hold in memory).
     ///
     /// Returns `ProviderError::AuthFailed` if `old_password` is wrong.
-    /// Returns `ProviderError::Locked` if the backend is not unlocked.
+    /// Returns `ProviderError::Locked` if the provider is not unlocked.
     async fn change_password(
         &self,
         old_password: Zeroizing<String>,
         new_password: Zeroizing<String>,
     ) -> Result<(), ProviderError> {
-        // Verify the backend is unlocked and snapshot the in-memory token.
+        // Verify the provider is unlocked and snapshot the in-memory token.
         let in_memory_token = {
             let guard = self.access_token.lock().await;
             guard
@@ -439,13 +439,13 @@ stored locally — you will not need to enter it again.",
         )
         .map_err(|e| ProviderError::Unavailable(format!("failed to re-encrypt SM token: {e}")))?;
 
-        info!(backend = %self.config.id, "SM unlock password changed");
+        info!(provider = %self.config.id, "SM unlock password changed");
         Ok(())
     }
 
     /// Re-fetch all secrets from the Bitwarden SM API using the in-memory token.
     ///
-    /// Requires the backend to be unlocked — the access token is held in memory
+    /// Requires the provider to be unlocked — the access token is held in memory
     /// only while unlocked (zeroized on lock/drop).  Returns
     /// `ProviderError::Locked` if called while locked; the caller must unlock
     /// first.  There is no disk fallback: the password used to derive the
@@ -486,7 +486,7 @@ stored locally — you will not need to enter it again.",
                     *state_guard = Some(auth);
                 }
 
-                info!(backend = %self.config.id, changed, "SM secrets synced");
+                info!(provider = %self.config.id, changed, "SM secrets synced");
 
                 if let Some(cb) = self
                     .callbacks
@@ -523,7 +523,7 @@ stored locally — you will not need to enter it again.",
             let mut state_guard = self.state.lock().await;
             *state_guard = None;
         }
-        info!(backend = %self.config.id, "SM backend locked");
+        info!(provider = %self.config.id, "SM provider locked");
 
         if let Some(cb) = self
             .callbacks
@@ -552,7 +552,7 @@ stored locally — you will not need to enter it again.",
     /// performing a full secrets fetch.
     ///
     /// Uses `GET /organizations/{org_id}/secrets/sync?lastSyncedDate=` which
-    /// returns `{ "hasChanges": bool }`.  If the backend is locked (no cached
+    /// returns `{ "hasChanges": bool }`.  If the provider is locked (no cached
     /// bearer / no stored token) we re-authenticate first.  Returns `Ok(true)`
     /// on any transient error so the caller falls back to a full sync.
     async fn check_remote_changed(&self) -> Result<bool, ProviderError> {
@@ -563,7 +563,7 @@ stored locally — you will not need to enter it again.",
             let guard = self.state.lock().await;
             match guard.as_ref() {
                 Some(s) => (s.bearer.clone(), s.last_synced_at),
-                // Backend is locked — no state yet, assume changed.
+                // Provider is locked — no state yet, assume changed.
                 None => return Ok(true),
             }
         };
@@ -581,14 +581,14 @@ stored locally — you will not need to enter it again.",
             .await
         {
             Ok(changed) => {
-                debug!(backend = %self.config.id, changed, "SM delta-sync check");
+                debug!(provider = %self.config.id, changed, "SM delta-sync check");
                 Ok(changed)
             }
             Err(e) => {
                 // A 401 means the cached bearer expired — treat as changed so
                 // the caller triggers a full sync (which re-authenticates).
                 // Any other transient error also falls back to sync.
-                debug!(backend = %self.config.id, error = %e,
+                debug!(provider = %self.config.id, error = %e,
                     "SM delta-sync check failed, assuming changed");
                 Ok(true)
             }
@@ -687,8 +687,8 @@ fn secret_value(secret: &DecryptedSecret) -> SecretBytes {
 // Re-export for consumers
 // ---------------------------------------------------------------------------
 
-pub use SmBackend as BitwardenSmBackend;
 pub use SmConfig as BitwardenSmConfig;
+pub use SmProvider as BitwardenSmProvider;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -728,8 +728,8 @@ mod tests {
         }
     }
 
-    fn make_backend() -> SmBackend {
-        SmBackend::new(SmConfig {
+    fn make_provider() -> SmProvider {
+        SmProvider::new(SmConfig {
             id: "test-sm".to_string(),
             name: Some("Test SM".to_string()),
             region: SmRegion::Us,
@@ -738,7 +738,7 @@ mod tests {
         })
     }
 
-    async fn inject_state(b: &SmBackend, secrets: Vec<DecryptedSecret>) {
+    async fn inject_state(b: &SmProvider, secrets: Vec<DecryptedSecret>) {
         let mut state = b.state.lock().await;
         *state = Some(AuthState {
             secrets,
@@ -750,13 +750,13 @@ mod tests {
 
     #[tokio::test]
     async fn starts_locked() {
-        assert!(make_backend().status().await.unwrap().locked);
+        assert!(make_provider().status().await.unwrap().locked);
     }
 
     #[tokio::test]
     async fn list_items_when_locked_returns_error() {
         assert!(matches!(
-            make_backend().list_items().await,
+            make_provider().list_items().await,
             Err(ProviderError::Locked)
         ));
     }
@@ -764,7 +764,7 @@ mod tests {
     #[tokio::test]
     async fn get_secret_attr_when_locked_returns_error() {
         assert!(matches!(
-            make_backend()
+            make_provider()
                 .get_secret_attr("00000000-0000-0000-0000-000000000000", "password")
                 .await,
             Err(ProviderError::Locked)
@@ -779,7 +779,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let result = {
             let _env = scoped_env("XDG_DATA_HOME", tmp.to_str().unwrap());
-            make_backend()
+            make_provider()
                 .unlock(UnlockInput::Password(Zeroizing::new(
                     "my-unlock-password".to_string(),
                 )))
@@ -800,7 +800,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let result = {
             let _env = scoped_env("XDG_DATA_HOME", tmp.to_str().unwrap());
-            let b = make_backend();
+            let b = make_provider();
 
             // First, store a token with the correct password via registration.
             let correct_pw = Zeroizing::new("correct-password".to_string());
@@ -825,7 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn lock_clears_state() {
-        let b = make_backend();
+        let b = make_provider();
         inject_state(&b, Vec::new()).await;
         assert!(!b.status().await.unwrap().locked);
         b.lock().await.unwrap();
@@ -834,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_items_returns_secrets_when_unlocked() {
-        let b = make_backend();
+        let b = make_provider();
         let secret_id = Uuid::new_v4();
         inject_state(
             &b,
@@ -864,7 +864,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_secret_attr_returns_value() {
-        let b = make_backend();
+        let b = make_provider();
         let secret_id = Uuid::new_v4();
         inject_state(
             &b,
@@ -889,7 +889,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_secret_attr_falls_back_to_note_when_value_empty() {
-        let b = make_backend();
+        let b = make_provider();
         let secret_id = Uuid::new_v4();
         inject_state(
             &b,
@@ -914,7 +914,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_secret_attr_not_found() {
-        let b = make_backend();
+        let b = make_provider();
         inject_state(&b, Vec::new()).await;
         assert!(matches!(
             b.get_secret_attr("00000000-0000-0000-0000-000000000001", "password")
@@ -925,7 +925,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_secret_attr_unknown_attr_returns_not_found() {
-        let b = make_backend();
+        let b = make_provider();
         let secret_id = Uuid::new_v4();
         inject_state(
             &b,
@@ -948,7 +948,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_filters_by_attributes() {
-        let b = make_backend();
+        let b = make_provider();
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();
         inject_state(
@@ -1009,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn get_item_attributes_when_locked_returns_error() {
         assert!(matches!(
-            make_backend()
+            make_provider()
                 .get_item_attributes("00000000-0000-0000-0000-000000000000")
                 .await,
             Err(ProviderError::Locked)
@@ -1018,7 +1018,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_item_attributes_found_and_not_found() {
-        let b = make_backend();
+        let b = make_provider();
         let secret_id = Uuid::new_v4();
         inject_state(
             &b,
@@ -1055,7 +1055,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_returns_empty_when_no_match() {
-        let b = make_backend();
+        let b = make_provider();
         inject_state(
             &b,
             vec![DecryptedSecret {
@@ -1082,8 +1082,8 @@ mod tests {
         "0.00000000-0000-0000-0000-000000000000.fake-secret:AAAAAAAAAAAAAAAAAAAAAA==";
 
     /// Store a token encrypted with `password` on disk, inject it into memory,
-    /// and inject auth state so the backend appears unlocked.
-    async fn setup_unlocked_with_token(b: &SmBackend, password: &str) {
+    /// and inject auth state so the provider appears unlocked.
+    async fn setup_unlocked_with_token(b: &SmProvider, password: &str) {
         let storage_key = b.derive_storage_key(password).unwrap_or_else(|e| {
             panic!("derive_storage_key failed in test setup: {e}");
         });
@@ -1113,7 +1113,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let result = {
             let _env = scoped_env("XDG_DATA_HOME", tmp.to_str().unwrap());
-            let b = make_backend();
+            let b = make_provider();
             setup_unlocked_with_token(&b, "old-password").await;
 
             let res = b
@@ -1153,7 +1153,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let result = {
             let _env = scoped_env("XDG_DATA_HOME", tmp.to_str().unwrap());
-            let b = make_backend();
+            let b = make_provider();
             setup_unlocked_with_token(&b, "real-password").await;
 
             b.change_password(
@@ -1168,8 +1168,8 @@ mod tests {
 
     #[tokio::test]
     async fn change_password_when_locked() {
-        let b = make_backend();
-        // Backend is locked (default state) — no access_token in memory.
+        let b = make_provider();
+        // Provider is locked (default state) — no access_token in memory.
         let result = b
             .change_password(
                 Zeroizing::new("old".to_string()),

@@ -49,30 +49,30 @@ pub fn derive_storage_key(master_key: &[u8], email: &str) -> Result<StorageKey, 
         .map_err(|e| BitwardenError::Crypto(format!("storage key: {e}")))
 }
 
-/// Encrypt `client_secret` and persist the credential for `backend_id`.
+/// Encrypt `client_secret` and persist the credential for `provider_id`.
 pub fn encrypt_and_save(
-    backend_id: &str,
+    provider_id: &str,
     master_key: &[u8],
     email: &str,
     client_id: &str,
     client_secret: &str,
 ) -> Result<(), BitwardenError> {
     let key = derive_storage_key(master_key, email)?;
-    credential::encrypt_and_save(backend_id, &key, client_id, client_secret)
+    credential::encrypt_and_save(provider_id, &key, client_id, client_secret)
         .map_err(|e| BitwardenError::Other(anyhow::anyhow!("{e}")))
 }
 
-/// Load and decrypt the OAuth credential for `backend_id`.
+/// Load and decrypt the OAuth credential for `provider_id`.
 ///
 /// Returns `None` if no credential is stored.
 /// Returns an error if the MAC fails (wrong master password or tampered file).
 pub fn load_and_decrypt(
-    backend_id: &str,
+    provider_id: &str,
     master_key: &[u8],
     email: &str,
 ) -> Result<Option<OAuthCredential>, BitwardenError> {
     let key = derive_storage_key(master_key, email)?;
-    credential::load_and_decrypt(backend_id, &key).map_err(BitwardenError::Crypto)
+    credential::load_and_decrypt(provider_id, &key).map_err(BitwardenError::Crypto)
 }
 
 #[cfg(test)]

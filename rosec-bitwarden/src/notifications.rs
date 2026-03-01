@@ -32,9 +32,9 @@
 //!
 //! # Lifecycle
 //!
-//! The task is started by `BitwardenBackend::unlock` and stopped by `lock`.
+//! The task is started by `BitwardenProvider::unlock` and stopped by `lock`.
 //! A `tokio::sync::watch` channel is the cancellation token: the sender is
-//! owned by `BitwardenBackend`; when `lock` drops the sender the task exits.
+//! owned by `BitwardenProvider`; when `lock` drops the sender the task exits.
 //!
 //! # Graceful degradation
 //!
@@ -57,7 +57,7 @@ use tracing::{debug, info, trace, warn};
 
 /// Configuration for the notifications background task.
 ///
-/// Constructed in `BitwardenBackend::unlock` from config + live auth state.
+/// Constructed in `BitwardenProvider::unlock` from config + live auth state.
 pub struct NotificationsConfig {
     /// Base URL for the notifications service, e.g.
     /// `https://notifications.bitwarden.com`.
@@ -66,14 +66,14 @@ pub struct NotificationsConfig {
     /// Current JWT access token — sent as `Authorization: Bearer <jwt>` on
     /// the negotiate POST and as `?access_token=<jwt>` on the WebSocket URL.
     pub access_token: zeroize::Zeroizing<String>,
-    /// Backend instance ID (for log messages only).
-    pub backend_id: String,
+    /// Provider instance ID (for log messages only).
+    pub provider_id: String,
     /// Invoked (from a Tokio task) when the hub signals a cipher change.
-    /// Typically calls `ServiceState::try_sync_backend`.
+    /// Typically calls `ServiceState::try_sync_provider`.
     /// If `None`, sync nudges are silently ignored.
     pub on_sync_nudge: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     /// Invoked (from a Tokio task) when the hub sends `LogOut`.
-    /// Typically calls `ServiceState::auto_lock` for this backend.
+    /// Typically calls `ServiceState::auto_lock` for this provider.
     /// If `None`, logout events are silently ignored.
     pub on_lock_nudge: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     /// Watch receiver used for cancellation: the task exits when the
@@ -188,14 +188,14 @@ struct InvocationArgument {
 // ---------------------------------------------------------------------------
 
 async fn notifications_loop(mut config: NotificationsConfig) {
-    let backend_id = config.backend_id.clone();
+    let provider_id = config.provider_id.clone();
     let mut backoff = BACKOFF_INITIAL;
     let mut is_first_attempt = true;
 
     loop {
         // Bail out immediately if the vault was locked while we were sleeping.
         if config.cancel_rx.has_changed().is_err() {
-            debug!(backend = %backend_id, "notifications: cancellation received, exiting");
+            debug!(provider = %provider_id, "notifications: cancellation received, exiting");
             return;
         }
 
@@ -203,7 +203,7 @@ async fn notifications_loop(mut config: NotificationsConfig) {
             tokio::select! {
                 _ = tokio::time::sleep(backoff) => {}
                 _ = config.cancel_rx.changed() => {
-                    debug!(backend = %backend_id, "notifications: cancelled during backoff, exiting");
+                    debug!(provider = %provider_id, "notifications: cancelled during backoff, exiting");
                     return;
                 }
             }
@@ -213,12 +213,12 @@ async fn notifications_loop(mut config: NotificationsConfig) {
 
         match run_session(&mut config).await {
             SessionResult::Cancelled => {
-                debug!(backend = %backend_id, "notifications: vault locked, exiting task");
+                debug!(provider = %provider_id, "notifications: vault locked, exiting task");
                 return;
             }
             SessionResult::Disconnected => {
                 info!(
-                    backend = %backend_id,
+                    provider = %provider_id,
                     next_retry_secs = backoff.as_secs(),
                     "notifications: hub disconnected, will retry"
                 );
@@ -230,7 +230,7 @@ async fn notifications_loop(mut config: NotificationsConfig) {
                 // Degrade to poll-only rather than retrying indefinitely.
                 let safe_reason = redact_token(&reason);
                 warn!(
-                    backend = %backend_id,
+                    provider = %provider_id,
                     reason = %safe_reason,
                     "notifications: initial connection failed, falling back to poll-only"
                 );
@@ -251,7 +251,7 @@ enum SessionResult {
 
 /// Run one hub session.  Returns when cancelled or when the connection drops.
 async fn run_session(config: &mut NotificationsConfig) -> SessionResult {
-    let backend_id = &config.backend_id;
+    let provider_id = &config.provider_id;
 
     // Build the two URLs:
     //   negotiate_url — clean HTTP URL, auth via Bearer header
@@ -267,7 +267,7 @@ async fn run_session(config: &mut NotificationsConfig) -> SessionResult {
         Err(e) => return SessionResult::ConnectFailed(e),
     };
 
-    debug!(backend = %backend_id, "notifications: connecting to hub");
+    debug!(provider = %provider_id, "notifications: connecting to hub");
 
     // ------------------------------------------------------------------
     // Step 1: Negotiate — POST to obtain a connectionId.
@@ -294,7 +294,7 @@ async fn run_session(config: &mut NotificationsConfig) -> SessionResult {
     };
 
     debug!(
-        backend = %backend_id,
+        provider = %provider_id,
         connection_id = %neg.connection_id,
         "notifications: negotiate succeeded"
     );
@@ -337,14 +337,14 @@ async fn run_session(config: &mut NotificationsConfig) -> SessionResult {
         }
     }
 
-    debug!(backend = %backend_id, "notifications: connected to hub");
+    debug!(provider = %provider_id, "notifications: connected to hub");
 
     // ------------------------------------------------------------------
     // Step 4: Event loop — read frames until cancelled or disconnected.
     // ------------------------------------------------------------------
     let on_sync = config.on_sync_nudge.clone();
     let on_lock = config.on_lock_nudge.clone();
-    let backend_id_owned = backend_id.to_string();
+    let provider_id_owned = provider_id.to_string();
 
     loop {
         tokio::select! {
@@ -361,13 +361,13 @@ async fn run_session(config: &mut NotificationsConfig) -> SessionResult {
                 match msg {
                     None => return SessionResult::Disconnected,
                     Some(Err(e)) => {
-                        debug!(backend = %backend_id_owned, error = %e, "notifications: WS error");
+                        debug!(provider = %provider_id_owned, error = %e, "notifications: WS error");
                         return SessionResult::Disconnected;
                     }
                     Some(Ok(m)) if m.is_text() => {
                         if let Some(text) = m.as_text() {
-                            trace!(backend = %backend_id_owned, len = text.len(), "notifications: WS text message received");
-                            handle_frames(text, &backend_id_owned, &on_sync, &on_lock);
+                            trace!(provider = %provider_id_owned, len = text.len(), "notifications: WS text message received");
+                            handle_frames(text, &provider_id_owned, &on_sync, &on_lock);
                         }
                     }
                     Some(Ok(_)) => {
@@ -384,7 +384,7 @@ async fn run_session(config: &mut NotificationsConfig) -> SessionResult {
 /// and dispatch sync/lock callbacks.
 fn handle_frames(
     text: &str,
-    backend_id: &str,
+    provider_id: &str,
     on_sync: &Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     on_lock: &Option<Arc<dyn Fn() + Send + Sync + 'static>>,
 ) {
@@ -394,18 +394,18 @@ fn handle_frames(
             continue;
         }
 
-        trace!(backend = %backend_id, %frame, "notifications: received frame");
+        trace!(provider = %provider_id, %frame, "notifications: received frame");
 
         let inv: Invocation = match serde_json::from_str(frame) {
             Ok(i) => i,
             Err(e) => {
-                trace!(backend = %backend_id, error = %e, %frame, "notifications: unparseable frame (ping/ack/unknown)");
+                trace!(provider = %provider_id, error = %e, %frame, "notifications: unparseable frame (ping/ack/unknown)");
                 continue;
             }
         };
 
         let Some(target) = inv.target else {
-            trace!(backend = %backend_id, "notifications: frame with no target field");
+            trace!(provider = %provider_id, "notifications: frame with no target field");
             continue;
         };
 
@@ -414,27 +414,27 @@ fn handle_frames(
         // first argument.
         if target == "ReceiveMessage" {
             let Some(pt) = inv.arguments.first().and_then(|a| a.push_type) else {
-                trace!(backend = %backend_id, "notifications: ReceiveMessage with no push type");
+                trace!(provider = %provider_id, "notifications: ReceiveMessage with no push type");
                 continue;
             };
 
             let name = push_type::name(pt);
 
             if push_type::SYNC_TYPES.contains(&pt) {
-                debug!(backend = %backend_id, push_type = name, "notifications: sync event");
+                debug!(provider = %provider_id, push_type = name, "notifications: sync event");
                 if let Some(f) = on_sync {
                     f();
                 }
             } else if pt == push_type::LOG_OUT {
-                warn!(backend = %backend_id, push_type = name, "notifications: lock event");
+                warn!(provider = %provider_id, push_type = name, "notifications: lock event");
                 if let Some(f) = on_lock {
                     f();
                 }
             } else {
-                trace!(backend = %backend_id, push_type = pt, push_name = name, "notifications: unhandled push type");
+                trace!(provider = %provider_id, push_type = pt, push_name = name, "notifications: unhandled push type");
             }
         } else {
-            trace!(backend = %backend_id, %target, "notifications: non-ReceiveMessage target");
+            trace!(provider = %provider_id, %target, "notifications: non-ReceiveMessage target");
         }
     }
 }

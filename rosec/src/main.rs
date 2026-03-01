@@ -1455,10 +1455,7 @@ async fn cmd_provider_add_password(args: &[String]) -> Result<()> {
     .await?;
 
     let entry_id: String = proxy
-        .call(
-            "VaultAddPassword",
-            &(vault_id, pw.as_bytes().to_vec(), &label),
-        )
+        .call("AddPassword", &(vault_id, pw.as_bytes().to_vec(), &label))
         .await?;
 
     println!("Added password entry {entry_id} (label: {label}) to vault '{vault_id}'.");
@@ -1483,9 +1480,7 @@ async fn cmd_provider_list_passwords(args: &[String]) -> Result<()> {
     )
     .await?;
 
-    let entries: Vec<(String, String)> = proxy
-        .call("VaultListPasswords", &(vault_id.as_str(),))
-        .await?;
+    let entries: Vec<(String, String)> = proxy.call("ListPasswords", &(vault_id.as_str(),)).await?;
 
     if entries.is_empty() {
         println!("No password entries found for vault '{vault_id}'.");
@@ -1572,9 +1567,7 @@ async fn cmd_provider_remove_password(args: &[String]) -> Result<()> {
     .await?;
 
     // First list passwords to show the user what they're removing.
-    let entries: Vec<(String, String)> = proxy
-        .call("VaultListPasswords", &(vault_id.as_str(),))
-        .await?;
+    let entries: Vec<(String, String)> = proxy.call("ListPasswords", &(vault_id.as_str(),)).await?;
 
     let target = entries
         .iter()
@@ -1592,10 +1585,7 @@ async fn cmd_provider_remove_password(args: &[String]) -> Result<()> {
     println!("Removing password entry: {entry_id} {label_display}");
 
     let _: () = proxy
-        .call(
-            "VaultRemovePassword",
-            &(vault_id.as_str(), entry_id.as_str()),
-        )
+        .call("RemovePassword", &(vault_id.as_str(), entry_id.as_str()))
         .await?;
 
     println!("Removed password entry '{entry_id}' from vault '{vault_id}'.");

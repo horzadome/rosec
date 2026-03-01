@@ -193,7 +193,7 @@ impl ApiClient {
         if !status.is_success() {
             if let Ok(err_resp) = serde_json::from_str::<LoginErrorResponse>(&body) {
                 // Device not registered — server requires new-device verification.
-                // User must run `rosec backend register <id>` to register this
+                // User must run `rosec provider register <id>` to register this
                 // device UUID via the personal API key (client_credentials grant).
                 if err_resp.error.as_deref() == Some("device_error") {
                     return Err(BitwardenError::DeviceVerificationRequired);

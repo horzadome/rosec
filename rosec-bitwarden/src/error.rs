@@ -1,4 +1,4 @@
-//! Error types for the Bitwarden backend.
+//! Error types for the Bitwarden provider.
 
 #[derive(Debug, thiserror::Error)]
 pub enum BitwardenError {
@@ -12,9 +12,9 @@ pub enum BitwardenError {
     TwoFactorRequired { providers: Vec<u8> },
 
     /// Server rejected login because this device UUID is not yet registered.
-    /// The user must run `rosec backend register <id>` with their personal
+    /// The user must run `rosec provider register <id>` with their personal
     /// API key to register the device, then retry authentication.
-    #[error("new device verification required — run `rosec backend register <id>` first")]
+    #[error("new device verification required — run `rosec provider register <id>` first")]
     DeviceVerificationRequired,
 
     #[error("crypto error: {0}")]
