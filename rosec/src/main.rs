@@ -175,6 +175,7 @@ EXAMPLES:
     rosec search -s                                 sync first, then list all
     rosec search type=login                         only login items
     rosec search username=alice                     items with username 'alice'
+    rosec search rosec_provider=personal            items from 'personal' provider
     rosec search type=login username=alice          combine filters
     rosec search name=\"GitHub*\"                     glob on item name
     rosec search --format=json type=login           JSON output
@@ -2088,9 +2089,10 @@ fn trunc(s: &str, max: usize) -> String {
 
 /// Print results as an aligned table.
 ///
-/// Columns: TYPE | NAME | USERNAME | URI | ID [| PATH]
+/// Columns: TYPE | PROVIDER | NAME | USERNAME | URI | ID [| PATH]
 fn print_search_table(items: &[ItemSummary], show_path: bool) {
     const H_TYPE: &str = "TYPE";
+    const H_PROV: &str = "PROVIDER";
     const H_NAME: &str = "NAME";
     const H_USER: &str = "USERNAME";
     const H_URI: &str = "URI";
@@ -2098,9 +2100,10 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
 
     // Hard caps keep the table usable on a standard 120-column terminal.
     const MAX_TYPE: usize = 10;
+    const MAX_PROV: usize = 20;
     const MAX_NAME: usize = 30;
     const MAX_USER: usize = 30;
-    const MAX_URI: usize = 45;
+    const MAX_URI: usize = 40;
     const W_ID: usize = 16; // always exactly 16 hex chars
 
     let w_type = items
@@ -2115,6 +2118,18 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
         .max()
         .unwrap_or(0)
         .max(H_TYPE.len());
+    let w_prov = items
+        .iter()
+        .map(|i| {
+            i.attrs
+                .get("rosec_provider")
+                .map(String::len)
+                .unwrap_or(0)
+                .min(MAX_PROV)
+        })
+        .max()
+        .unwrap_or(0)
+        .max(H_PROV.len());
     let w_name = items
         .iter()
         .map(|i| i.label.len().min(MAX_NAME))
@@ -2151,6 +2166,8 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
     let w_id_col = W_ID.max(H_ID.len());
     let sep_w = w_type
         + 2
+        + w_prov
+        + 2
         + w_name
         + 2
         + w_user
@@ -2162,23 +2179,29 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
 
     if show_path {
         println!(
-            "{:<w_type$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {:<w_id_col$}  PATH",
-            H_TYPE, H_NAME, H_USER, H_URI, H_ID,
+            "{:<w_type$}  {:<w_prov$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {:<w_id_col$}  PATH",
+            H_TYPE, H_PROV, H_NAME, H_USER, H_URI, H_ID,
         );
     } else {
         println!(
-            "{:<w_type$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {}",
-            H_TYPE, H_NAME, H_USER, H_URI, H_ID,
+            "{:<w_type$}  {:<w_prov$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {}",
+            H_TYPE, H_PROV, H_NAME, H_USER, H_URI, H_ID,
         );
     }
     println!("{}", "-".repeat(sep_w));
 
     for item in items {
         let item_type = item.attrs.get("type").map(String::as_str).unwrap_or("");
+        let provider = item
+            .attrs
+            .get("rosec_provider")
+            .map(String::as_str)
+            .unwrap_or("");
         let username = item.attrs.get("username").map(String::as_str).unwrap_or("");
         let uri = item.attrs.get("uri").map(String::as_str).unwrap_or("");
 
         let t = trunc(item_type, MAX_TYPE);
+        let p = trunc(provider, MAX_PROV);
         let n = trunc(&item.label, MAX_NAME);
         let u = trunc(username, MAX_USER);
         let r = trunc(uri, MAX_URI);
@@ -2186,8 +2209,9 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
 
         if show_path {
             println!(
-                "{:<w_type$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {:<w_id_col$}  {}{}",
+                "{:<w_type$}  {:<w_prov$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {:<w_id_col$}  {}{}",
                 t,
+                p,
                 n,
                 u,
                 r,
@@ -2197,8 +2221,9 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
             );
         } else {
             println!(
-                "{:<w_type$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {}{}",
+                "{:<w_type$}  {:<w_prov$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {}{}",
                 t,
+                p,
                 n,
                 u,
                 r,
@@ -2228,7 +2253,7 @@ fn print_search_kv(items: &[ItemSummary], show_path: bool) {
         sorted_attrs.sort_by_key(|(k, _)| k.as_str());
         for (k, v) in &sorted_attrs {
             // Skip internal/redundant attrs in kv mode.
-            if matches!(k.as_str(), "provider_id" | "xdg:schema") {
+            if k.as_str() == "xdg:schema" {
                 continue;
             }
             println!("{k}={v}");

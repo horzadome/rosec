@@ -1586,6 +1586,11 @@ impl ServiceState {
                     if item.provider_id.is_empty() {
                         item.provider_id = bid.clone();
                     }
+                    // Stamp provider identity so clients can see where items
+                    // came from and filter by provider in searches.
+                    item.attributes
+                        .entry("rosec_provider".to_string())
+                        .or_insert_with(|| item.provider_id.clone());
                     // Stamp collection label if configured and not already set
                     // by the provider itself.
                     if let Some(col) = &collection_label {
