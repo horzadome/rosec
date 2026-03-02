@@ -66,7 +66,14 @@ impl Drop for TermiosGuard {
 ///
 /// The read buffer is `Zeroizing<Vec<u8>>` so the raw bytes are scrubbed on
 /// drop — no plain copy of the secret ever lingers on the heap.
-pub fn read_hidden(fd: RawFd) -> io::Result<Zeroizing<String>> {
+/// Read one line from `fd` with terminal echo disabled.
+///
+/// If `cancel_fd` is `Some(cfd)`, a `poll()` call races `fd` against `cfd`
+/// before the blocking `read`.  If `cfd` becomes readable (or gets a hangup /
+/// error) first the function returns `Err(ErrorKind::Interrupted)` so the
+/// caller can clean up without blocking.  Closing the write end of a pipe
+/// passed as `cancel_fd` is the intended cancellation mechanism.
+pub fn read_hidden(fd: RawFd, cancel_fd: Option<RawFd>) -> io::Result<Zeroizing<String>> {
     use std::os::unix::io::FromRawFd as _;
 
     // Save current termios and install the RAII guard immediately.
@@ -92,6 +99,45 @@ pub fn read_hidden(fd: RawFd) -> io::Result<Zeroizing<String>> {
     unsafe {
         if libc::tcsetattr(fd, libc::TCSAFLUSH, &noecho) != 0 {
             return Err(io::Error::last_os_error());
+        }
+    }
+
+    // If a cancel fd was provided, poll both fds before committing to a
+    // blocking read.  If the cancel pipe becomes readable (or hangs up) first
+    // we return Interrupted so the thread exits without reading from the tty.
+    if let Some(cfd) = cancel_fd {
+        let mut fds: [libc::pollfd; 2] = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: cfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            // -1 timeout = block until at least one fd is ready.
+            let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue; // EINTR — retry
+                }
+                return Err(e);
+            }
+            // Cancel pipe ready → interrupted.
+            if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "tty read cancelled",
+                ));
+            }
+            if fds[0].revents & libc::POLLIN != 0 {
+                break; // tty is ready — fall through to blocking read
+            }
         }
     }
 
@@ -139,12 +185,16 @@ pub fn read_hidden(fd: RawFd) -> io::Result<Zeroizing<String>> {
 /// performed.  All blocking I/O runs on a `spawn_blocking` thread so the
 /// tokio executor is not stalled.
 ///
+/// If `cancel_fd` is `Some`, it is passed to `read_hidden` so that closing
+/// the write end of the associated pipe aborts the blocking read cleanly.
+///
 /// Returns `Zeroizing<String>` so the value is scrubbed on drop.
 pub async fn prompt_field_on_fd(
     fd: RawFd,
     label: &str,
     placeholder: &str,
     kind: &str,
+    cancel_fd: Option<RawFd>,
 ) -> Result<Zeroizing<String>> {
     let prompt_str = if placeholder.is_empty() {
         format!("{label}: ")
@@ -166,7 +216,7 @@ pub async fn prompt_field_on_fd(
             "password" | "secret" => {
                 writer.write_all(prompt_str.as_bytes())?;
                 writer.flush()?;
-                Ok(read_hidden(fd)?)
+                Ok(read_hidden(fd, cancel_fd)?)
             }
             _ => {
                 writer.write_all(prompt_str.as_bytes())?;
@@ -194,10 +244,14 @@ pub async fn prompt_field_on_fd(
 /// Collect all `fields` from the terminal using `fd`, printing a blank line
 /// before the first prompt.
 ///
+/// If `cancel_fd` is `Some`, it is threaded into each `prompt_field_on_fd`
+/// call so that cancellation can interrupt any blocking read in the sequence.
+///
 /// Returns a map of `field.id → Zeroizing<String>`.
 pub async fn collect_tty_on_fd(
     fd: RawFd,
     fields: &[TtyField],
+    cancel_fd: Option<RawFd>,
 ) -> Result<HashMap<String, Zeroizing<String>>> {
     // Print a blank line before the first prompt for visual spacing.
     let _ = tokio::task::spawn_blocking(move || {
@@ -212,7 +266,8 @@ pub async fn collect_tty_on_fd(
 
     let mut map = HashMap::new();
     for field in fields {
-        let v = prompt_field_on_fd(fd, &field.label, &field.placeholder, &field.kind).await?;
+        let v = prompt_field_on_fd(fd, &field.label, &field.placeholder, &field.kind, cancel_fd)
+            .await?;
         map.insert(field.id.clone(), v);
     }
     Ok(map)

@@ -424,6 +424,19 @@ impl ServiceState {
             .map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")))
     }
 
+    /// Spawn `fut` on the stored Tokio runtime and return its `JoinHandle`.
+    ///
+    /// Unlike `run_on_tokio`, this does **not** await the handle — the caller
+    /// receives it and can race it against other futures (e.g. a peer-disconnect
+    /// signal) before deciding whether to abort it.
+    pub fn spawn_on_tokio<F, T>(&self, fut: F) -> tokio::task::JoinHandle<T>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.tokio_handle.spawn(fut)
+    }
+
     /// Return the number of currently registered providers.
     pub fn provider_count(&self) -> usize {
         self.providers
@@ -990,7 +1003,7 @@ impl ServiceState {
             let _ = w.flush();
         }
 
-        let password = crate::tty::read_hidden(fd)
+        let password = crate::tty::read_hidden(fd, None)
             .map_err(|e| FdoError::Failed(format!("built-in TTY prompt read error: {e}")))?;
 
         self.finish_prompt(prompt_path);

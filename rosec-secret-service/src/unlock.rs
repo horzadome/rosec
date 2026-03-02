@@ -39,8 +39,16 @@ pub struct UnlockResult {
 /// fail (wrong password) or require registration are handled individually
 /// afterwards.
 ///
+/// `cancel_fd` is the read end of a pipe; closing the write end from outside
+/// this function will abort any in-progress blocking TTY read.  Pass `None`
+/// if cancellation is not needed.
+///
 /// This function must be called from a Tokio task context.
-pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<Vec<UnlockResult>> {
+pub async fn unlock_with_tty(
+    state: Arc<ServiceState>,
+    tty_fd: RawFd,
+    cancel_fd: Option<RawFd>,
+) -> Result<Vec<UnlockResult>> {
     let providers = state.providers_ordered();
     let mut locked: Vec<_> = Vec::new();
 
@@ -66,7 +74,8 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
         let id = provider.id().to_string();
         let fields = provider_auth_fields(provider.as_ref());
         let _password =
-            auth_provider_with_tty_inner(&state, tty_fd, &id, &fields, None, false).await?;
+            auth_provider_with_tty_inner(&state, tty_fd, cancel_fd, &id, &fields, None, false)
+                .await?;
         results.push(UnlockResult {
             provider_id: id.clone(),
             success: true,
@@ -101,7 +110,7 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
         .first()
         .ok_or_else(|| anyhow!("provider returned no auth fields"))?;
 
-    let collected = collect_tty_on_fd(tty_fd, std::slice::from_ref(pw_field)).await?;
+    let collected = collect_tty_on_fd(tty_fd, std::slice::from_ref(pw_field), cancel_fd).await?;
 
     // Extract the raw password value.  The collected map is keyed by the first
     // provider's field ID, but other providers may use a different field name
@@ -179,9 +188,16 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
         // Build prefill map using this provider's own password field name.
         let mut prefill = HashMap::new();
         prefill.insert(pw_field_id, password);
-        let _password =
-            auth_provider_with_tty_inner(&state, tty_fd, &id, &fields, Some(prefill), false)
-                .await?;
+        let _password = auth_provider_with_tty_inner(
+            &state,
+            tty_fd,
+            cancel_fd,
+            &id,
+            &fields,
+            Some(prefill),
+            false,
+        )
+        .await?;
         results.push(UnlockResult {
             provider_id: id.clone(),
             success: true,
@@ -201,7 +217,8 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
             provider_auth_fields(b.as_ref())
         };
         let _password =
-            auth_provider_with_tty_inner(&state, tty_fd, &id, &fields, None, false).await?;
+            auth_provider_with_tty_inner(&state, tty_fd, cancel_fd, &id, &fields, None, false)
+                .await?;
         results.push(UnlockResult {
             provider_id: id.clone(),
             success: true,
@@ -224,6 +241,10 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
 /// This is the `AuthProviderWithTty` D-Bus method implementation.
 /// Must be called from a Tokio task context.
 ///
+/// `cancel_fd` is the read end of a pipe; closing the write end from outside
+/// this function will abort any in-progress blocking TTY read.  Pass `None`
+/// if cancellation is not needed.
+///
 /// When `force` is `true`, the normal unlock attempt is skipped and the
 /// registration flow is entered unconditionally.  This allows re-registering
 /// provider credentials (e.g. rotating a Bitwarden SM access token or
@@ -231,6 +252,7 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
 pub async fn auth_provider_with_tty(
     state: Arc<ServiceState>,
     tty_fd: RawFd,
+    cancel_fd: Option<RawFd>,
     provider_id: &str,
     force: bool,
 ) -> Result<()> {
@@ -241,7 +263,8 @@ pub async fn auth_provider_with_tty(
         provider_auth_fields(b.as_ref())
     };
     let password =
-        auth_provider_with_tty_inner(&state, tty_fd, provider_id, &fields, None, force).await?;
+        auth_provider_with_tty_inner(&state, tty_fd, cancel_fd, provider_id, &fields, None, force)
+            .await?;
     // auth_provider_inner (called by auth_provider_with_tty_inner) already
     // called mark_provider_unlocked + touch_activity.
     // Sync immediately so on_sync_succeeded callbacks fire (e.g. SSH rebuild).
@@ -286,6 +309,7 @@ pub async fn auth_provider_with_tty(
 async fn auth_provider_with_tty_inner(
     state: &Arc<ServiceState>,
     tty_fd: RawFd,
+    cancel_fd: Option<RawFd>,
     provider_id: &str,
     fields: &[TtyField],
     prefill: Option<HashMap<String, Zeroizing<String>>>,
@@ -338,7 +362,7 @@ async fn auth_provider_with_tty_inner(
             print_on_fd(tty_fd, &format!("Unlocking {provider_id}  ({name})\n"));
         }
 
-        collect_tty_on_fd(tty_fd, fields).await?
+        collect_tty_on_fd(tty_fd, fields, cancel_fd).await?
     };
 
     // If the provider requires new-password confirmation (e.g. creating a new
@@ -361,7 +385,8 @@ async fn auth_provider_with_tty_inner(
                 .unwrap_or_else(|| Zeroizing::new(String::new()));
             loop {
                 let confirm_label = format!("Confirm {}", field.label);
-                let entry = prompt_field_on_fd(tty_fd, &confirm_label, "", &field.kind).await?;
+                let entry =
+                    prompt_field_on_fd(tty_fd, &confirm_label, "", &field.kind, cancel_fd).await?;
                 if entry.as_str() == original.as_str() {
                     break;
                 }
@@ -413,7 +438,7 @@ async fn auth_provider_with_tty_inner(
             })
             .collect();
 
-        let reg_extra = collect_tty_on_fd(tty_fd, &reg_fields).await?;
+        let reg_extra = collect_tty_on_fd(tty_fd, &reg_fields, cancel_fd).await?;
         cred_map.extend(reg_extra);
 
         state

@@ -3868,6 +3868,7 @@ dependencies = [
  "async-trait",
  "base64",
  "cbc",
+ "futures-util",
  "hkdf",
  "libc",
  "num-bigint",

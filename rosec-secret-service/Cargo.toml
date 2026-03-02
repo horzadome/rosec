@@ -26,5 +26,6 @@ hkdf = { workspace = true }
 num-bigint = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
+futures-util = { workspace = true }
 libc = { workspace = true }
 wildmatch = { workspace = true }

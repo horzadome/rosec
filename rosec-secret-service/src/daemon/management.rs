@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use futures_util::StreamExt as _;
 use tracing::debug;
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
@@ -8,7 +9,7 @@ use zbus::message::Header;
 use zvariant::OwnedFd;
 
 use crate::state::ServiceState;
-use crate::unlock::{UnlockResult, auth_provider_with_tty, unlock_with_tty};
+use crate::unlock::{auth_provider_with_tty, unlock_with_tty};
 
 /// Log the D-Bus caller at debug level for a management method.
 fn log_caller(method: &str, header: &Header<'_>) {
@@ -237,10 +238,7 @@ impl RosecManagement {
     ) -> Result<Vec<UnlockResultEntry>, FdoError> {
         log_caller("UnlockWithTty", &header);
 
-        // Duplicate the fd so it survives the move into the Tokio task.
-        // SAFETY: as_raw_fd() returns a valid fd owned by tty_fd (which is
-        // kept alive until this function returns); dup() produces a new
-        // independent fd that we own and close after the task completes.
+        // Duplicate the tty fd so it survives the move into the Tokio task.
         use std::os::unix::io::AsRawFd as _;
         let raw: libc::c_int = unsafe { libc::dup(tty_fd.as_raw_fd()) };
         if raw < 0 {
@@ -250,26 +248,46 @@ impl RosecManagement {
             )));
         }
 
-        let state = Arc::clone(&self.state);
-        let results: Vec<UnlockResult> = self
-            .state
-            .run_on_tokio(async move {
-                let res = unlock_with_tty(state, raw).await;
-                // Close our dup'd fd after the unlock completes.
-                unsafe { libc::close(raw) };
-                res
-            })
-            .await?
-            .map_err(|e| FdoError::Failed(format!("unlock_with_tty error: {e}")))?;
+        // Create a cancellation pipe.  The read end is passed into the auth
+        // task; closing the write end from this side triggers poll() in
+        // read_hidden() to return POLLHUP and abort the blocking read.
+        let (cancel_r, cancel_w) = make_cancel_pipe()?;
 
-        Ok(results
-            .into_iter()
-            .map(|r| UnlockResultEntry {
-                provider_id: r.provider_id,
-                success: r.success,
-                message: r.message,
-            })
-            .collect())
+        let state = Arc::clone(&self.state);
+        let handle = self.state.spawn_on_tokio(async move {
+            let res = unlock_with_tty(state, raw, Some(cancel_r)).await;
+            // Close our dup'd fds after the unlock completes (whether success
+            // or failure) so no fd leaks occur.
+            unsafe {
+                libc::close(raw);
+                libc::close(cancel_r);
+            }
+            res
+        });
+
+        // Race the auth task against peer-disconnect.  If the caller exits
+        // before the task finishes, signal the cancel pipe and abort the task
+        // so its spawn_blocking thread unblocks via poll().
+        let result = wait_for_task_or_peer_exit(
+            handle,
+            cancel_w,
+            header.sender().map(|s| s.as_str().to_string()),
+            &self.state.conn,
+        )
+        .await;
+
+        match result {
+            Ok(Ok(results)) => Ok(results
+                .into_iter()
+                .map(|r| UnlockResultEntry {
+                    provider_id: r.provider_id,
+                    success: r.success,
+                    message: r.message,
+                })
+                .collect()),
+            Ok(Err(e)) => Err(FdoError::Failed(format!("unlock_with_tty error: {e}"))),
+            Err(e) => Err(e),
+        }
     }
 
     /// Authenticate a specific provider using credentials prompted on the caller's TTY.
@@ -297,15 +315,33 @@ impl RosecManagement {
             )));
         }
 
+        let (cancel_r, cancel_w) = make_cancel_pipe()?;
+
         let state = Arc::clone(&self.state);
-        self.state
-            .run_on_tokio(async move {
-                let res = auth_provider_with_tty(state, raw, &provider_id, force).await;
-                unsafe { libc::close(raw) };
-                res
-            })
-            .await?
-            .map_err(|e| FdoError::Failed(format!("auth_provider_with_tty error: {e}")))
+        let handle = self.state.spawn_on_tokio(async move {
+            let res = auth_provider_with_tty(state, raw, Some(cancel_r), &provider_id, force).await;
+            unsafe {
+                libc::close(raw);
+                libc::close(cancel_r);
+            }
+            res
+        });
+
+        let result = wait_for_task_or_peer_exit(
+            handle,
+            cancel_w,
+            header.sender().map(|s| s.as_str().to_string()),
+            &self.state.conn,
+        )
+        .await;
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(FdoError::Failed(format!(
+                "auth_provider_with_tty error: {e}"
+            ))),
+            Err(e) => Err(e),
+        }
     }
 
     /// Authenticate a provider by reading a password from a pipe fd.
@@ -661,6 +697,129 @@ impl RosecManagement {
                     .map_err(|e| FdoError::Failed(format!("change_password failed: {e}")))
             })
             .await?
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation helpers for TTY methods
+// ---------------------------------------------------------------------------
+
+/// Create a `(read_fd, write_fd)` pipe used to signal cancellation.
+///
+/// The read end is passed into the auth task where `read_hidden()` polls it
+/// alongside the tty fd.  Closing (or writing to) the write end causes the
+/// `poll()` inside `read_hidden()` to return `POLLHUP`/`POLLIN` and the
+/// blocking read is abandoned cleanly.
+///
+/// Both fds are set close-on-exec to prevent leaking into child processes.
+fn make_cancel_pipe() -> Result<(libc::c_int, libc::c_int), FdoError> {
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    // SAFETY: fds is a valid two-element array; pipe2 fills [read, write].
+    let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if ret < 0 {
+        return Err(FdoError::Failed(format!(
+            "pipe2 failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok((fds[0], fds[1]))
+}
+
+/// Race `task_handle` against a D-Bus `NameOwnerChanged` watch for `peer_name`.
+///
+/// If the task completes first, the cancel write-fd is closed (no-op for the
+/// task which already finished) and the task result is returned.
+///
+/// If the peer disappears (client exited) before the task finishes:
+///   1. The cancel write-fd is closed; this causes `POLLHUP` on the read end,
+///      unblocking any `poll()` inside `read_hidden()`.
+///   2. The task handle is aborted so Tokio drops it promptly.
+///   3. An `FdoError::Failed("peer disconnected")` is returned.
+///
+/// If no `peer_name` is available (e.g. the message had no sender), the task
+/// is awaited without any peer-disconnect supervision.
+async fn wait_for_task_or_peer_exit<T: Send + 'static>(
+    task_handle: tokio::task::JoinHandle<T>,
+    cancel_write_fd: libc::c_int,
+    peer_name: Option<String>,
+    conn: &zbus::Connection,
+) -> Result<T, FdoError> {
+    // RAII wrapper: close the write end of the cancel pipe when this guard is
+    // dropped, regardless of which branch of the select! wins.  Closing the
+    // write end is a no-op (EBADF) if the task already finished and we close
+    // it normally — libc::close on an already-closed fd returns an error we
+    // intentionally ignore.
+    struct CancelPipeGuard(libc::c_int);
+    impl Drop for CancelPipeGuard {
+        fn drop(&mut self) {
+            if self.0 >= 0 {
+                unsafe { libc::close(self.0) };
+            }
+        }
+    }
+    let _guard = CancelPipeGuard(cancel_write_fd);
+
+    let Some(peer) = peer_name else {
+        // No peer name — just await the task.
+        return task_handle
+            .await
+            .map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")));
+    };
+
+    // Subscribe to NameOwnerChanged for the caller's unique name.  When the
+    // new-owner field is empty the name has been released (process exited).
+    let dbus_proxy = match zbus::fdo::DBusProxy::new(conn).await {
+        Ok(p) => p,
+        Err(_) => {
+            // Can't set up the watch — fall back to plain await.
+            return task_handle
+                .await
+                .map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")));
+        }
+    };
+    let mut noc_stream = match dbus_proxy.receive_name_owner_changed().await {
+        Ok(s) => s,
+        Err(_) => {
+            return task_handle
+                .await
+                .map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")));
+        }
+    };
+
+    // Pin the task handle so we can poll it without consuming it, enabling us
+    // to call abort() on the abort handle if the peer disconnects.
+    let abort_handle = task_handle.abort_handle();
+    tokio::pin!(task_handle);
+
+    tokio::select! {
+        // Task finished normally.
+        join_result = &mut task_handle => {
+            join_result.map_err(|e| FdoError::Failed(format!("tokio task panicked: {e}")))
+        }
+        // Watch NameOwnerChanged for this peer.
+        _ = async {
+            loop {
+                let Some(signal) = noc_stream.next().await else { break };
+                let args = match signal.args() {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                // new_owner is empty when the name is released.
+                if args.name.as_str() == peer && args.new_owner.as_deref().unwrap_or("").is_empty() {
+                    break;
+                }
+            }
+        } => {
+            // Peer disconnected.
+            // 1. Abort the Tokio task (drops the async future and its
+            //    spawn_blocking continuations as soon as the blocking thread
+            //    yields or finishes).
+            abort_handle.abort();
+            // 2. The _guard Drop (below) will close cancel_write_fd, which
+            //    triggers POLLHUP on the read end inside read_hidden() so the
+            //    spawn_blocking thread exits without waiting for user input.
+            Err(FdoError::Failed("peer disconnected — TTY auth cancelled".to_string()))
+        }
     }
 }
 
