@@ -50,11 +50,10 @@ pub fn derive_key(
 
 /// Derive a MAC key from an encryption key using HKDF-SHA256.
 ///
-/// NOTE: The salt is `None` for backward compatibility with existing vaults.
-/// A future vault format version should use a domain-specific salt like
-/// `b"rosec-vault-mac-v1"` for stronger domain separation.
+/// Uses a domain-specific salt for strong domain separation between the
+/// encryption key and the MAC key.
 pub fn derive_mac_key(encryption_key: &[u8]) -> Result<Zeroizing<[u8; MAC_KEY_LEN]>, CryptoError> {
-    let hkdf = Hkdf::<Sha256>::new(None, encryption_key);
+    let hkdf = Hkdf::<Sha256>::new(Some(b"rosec-vault-mac-v1"), encryption_key);
     let mut mac_key = Zeroizing::new([0u8; MAC_KEY_LEN]);
     hkdf.expand(b"mac key", &mut *mac_key)
         .map_err(CryptoError::HkdfExpand)?;
