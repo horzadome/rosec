@@ -1183,17 +1183,13 @@ impl ServiceState {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        // Use WithRegistration whenever the provider declares registration_info,
-        // even if no extra fields were collected.  This lets providers (e.g.
-        // LocalVault on first-time creation) distinguish a normal unlock attempt
-        // from a confirmed-creation retry purely from the input variant.
-        let input = if !registration_fields.is_empty() || provider.registration_info().is_some() {
+        let input = if registration_fields.is_empty() {
+            UnlockInput::Password(password)
+        } else {
             UnlockInput::WithRegistration {
                 password,
                 registration_fields,
             }
-        } else {
-            UnlockInput::Password(password)
         };
 
         provider.unlock(input).await.map_err(map_provider_error)?;
@@ -1201,6 +1197,71 @@ impl ServiceState {
         self.mark_provider_unlocked(provider_id);
         self.touch_activity();
         info!(provider = %provider_id, "provider authenticated via AuthProvider");
+        Ok(())
+    }
+
+    /// Like [`auth_provider_inner`] but always uses `UnlockInput::WithRegistration`,
+    /// even when `fields` contains no extra registration values.
+    ///
+    /// Used exclusively for the confirmed-creation retry path: after the user has
+    /// confirmed their password in the TTY prompt, we call this so providers like
+    /// `LocalVault` can distinguish "first attempt, file missing" (`Password`) from
+    /// "confirmed, create the file now" (`WithRegistration`).
+    pub(crate) async fn auth_provider_inner_confirmed(
+        &self,
+        provider_id: &str,
+        fields: HashMap<String, Zeroizing<String>>,
+    ) -> Result<(), FdoError> {
+        let provider = self
+            .provider_by_id(provider_id)
+            .ok_or_else(|| FdoError::Failed(format!("provider '{provider_id}' not found")))?;
+
+        let pw_field = provider.password_field();
+        let pw_field_id = pw_field.id;
+
+        let password_value = fields.get(pw_field_id).ok_or_else(|| {
+            FdoError::Failed(format!(
+                "required field '{pw_field_id}' missing for provider '{provider_id}'"
+            ))
+        })?;
+
+        if pw_field.required && password_value.is_empty() {
+            return Err(FdoError::Failed(format!(
+                "field '{pw_field_id}' must not be empty"
+            )));
+        }
+
+        let password = password_value.clone();
+
+        // Collect any extra registration fields from the map (same logic as
+        // auth_provider_inner), but always use WithRegistration regardless.
+        let reg_field_ids: std::collections::HashSet<&str> = provider
+            .registration_info()
+            .map(|ri| ri.fields.iter().map(|f| f.id).collect())
+            .unwrap_or_default();
+        let auth_field_ids: std::collections::HashSet<&str> =
+            provider.auth_fields().iter().map(|f| f.id).collect();
+        let mut all_extra_ids: std::collections::HashSet<&str> =
+            reg_field_ids.union(&auth_field_ids).copied().collect();
+        all_extra_ids.remove(pw_field_id);
+
+        let registration_fields: HashMap<String, Zeroizing<String>> = fields
+            .iter()
+            .filter(|(k, v)| all_extra_ids.contains(k.as_str()) && !v.is_empty())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        // Always WithRegistration — this is the confirmed-creation retry.
+        let input = UnlockInput::WithRegistration {
+            password,
+            registration_fields,
+        };
+
+        provider.unlock(input).await.map_err(map_provider_error)?;
+
+        self.mark_provider_unlocked(provider_id);
+        self.touch_activity();
+        info!(provider = %provider_id, "provider authenticated via AuthProvider (confirmed)");
         Ok(())
     }
 

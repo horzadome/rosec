@@ -401,11 +401,11 @@ async fn auth_provider_with_tty_inner(
         let reg_extra = collect_tty_on_fd(tty_fd, &reg_fields).await?;
         cred_map.extend(reg_extra);
 
-        // Retry with registration fields included.
-        // cred_map now contains both the original credentials and registration
-        // fields — all as Zeroizing<String> values that zeroize on drop.
+        // Retry with registration fields included.  Use the confirmed variant so
+        // providers (e.g. LocalVault) that distinguish first-attempt from
+        // confirmed-creation by input variant get WithRegistration unconditionally.
         state
-            .auth_provider_inner(provider_id, cred_map.clone())
+            .auth_provider_inner_confirmed(provider_id, cred_map.clone())
             .await
             .map_err(|e| anyhow!("registration failed for '{provider_id}': {e}"))?;
     } else if let Some(result) = auth_result {
