@@ -571,7 +571,7 @@ pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
     fn name(&self) -> &str;
 
-    /// The provider type identifier (e.g. `"bitwarden"`, `"bitwarden-sm"`, `"local"`).
+    /// The provider type identifier (e.g. `"bitwarden-pm"`, `"bitwarden-sm"`, `"local"`).
     ///
     /// Used by `rosec provider list` to show what kind of provider each entry is.
     fn kind(&self) -> &str;

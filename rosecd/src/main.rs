@@ -758,9 +758,9 @@ fn wire_provider_callbacks(
 
 /// Build all configured providers, in order.
 ///
-/// Local vaults (`kind = "local"`) and external providers (`kind = "bitwarden"`,
-/// etc.) are built from the unified `[[provider]]` config entries.  Both go
-/// through the same `Provider` trait.
+/// Local vaults (`kind = "local"`) and external providers (`kind = "bitwarden-pm"`,
+/// `"bitwarden-sm"`, etc.) are built from the unified `[[provider]]` config entries.
+/// Both go through the same `Provider` trait.
 async fn build_providers(
     config: &Config,
     plugin_registry: &rosec_wasm::PluginRegistry,
@@ -1047,7 +1047,7 @@ async fn config_watcher(
                 .get(id)
                 .is_some_and(|old_fp| new_map.get(id).is_some_and(|new_fp| old_fp != new_fp));
             (is_new || is_changed)
-                && !matches!(entry.kind.as_str(), "local" | "bitwarden" | "bitwarden-sm")
+                && !matches!(entry.kind.as_str(), "local" | "bitwarden-sm")
                 && !plugin_registry.contains_kind(&entry.kind)
         });
         if needs_rescan {
@@ -1165,67 +1165,6 @@ async fn build_single_provider(
     plugin_registry: &rosec_wasm::PluginRegistry,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     match entry.kind.as_str() {
-        "bitwarden" => {
-            let email = entry
-                .options
-                .get("email")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("bitwarden provider '{}' requires 'email' option", entry.id)
-                })?
-                .to_string();
-
-            let region = entry
-                .options
-                .get("region")
-                .and_then(|v| v.as_str())
-                .and_then(rosec_bitwarden::BitwardenRegion::parse);
-
-            let base_url = entry
-                .options
-                .get("base_url")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let api_url = entry
-                .options
-                .get("api_url")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let identity_url = entry
-                .options
-                .get("identity_url")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-
-            let realtime_sync = entry
-                .options
-                .get("realtime_sync")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-
-            let notifications_poll_interval_secs = entry
-                .options
-                .get("notifications_poll_interval_secs")
-                .and_then(|v| v.as_u64())
-                .map(|v| v.max(1))
-                .unwrap_or(3600);
-
-            let bw_config = rosec_bitwarden::BitwardenConfig {
-                id: entry.id.clone(),
-                email,
-                region,
-                base_url,
-                api_url,
-                identity_url,
-                realtime_sync,
-                notifications_poll_interval_secs,
-            };
-
-            Ok(Arc::new(
-                rosec_bitwarden::BitwardenProvider::new(bw_config)
-                    .map_err(|e| anyhow::anyhow!("bitwarden provider '{}': {e}", entry.id))?,
-            ))
-        }
         "bitwarden-sm" => {
             let organization_id = entry
                 .options
@@ -1396,9 +1335,8 @@ fn load_config(path: &PathBuf) -> Result<Config> {
 
 // ── Device ID persistence ────────────────────────────────────────
 //
-// Bitwarden APIs require a stable `deviceIdentifier`.  The native
-// provider (`rosec-bitwarden`) manages its own copy; the WASM provider
-// cannot access the filesystem, so the host injects the same device ID
+// Bitwarden APIs require a stable `deviceIdentifier`.  The WASM provider
+// cannot access the filesystem, so the host injects the device ID
 // into its init options.
 
 /// Return `$XDG_DATA_HOME/rosec/device_id` (default

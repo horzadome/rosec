@@ -25,7 +25,7 @@ cbc        = { workspace = true }
 hmac       = { workspace = true }
 base64     = { workspace = true }
 
-# HTTP client (same config as rosec-bitwarden)
+# HTTP client (same config as rosec-bitwarden-pm)
 reqwest = { workspace = true }
 uuid    = { workspace = true, features = ["serde"] }
 

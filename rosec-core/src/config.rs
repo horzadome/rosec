@@ -129,7 +129,7 @@ impl Default for PromptTheme {
 /// A unified provider configuration entry.
 ///
 /// Covers both local vaults (`kind = "local"`) and external providers
-/// (`kind = "bitwarden"`, `"bitwarden-sm"`, etc.).
+/// (`kind = "bitwarden-pm"`, `"bitwarden-sm"`, etc.).
 ///
 /// `Debug` is manually implemented to redact known sensitive option keys
 /// (passwords, tokens, secrets) so they don't appear in logs.
@@ -138,7 +138,7 @@ pub struct ProviderEntry {
     /// Unique identifier for this provider.
     pub id: String,
 
-    /// Provider type: `"local"`, `"bitwarden"`, `"bitwarden-sm"`, etc.
+    /// Provider type: `"local"`, `"bitwarden-pm"`, `"bitwarden-sm"`, etc.
     pub kind: String,
 
     /// Whether this provider is active.
@@ -150,7 +150,7 @@ pub struct ProviderEntry {
     /// ```toml
     /// [[provider]]
     /// id      = "bw1"
-    /// kind    = "bitwarden"
+    /// kind    = "bitwarden-pm"
     /// enabled = false          # temporarily disabled
     /// ```
     #[serde(default = "default_true")]
@@ -390,7 +390,7 @@ mod tests {
         let toml_str = r#"
             [[provider]]
             id = "bw1"
-            kind = "bitwarden"
+            kind = "bitwarden-pm"
 
             [provider.options]
             email = "test@example.com"
@@ -399,7 +399,7 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.provider.len(), 1);
         assert_eq!(cfg.provider[0].id, "bw1");
-        assert_eq!(cfg.provider[0].kind, "bitwarden");
+        assert_eq!(cfg.provider[0].kind, "bitwarden-pm");
         assert_eq!(
             cfg.provider[0]
                 .options
@@ -490,11 +490,11 @@ mod tests {
         let toml_str = r#"
             [[provider]]
             id = "bw1"
-            kind = "bitwarden"
+            kind = "bitwarden-pm"
 
             [[provider]]
             id = "bw2"
-            kind = "bitwarden"
+            kind = "bitwarden-pm"
 
             [provider.options]
             email = "other@example.com"
@@ -563,7 +563,7 @@ mod tests {
         let toml_str = r#"
             [[provider]]
             id = "bw1"
-            kind = "bitwarden"
+            kind = "bitwarden-pm"
             return_attr = ["password", "totp", "number", "notes"]
             match_attr = ["username", "uri"]
 
@@ -591,7 +591,7 @@ mod tests {
         let toml_str = r#"
             [[provider]]
             id = "bw1"
-            kind = "bitwarden"
+            kind = "bitwarden-pm"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(cfg.provider[0].return_attr.is_none());
@@ -641,7 +641,7 @@ mod tests {
 
             [[provider]]
             id = "bw1"
-            kind = "bitwarden"
+            kind = "bitwarden-pm"
 
             [provider.options]
             email = "test@example.com"
@@ -651,7 +651,7 @@ mod tests {
         assert_eq!(cfg.provider[0].id, "local");
         assert_eq!(cfg.provider[0].kind, "local");
         assert_eq!(cfg.provider[1].id, "bw1");
-        assert_eq!(cfg.provider[1].kind, "bitwarden");
+        assert_eq!(cfg.provider[1].kind, "bitwarden-pm");
     }
 
     #[test]
@@ -659,7 +659,7 @@ mod tests {
         let toml_str = r#"
             [[provider]]
             id = "bw1"
-            kind = "bitwarden"
+            kind = "bitwarden-pm"
 
             [provider.autolock]
             idle_timeout_minutes = 5
@@ -701,7 +701,7 @@ mod tests {
         let toml_str = r#"
             [[provider]]
             id = "bw1"
-            kind = "bitwarden"
+            kind = "bitwarden-pm"
         "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(cfg.provider[0].autolock.is_none());
@@ -730,7 +730,7 @@ mod tests {
 
             [[provider]]
             id = "bw1"
-            kind = "bitwarden"
+            kind = "bitwarden-pm"
 
             [provider.autolock]
             idle_timeout_minutes = 0

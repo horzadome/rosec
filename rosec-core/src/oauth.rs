@@ -14,7 +14,7 @@
 //!
 //! The file is created with mode `0600` (owner read/write only) on Unix.
 //! The `client_secret` is **never** written in plaintext.  Instead, the
-//! caller (e.g. `rosec-bitwarden::oauth_cred`) derives an encryption key
+//! caller (e.g. `rosec-wasm::wasm_cred`) derives an encryption key
 //! from the master password, encrypts the secret with AES-256-CBC + HMAC-SHA256,
 //! and passes the pre-encrypted bytes here for persistence.  `load_encrypted`
 //! returns those bytes unchanged — decryption is again the caller's responsibility.

@@ -15,7 +15,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 /// Add a new `[[provider]]` entry to the config file.
 ///
 /// `id` must be unique within the file; returns an error if it is already
-/// present.  `kind` is the provider type string (e.g. `"bitwarden"`,
+/// present.  `kind` is the provider type string (e.g. `"bitwarden-pm"`,
 /// `"bitwarden-sm"`, `"local"`).
 ///
 /// For `kind = "local"`, `path` should be provided as an option with key
@@ -145,7 +145,6 @@ pub fn set_provider_enabled(config_path: &Path, id: &str, enabled: bool) -> Resu
 /// requirements from the plugin manifest (see `PluginRegistry`).
 pub fn required_options_for_kind(kind: &str) -> &'static [(&'static str, &'static str)] {
     match kind {
-        "bitwarden" => &[("email", "Bitwarden account email")],
         "bitwarden-sm" => &[("organization_id", "Organization UUID")],
         _ => &[],
     }
@@ -157,25 +156,6 @@ pub fn required_options_for_kind(kind: &str) -> &'static [(&'static str, &'stati
 /// options from the plugin manifest (see `PluginRegistry`).
 pub fn optional_options_for_kind(kind: &str) -> &'static [(&'static str, &'static str)] {
     match kind {
-        "bitwarden" => &[
-            ("region", "Cloud region: 'us' or 'eu' (default: us)"),
-            (
-                "base_url",
-                "Self-hosted base URL, e.g. https://vault.example.com",
-            ),
-            (
-                "api_url",
-                "Explicit API URL override (overrides region/base_url)",
-            ),
-            (
-                "identity_url",
-                "Explicit identity URL override (overrides region/base_url)",
-            ),
-            (
-                "collection",
-                "Label stamped on all items as the 'collection' attribute (e.g. 'work')",
-            ),
-        ],
         "bitwarden-sm" => &[
             ("region", "Cloud region: 'us' or 'eu' (default: us)"),
             ("server_url", "Self-hosted server URL (overrides region)"),
@@ -192,7 +172,7 @@ pub fn optional_options_for_kind(kind: &str) -> &'static [(&'static str, &'stati
 ///
 /// WASM plugin kinds are discovered dynamically from the plugin registry
 /// and are not included here.
-pub const KNOWN_KINDS: &[&str] = &["local", "bitwarden", "bitwarden-sm"];
+pub const KNOWN_KINDS: &[&str] = &["local", "bitwarden-sm"];
 
 /// Set a single dotted-path value in the config file.
 ///
@@ -377,13 +357,13 @@ mod tests {
         add_provider(
             &path,
             "bw1",
-            "bitwarden",
+            "bitwarden-pm",
             &[("email".into(), "a@b.com".into())],
         )
         .unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("id = \"bw1\""));
-        assert!(contents.contains("kind = \"bitwarden\""));
+        assert!(contents.contains("kind = \"bitwarden-pm\""));
         assert!(contents.contains("email = \"a@b.com\""));
     }
 
@@ -391,8 +371,8 @@ mod tests {
     fn add_provider_rejects_duplicate_id() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
-        let err = add_provider(&path, "bw1", "bitwarden", &[]).unwrap_err();
+        add_provider(&path, "bw1", "bitwarden-pm", &[]).unwrap();
+        let err = add_provider(&path, "bw1", "bitwarden-pm", &[]).unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
 
@@ -403,14 +383,14 @@ mod tests {
         add_provider(
             &path,
             "bw1",
-            "bitwarden",
+            "bitwarden-pm",
             &[("email".into(), "a@b.com".into())],
         )
         .unwrap();
         add_provider(
             &path,
             "bw2",
-            "bitwarden",
+            "bitwarden-pm",
             &[("email".into(), "b@b.com".into())],
         )
         .unwrap();
@@ -423,8 +403,8 @@ mod tests {
     fn remove_provider_by_id() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
-        add_provider(&path, "bw2", "bitwarden", &[]).unwrap();
+        add_provider(&path, "bw1", "bitwarden-pm", &[]).unwrap();
+        add_provider(&path, "bw2", "bitwarden-pm", &[]).unwrap();
         remove_provider(&path, "bw1").unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(!contents.contains("id = \"bw1\""));
@@ -435,7 +415,7 @@ mod tests {
     fn remove_last_provider_cleans_key() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
+        add_provider(&path, "bw1", "bitwarden-pm", &[]).unwrap();
         remove_provider(&path, "bw1").unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(!contents.contains("bw1"));
@@ -459,7 +439,7 @@ mod tests {
             "# my comment\n[service]\ndedup_strategy = \"priority\"\n",
         )
         .unwrap();
-        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
+        add_provider(&path, "bw1", "bitwarden-pm", &[]).unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("# my comment"));
         assert!(contents.contains("dedup_strategy = \"priority\""));
@@ -510,7 +490,7 @@ mod tests {
     fn add_local_provider_rejects_id_colliding_with_external() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_provider(&path, "shared-id", "bitwarden", &[]).unwrap();
+        add_provider(&path, "shared-id", "bitwarden-pm", &[]).unwrap();
         let err = add_local_provider(&path, "shared-id", "/tmp/v.vault", None).unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
@@ -554,7 +534,7 @@ mod tests {
         add_provider(
             &path,
             "bw1",
-            "bitwarden",
+            "bitwarden-pm",
             &[("email".into(), "a@b.com".into())],
         )
         .unwrap();
@@ -578,7 +558,7 @@ mod tests {
     fn disable_provider_adds_enabled_false() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
+        add_provider(&path, "bw1", "bitwarden-pm", &[]).unwrap();
         set_provider_enabled(&path, "bw1", false).unwrap();
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("enabled = false"));
@@ -588,7 +568,7 @@ mod tests {
     fn enable_provider_removes_enabled_field() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
+        add_provider(&path, "bw1", "bitwarden-pm", &[]).unwrap();
         set_provider_enabled(&path, "bw1", false).unwrap();
         assert!(
             fs::read_to_string(&path)
@@ -604,7 +584,7 @@ mod tests {
     fn enable_disable_nonexistent_provider_errors() {
         let dir = tmp();
         let path = dir.path().join("config.toml");
-        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
+        add_provider(&path, "bw1", "bitwarden-pm", &[]).unwrap();
         let err = set_provider_enabled(&path, "ghost", false).unwrap_err();
         assert!(err.to_string().contains("not found"));
     }

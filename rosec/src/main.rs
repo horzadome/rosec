@@ -1237,7 +1237,6 @@ async fn cmd_provider_add(args: &[String]) -> Result<()> {
 ///
 /// Format: `{kind}-{first8hexchars of sha256(credential)}`
 ///
-/// - `bitwarden`: hashes the email address
 /// - `bitwarden-sm`: hashes the organization_id
 /// - anything else: falls back to the kind string itself
 fn derive_provider_id(
@@ -1250,7 +1249,6 @@ fn derive_provider_id(
     let discovered_key = rosec_wasm::discovery::id_derivation_key(registry, kind);
 
     let credential_key = match kind {
-        "bitwarden" => "email",
         "bitwarden-sm" => "organization_id",
         _ => match discovered_key.as_deref() {
             Some(k) => k,

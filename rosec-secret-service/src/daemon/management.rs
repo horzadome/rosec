@@ -680,7 +680,7 @@ pub struct DaemonStatus {
 pub struct ProviderListEntry {
     pub id: String,
     pub name: String,
-    /// The provider type string (e.g. `"bitwarden"`, `"bitwarden-sm"`).
+    /// The provider type string (e.g. `"bitwarden-pm"`, `"bitwarden-sm"`).
     pub kind: String,
     pub locked: bool,
 }

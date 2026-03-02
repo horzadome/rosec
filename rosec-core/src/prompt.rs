@@ -61,10 +61,10 @@ mod tests {
             title: "Unlock".to_string(),
             message: "Enter password".to_string(),
             hint: "Hint".to_string(),
-            backend: "bitwarden".to_string(),
+            backend: "bitwarden-pm".to_string(),
         };
         let out = render_template("{{title}} {{backend}}", &ctx);
-        assert_eq!(out, "Unlock bitwarden");
+        assert_eq!(out, "Unlock bitwarden-pm");
     }
 
     #[test]
@@ -80,10 +80,10 @@ mod tests {
             title: "Unlock".to_string(),
             message: "Enter".to_string(),
             hint: "Hint".to_string(),
-            backend: "bitwarden".to_string(),
+            backend: "bitwarden-pm".to_string(),
         };
         let args = vec!["--hint={{backend}}".to_string()];
         let out = render_args(&args, &ctx);
-        assert_eq!(out, vec!["--hint=bitwarden".to_string()]);
+        assert_eq!(out, vec!["--hint=bitwarden-pm".to_string()]);
     }
 }

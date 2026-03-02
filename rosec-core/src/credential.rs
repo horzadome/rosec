@@ -11,7 +11,7 @@
 //! - File I/O via [`rosec_core::oauth`] (write-then-rename, mode 0600)
 //!
 //! It does **not** own:
-//! - Key derivation — callers (e.g. `rosec-bitwarden::oauth_cred`) supply a
+//! - Key derivation — callers (e.g. `rosec-wasm::wasm_cred`) supply a
 //!   64-byte key derived via HKDF or similar from their own master secret.
 //! - The semantic meaning of `client_id` / `client_secret` — those are opaque
 //!   strings from this module's perspective.

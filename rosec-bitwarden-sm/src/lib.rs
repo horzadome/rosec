@@ -2,7 +2,7 @@
 //!
 //! Native implementation — no Bitwarden SDK dependency.  All HTTP requests
 //! and cryptographic operations are performed directly using the same
-//! `reqwest` + `aes`/`cbc`/`hmac` stack used by `rosec-bitwarden`.
+//! `reqwest` + `aes`/`cbc`/`hmac` stack used by `rosec-bitwarden-pm`.
 //!
 //! # Authentication
 //!

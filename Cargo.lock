@@ -160,18 +160,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
-name = "argon2"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
-dependencies = [
- "base64ct",
- "blake2",
- "cpufeatures 0.2.17",
- "password-hash",
-]
-
-[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -394,15 +382,6 @@ name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
-
-[[package]]
-name = "blake2"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
-dependencies = [
- "digest",
-]
 
 [[package]]
 name = "block-buffer"
@@ -1166,7 +1145,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
- "pem-rfc7468",
  "zeroize",
 ]
 
@@ -3382,17 +3360,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "password-hash"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
-dependencies = [
- "base64ct",
- "rand_core 0.6.4",
- "subtle",
-]
-
-[[package]]
 name = "pbkdf2"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3514,29 +3481,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "pkcs5"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e847e2c91a18bfa887dd028ec33f2fe6f25db77db3619024764914affe8b69a6"
-dependencies = [
- "aes",
- "cbc",
- "der",
- "pbkdf2",
- "scrypt",
- "sha2",
- "spki",
-]
-
-[[package]]
 name = "pkcs8"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
 dependencies = [
  "der",
- "pkcs5",
- "rand_core 0.6.4",
  "spki",
 ]
 
@@ -4108,7 +4058,7 @@ dependencies = [
 
 [[package]]
 name = "rosec"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -4129,41 +4079,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "rosec-bitwarden"
-version = "0.0.1"
-dependencies = [
- "aes",
- "anyhow",
- "argon2",
- "async-trait",
- "base64",
- "block-padding",
- "cbc",
- "futures-util",
- "hkdf",
- "hmac",
- "http",
- "pbkdf2",
- "pkcs8",
- "rand 0.10.0",
- "reqwest",
- "rosec-core",
- "rsa",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tokio-websockets",
- "tracing",
- "uuid",
- "zeroize",
-]
-
-[[package]]
 name = "rosec-bitwarden-sm"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -4187,7 +4104,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -4211,7 +4128,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-fuse"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "fuser",
@@ -4227,7 +4144,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-pam"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "libc",
  "tokio",
@@ -4238,7 +4155,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-prompt"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "iced",
@@ -4253,7 +4170,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-secret-service"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -4280,7 +4197,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-ssh-agent"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -4296,7 +4213,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-vault"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -4322,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-wasm"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4341,14 +4258,13 @@ dependencies = [
 
 [[package]]
 name = "rosecd"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "futures-util",
  "husky-rs",
  "libc",
  "notify",
- "rosec-bitwarden",
  "rosec-bitwarden-sm",
  "rosec-core",
  "rosec-fuse",
@@ -4586,15 +4502,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "salsa20"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97a22f5af31f73a954c10289c93e8a50cc23d971e80ee446f1f6f7137a088213"
-dependencies = [
- "cipher",
-]
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4623,17 +4530,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "scrypt"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
-dependencies = [
- "pbkdf2",
- "salsa20",
- "sha2",
-]
 
 [[package]]
 name = "sctk-adwaita"
@@ -4804,23 +4700,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sha1"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest",
-]
-
-[[package]]
-name = "sha1_smol"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
-
-[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4871,12 +4750,6 @@ name = "simd-adler32"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
-
-[[package]]
-name = "simdutf8"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "siphasher"
@@ -5394,28 +5267,6 @@ dependencies = [
  "futures-sink",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "tokio-websockets"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b6aa6c8b5a31e06fd3760eb5c1b8d9072e30731f0467ee3795617fe768e7449"
-dependencies = [
- "base64",
- "bytes",
- "fastrand",
- "futures-core",
- "futures-sink",
- "http",
- "httparse",
- "rustls-pki-types",
- "rustls-platform-verifier",
- "sha1_smol",
- "simdutf8",
- "tokio",
- "tokio-rustls",
- "tokio-util",
 ]
 
 [[package]]
