@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::os::unix::process::CommandExt as _;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
@@ -739,15 +740,25 @@ impl ServiceState {
             && !askpass.is_empty()
         {
             tracing::debug!(program = %askpass, "using SSH_ASKPASS for prompt");
-            let mut child = std::process::Command::new(&askpass)
-                .arg(label) // prompt text as argv[1] (standard convention)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .map_err(|e| {
-                    FdoError::Failed(format!("SSH_ASKPASS '{askpass}' failed to launch: {e}"))
-                })?;
+            // SAFETY: pre_exec runs after fork() in the child process.
+            // setsid() is async-signal-safe and has no preconditions.
+            let mut child = unsafe {
+                std::process::Command::new(&askpass)
+                    .arg(label) // prompt text as argv[1] (standard convention)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    // Detach from the calling terminal so Ctrl+C in the user's
+                    // shell does not send SIGINT to this child.
+                    .pre_exec(|| {
+                        libc::setsid();
+                        Ok(())
+                    })
+                    .spawn()
+                    .map_err(|e| {
+                        FdoError::Failed(format!("SSH_ASKPASS '{askpass}' failed to launch: {e}"))
+                    })?
+            };
 
             let pid = child.id();
             self.set_prompt_pid(&prompt_path, pid);
@@ -815,6 +826,16 @@ impl ServiceState {
             );
 
             let mut cmd = std::process::Command::new(&program);
+            // SAFETY: pre_exec runs after fork() in the child process.
+            // setsid() is async-signal-safe and has no preconditions.
+            // Detach from the calling terminal so Ctrl+C in the user's
+            // shell does not send SIGINT to this child.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit());
