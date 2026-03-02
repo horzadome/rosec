@@ -6,8 +6,7 @@ use async_trait::async_trait;
 use base64::prelude::{BASE64_STANDARD, Engine};
 use rosec_core::{
     Attributes, Capability, ItemAttributes, ItemMeta, ItemUpdate, NewItem, Provider,
-    ProviderCallbacks, ProviderError, ProviderStatus, RegistrationInfo, SecretBytes, SshKeyMeta,
-    UnlockInput,
+    ProviderCallbacks, ProviderError, ProviderStatus, SecretBytes, SshKeyMeta, UnlockInput,
 };
 use tokio::fs;
 use tokio::sync::RwLock;
@@ -289,29 +288,18 @@ impl Provider for LocalVault {
         })
     }
 
-    fn registration_info(&self) -> Option<RegistrationInfo> {
-        // Signal that first-time vault creation requires password confirmation.
-        // The daemon prompts for confirmation of all password/secret fields
-        // before retrying unlock with UnlockInput::WithRegistration, at which
-        // point the vault file is created.  No extra fields beyond the password
-        // are needed.
-        Some(RegistrationInfo {
-            instructions: "This vault does not exist yet. It will be created with the password you provided.",
-            fields: &[],
-        })
+    fn needs_new_password_confirmation(&self) -> bool {
+        // Confirmation is required when the vault file does not yet exist.
+        // The daemon will prompt the user to enter the password twice before
+        // calling unlock(), so that a typo cannot silently create a vault
+        // with a wrong (unrecoverable) password.
+        !self.path.exists()
     }
 
     async fn unlock(&self, input: UnlockInput) -> Result<(), ProviderError> {
-        // WithRegistration is the confirmed-creation path (password already
-        // confirmed by the daemon before retrying).  Password is the normal
-        // unlock path — if the vault file is missing we signal RegistrationRequired
-        // so the daemon can prompt for confirmation before creating the file.
-        let (password, confirmed_create) = match input {
-            UnlockInput::Password(pw) => (pw, false),
-            UnlockInput::WithRegistration {
-                password,
-                registration_fields: _,
-            } => (password, true),
+        let password = match input {
+            UnlockInput::Password(pw) => pw,
+            UnlockInput::WithRegistration { password, .. } => password,
         };
 
         if password.is_empty() {
@@ -330,15 +318,9 @@ impl Provider for LocalVault {
         let password_bytes = password.as_bytes();
         let (data, vault_key, wrapping_entries) = match self.load_vault(password_bytes).await {
             Ok(result) => result,
-            Err(ProviderError::Unavailable(_)) if confirmed_create => {
-                // Password confirmed by the daemon — safe to create the vault.
+            Err(ProviderError::Unavailable(_)) => {
                 info!("vault not found, creating new vault");
                 self.create_vault(password_bytes).await?
-            }
-            Err(ProviderError::Unavailable(_)) => {
-                // First attempt, no file yet — ask the daemon to confirm the
-                // password before we create anything.
-                return Err(ProviderError::RegistrationRequired);
             }
             Err(e) => return Err(e),
         };

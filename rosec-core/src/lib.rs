@@ -658,6 +658,21 @@ pub trait Provider: Send + Sync {
         &[]
     }
 
+    /// Returns `true` if the user's password must be confirmed (typed twice)
+    /// before the first unlock attempt.
+    ///
+    /// This is used by providers that create new persistent state on first
+    /// unlock (e.g. a local vault whose file does not yet exist).  Because
+    /// nothing has been stored yet, a typo in the password cannot be detected
+    /// after the fact — so the daemon asks the user to enter it twice before
+    /// proceeding.
+    ///
+    /// Providers that already have stored credentials (Bitwarden, SM) return
+    /// `false` — the password is verified implicitly when decryption succeeds.
+    fn needs_new_password_confirmation(&self) -> bool {
+        false
+    }
+
     async fn status(&self) -> Result<ProviderStatus, ProviderError>;
 
     /// Authenticate this provider with the supplied credentials.

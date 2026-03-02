@@ -115,7 +115,7 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
 
     // Track which providers need a registration flow (password already collected).
     let mut need_registration: Vec<(String, Zeroizing<String>)> = Vec::new();
-    // Track which providers had a plain failure.
+    // Track which providers had a plain auth failure (wrong password etc).
     let mut need_individual: Vec<String> = Vec::new();
 
     for provider in &locked {
@@ -139,6 +139,24 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
             Err(FdoError::Failed(ref msg)) if msg == "registration_required" => {
                 debug!(provider = %id, "registration required after opportunistic unlock");
                 need_registration.push((id, raw_password.clone()));
+            }
+            Err(FdoError::Failed(ref msg))
+                if msg.contains("not found") || msg.contains("unavailable") =>
+            {
+                // Provider is unavailable (e.g. local vault file does not exist
+                // yet).  Creating new vaults mid-sweep is not supported — the
+                // user should run `rosec provider auth <id>` to initialise it.
+                print_on_fd(
+                    tty_fd,
+                    &format!(
+                        "\n  {id}: not available — run `rosec provider auth {id}` to initialise\n"
+                    ),
+                );
+                results.push(UnlockResult {
+                    provider_id: id.clone(),
+                    success: false,
+                    message: "unavailable".to_string(),
+                });
             }
             Err(e) => {
                 debug!(provider = %id, "opportunistic unlock failed: {e}");
@@ -273,11 +291,16 @@ async fn auth_provider_with_tty_inner(
     prefill: Option<HashMap<String, Zeroizing<String>>>,
     force: bool,
 ) -> Result<Zeroizing<String>> {
-    let is_token_auth = {
+    let (is_token_auth, needs_confirmation) = {
         let b = state
             .provider_by_id(provider_id)
             .ok_or_else(|| anyhow!("provider '{provider_id}' not found"))?;
-        b.kind().ends_with("-sm")
+        (
+            b.kind().ends_with("-sm"),
+            // Only check when we're going to collect the password ourselves
+            // (prefill = None, not a force-registration path).
+            prefill.is_none() && !force && b.needs_new_password_confirmation(),
+        )
     };
 
     // When force is set, verify the provider actually supports registration
@@ -294,9 +317,7 @@ async fn auth_provider_with_tty_inner(
     }
 
     let mut cred_map: HashMap<String, Zeroizing<String>> = if let Some(existing) = prefill {
-        // Credentials already collected — skip the main prompt and go directly
-        // to the first AuthProvider call (which we expect to return
-        // registration_required).
+        // Credentials already collected by the sweep — skip prompting.
         existing
     } else {
         // Print unlock header.
@@ -320,13 +341,40 @@ async fn auth_provider_with_tty_inner(
         collect_tty_on_fd(tty_fd, fields).await?
     };
 
-    // When force is true, skip the normal auth attempt and go straight to
-    // registration.  Otherwise, try normal auth first and only fall through
-    // to registration if the provider reports it is required.
+    // If the provider requires new-password confirmation (e.g. creating a new
+    // local vault where nothing is stored yet to verify against), prompt the
+    // user to type the password a second time before proceeding.
+    if needs_confirmation {
+        print_on_fd(tty_fd, "\n");
+        print_on_fd(
+            tty_fd,
+            "This vault does not exist yet and will be created with this password.\n",
+        );
+        print_on_fd(tty_fd, "Please confirm your password:\n\n");
+        for field in fields
+            .iter()
+            .filter(|f| f.kind == "password" || f.kind == "secret")
+        {
+            let original = cred_map
+                .get(&field.id)
+                .cloned()
+                .unwrap_or_else(|| Zeroizing::new(String::new()));
+            loop {
+                let confirm_label = format!("Confirm {}", field.label);
+                let entry = prompt_field_on_fd(tty_fd, &confirm_label, "", &field.kind).await?;
+                if entry.as_str() == original.as_str() {
+                    break;
+                }
+                print_on_fd(tty_fd, "Does not match — please try again.\n\n");
+            }
+        }
+    }
+
+    // Try to authenticate.  If the provider requires registration (SM token
+    // setup, Bitwarden device registration), collect the extra fields and retry.
     let auth_result = if force {
-        None
+        None // skip straight to registration
     } else {
-        // Pass the Zeroizing<String> map directly — no plain String intermediary.
         Some(
             state
                 .auth_provider_inner(provider_id, cred_map.clone())
@@ -335,13 +383,12 @@ async fn auth_provider_with_tty_inner(
     };
 
     let needs_registration = match &auth_result {
-        None => true, // force — skip straight to registration
+        None => true,
         Some(Err(FdoError::Failed(msg))) if msg == "registration_required" => true,
         _ => false,
     };
 
     if needs_registration {
-        // Registration required — get the instructions and extra fields.
         let b = state
             .provider_by_id(provider_id)
             .ok_or_else(|| anyhow!("provider '{provider_id}' not found"))?;
@@ -353,38 +400,6 @@ async fn auth_provider_with_tty_inner(
         print_on_fd(tty_fd, "\n");
         print_on_fd(tty_fd, &format!("{}\n", reg_info.instructions));
         print_on_fd(tty_fd, "\n");
-
-        // Confirm password only when we are the ones who collected it (not from
-        // a prefill path — prefill means the password was already verified by
-        // another provider unlocking successfully).
-        // We check by seeing whether the pw field is in cred_map at all.
-        let pw_field_id = b.password_field().id.to_string();
-        if cred_map.contains_key(&pw_field_id) {
-            // First-time setup: the password has not been verified against
-            // anything stored.  Ask the user to confirm it once per
-            // password/secret field to guard against typos.
-            print_on_fd(
-                tty_fd,
-                "Please confirm your password (it has not been verified yet):\n\n",
-            );
-            for field in fields
-                .iter()
-                .filter(|f| f.kind == "password" || f.kind == "secret")
-            {
-                let original = cred_map
-                    .get(&field.id)
-                    .cloned()
-                    .unwrap_or_else(|| Zeroizing::new(String::new()));
-                loop {
-                    let confirm_label = format!("Confirm {}", field.label);
-                    let entry = prompt_field_on_fd(tty_fd, &confirm_label, "", &field.kind).await?;
-                    if entry.as_str() == original.as_str() {
-                        break;
-                    }
-                    print_on_fd(tty_fd, "Does not match — please try again.\n\n");
-                }
-            }
-        }
 
         // Collect registration-specific fields (e.g. the SM access token).
         let reg_fields: Vec<TtyField> = reg_info
@@ -401,11 +416,8 @@ async fn auth_provider_with_tty_inner(
         let reg_extra = collect_tty_on_fd(tty_fd, &reg_fields).await?;
         cred_map.extend(reg_extra);
 
-        // Retry with registration fields included.  Use the confirmed variant so
-        // providers (e.g. LocalVault) that distinguish first-attempt from
-        // confirmed-creation by input variant get WithRegistration unconditionally.
         state
-            .auth_provider_inner_confirmed(provider_id, cred_map.clone())
+            .auth_provider_inner(provider_id, cred_map.clone())
             .await
             .map_err(|e| anyhow!("registration failed for '{provider_id}': {e}"))?;
     } else if let Some(result) = auth_result {
