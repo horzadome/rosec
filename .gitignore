@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+rosec-bitwarden-wasm/target/
 
 # IDE / editor
 .aide/

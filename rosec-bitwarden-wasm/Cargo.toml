@@ -1,0 +1,35 @@
+[package]
+name = "rosec-bitwarden-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+description = "Bitwarden PM provider as an Extism WASM guest plugin for rosec"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Extism guest SDK
+extism-pdk = "1.4.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto
+aes = "0.8"
+cbc = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+sha1 = "0.10"
+pbkdf2 = "0.12"
+argon2 = "0.5"
+hkdf = "0.12"
+rsa = "0.9"
+pkcs8 = { version = "0.10", features = ["pkcs5", "encryption"] }
+base64 = "0.22"
+block-padding = "0.3"
+
+# Zeroize for secret scrubbing
+zeroize = { version = "1", features = ["derive"] }

@@ -1212,6 +1212,55 @@ async fn build_single_provider(
                 sm_config,
             )))
         }
+        "wasm" => {
+            let wasm_path = entry
+                .options
+                .get("wasm_path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("wasm provider '{}' requires 'wasm_path' option", entry.id)
+                })?
+                .to_string();
+
+            let name = entry
+                .options
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&entry.id)
+                .to_string();
+
+            let allowed_hosts: Vec<String> = entry
+                .options
+                .get("allowed_hosts")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Forward all options except the host-consumed ones to the guest.
+            let guest_options: std::collections::HashMap<String, serde_json::Value> = entry
+                .options
+                .iter()
+                .filter(|(k, _)| !matches!(k.as_str(), "wasm_path" | "name" | "allowed_hosts"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            let wasm_config = rosec_wasm::WasmProviderConfig {
+                id: entry.id.clone(),
+                name,
+                wasm_path,
+                allowed_hosts,
+                options: guest_options,
+            };
+
+            Ok(Arc::new(
+                rosec_wasm::WasmProvider::new(wasm_config)
+                    .map_err(|e| anyhow::anyhow!("wasm provider '{}': {e}", entry.id))?,
+            ))
+        }
         other => anyhow::bail!("unknown provider kind '{other}'"),
     }
 }
