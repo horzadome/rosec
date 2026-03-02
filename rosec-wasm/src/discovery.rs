@@ -1,16 +1,16 @@
-//! Plugin discovery — scan directories for `.wasm` plugins and build
+//! Provider discovery — scan directories for `.wasm` provider plugins and build
 //! a registry of available provider kinds.
 //!
 //! # Search paths
 //!
-//! Plugins are discovered from two locations (in order):
+//! Providers are discovered from two locations (in order):
 //!
-//! 1. **System-wide**: `/usr/lib/rosec/plugins/` — for distro packages
-//! 2. **User-local**: `$XDG_DATA_HOME/rosec/plugins/` (default
-//!    `~/.local/share/rosec/plugins/`) — for user-installed plugins
+//! 1. **System-wide**: `/usr/lib/rosec/providers/` — for distro packages
+//! 2. **User-local**: `$XDG_DATA_HOME/rosec/providers/` (default
+//!    `~/.local/share/rosec/providers/`) — for user-installed providers
 //!
 //! If the same `kind` appears in both directories the user-local copy
-//! takes precedence, allowing users to override system-installed plugins.
+//! takes precedence, allowing users to override system-installed providers.
 //!
 //! # Discovery protocol
 //!
@@ -27,11 +27,11 @@ use tracing::{debug, info, warn};
 
 use crate::protocol::{PluginManifest, PluginOptionDescriptor};
 
-/// System-wide plugin directory (for distro packages).
-const SYSTEM_PLUGIN_DIR: &str = "/usr/lib/rosec/plugins";
+/// System-wide provider directory (for distro packages).
+const SYSTEM_PLUGIN_DIR: &str = "/usr/lib/rosec/providers";
 
-/// Subdirectory under `$XDG_DATA_HOME` for user-installed plugins.
-const USER_PLUGIN_SUBDIR: &str = "rosec/plugins";
+/// Subdirectory under `$XDG_DATA_HOME` for user-installed providers.
+const USER_PLUGIN_SUBDIR: &str = "rosec/providers";
 
 // ── PluginRegistry ───────────────────────────────────────────────
 
@@ -87,14 +87,14 @@ impl PluginRegistry {
 
 // ── Scanning ─────────────────────────────────────────────────────
 
-/// Scan the standard plugin directories and return a registry of
-/// discovered plugins.
+/// Scan the standard provider directories and return a registry of
+/// discovered providers.
 ///
 /// Search order:
-/// 1. System-wide (`/usr/lib/rosec/plugins/`)
-/// 2. User-local (`$XDG_DATA_HOME/rosec/plugins/`)
+/// 1. System-wide (`/usr/lib/rosec/providers/`)
+/// 2. User-local (`$XDG_DATA_HOME/rosec/providers/`)
 ///
-/// User-local plugins override system-wide plugins with the same kind.
+/// User-local providers override system-wide providers with the same kind.
 pub fn scan_plugins() -> PluginRegistry {
     let mut registry = PluginRegistry::default();
 
@@ -108,12 +108,12 @@ pub fn scan_plugins() -> PluginRegistry {
     }
 
     if registry.is_empty() {
-        debug!("no WASM plugins discovered");
+        debug!("no WASM providers discovered");
     } else {
         info!(
             count = registry.len(),
             kinds = ?registry.kinds(),
-            "discovered WASM plugins",
+            "discovered WASM providers",
         );
     }
 
@@ -128,7 +128,7 @@ fn scan_directory(dir: &Path, registry: &mut PluginRegistry) {
         Ok(entries) => entries,
         Err(e) => {
             // Missing directories are normal (no system packages installed,
-            // or user hasn't created the plugins dir yet).
+            // or user hasn't created the providers dir yet).
             debug!(dir = %dir.display(), "plugin directory not readable: {e}");
             return;
         }
@@ -225,9 +225,9 @@ fn probe_plugin(wasm_path: &Path) -> Result<PluginManifest, anyhow::Error> {
     Ok(pm)
 }
 
-/// Resolve the user-local plugin directory.
+/// Resolve the user-local provider directory.
 ///
-/// Uses `$XDG_DATA_HOME/rosec/plugins/` (default `~/.local/share/rosec/plugins/`).
+/// Uses `$XDG_DATA_HOME/rosec/providers/` (default `~/.local/share/rosec/providers/`).
 fn user_plugin_dir() -> Option<PathBuf> {
     // Check $XDG_DATA_HOME first.
     if let Ok(data_home) = std::env::var("XDG_DATA_HOME")
@@ -236,7 +236,7 @@ fn user_plugin_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(data_home).join(USER_PLUGIN_SUBDIR));
     }
 
-    // Fall back to $HOME/.local/share/rosec/plugins/
+    // Fall back to $HOME/.local/share/rosec/providers/
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
@@ -247,7 +247,7 @@ fn user_plugin_dir() -> Option<PathBuf> {
         );
     }
 
-    warn!("cannot determine user plugin directory: neither $XDG_DATA_HOME nor $HOME is set");
+    warn!("cannot determine user provider directory: neither $XDG_DATA_HOME nor $HOME is set");
     None
 }
 
