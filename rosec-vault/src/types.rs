@@ -70,7 +70,7 @@ impl WrappingEntry {
 }
 
 /// Data for a single vault item (decrypted form).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct VaultItemData {
     pub id: String,
     pub label: String,
@@ -80,10 +80,34 @@ pub struct VaultItemData {
     pub modified: i64,
 }
 
+impl std::fmt::Debug for VaultItemData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultItemData")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("attributes", &self.attributes)
+            .field(
+                "secrets",
+                &format_args!("[{} redacted]", self.secrets.len()),
+            )
+            .field("created", &self.created)
+            .field("modified", &self.modified)
+            .finish()
+    }
+}
+
 /// Container for all vault items (decrypted form).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct VaultData {
     pub items: Vec<VaultItemData>,
+}
+
+impl std::fmt::Debug for VaultData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultData")
+            .field("items", &format_args!("[{} items]", self.items.len()))
+            .finish()
+    }
 }
 
 /// On-disk vault file format (v2 with key wrapping).

@@ -14,6 +14,40 @@ use tracing::{debug, info};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+/// Write `data` to `path` with Unix mode `0600`, replacing any existing file.
+///
+/// Uses a write-then-rename strategy so the file is never partially written.
+fn write_secret_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let tmp_path = path.with_extension("json.tmp");
+
+    {
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+
+        f.write_all(data)?;
+        f.flush()?;
+    }
+
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
 use crate::crypto;
 use crate::types::{VaultData, VaultFile, VaultItemData, WrappingEntry};
 
@@ -145,8 +179,7 @@ impl LocalVault {
                 .map_err(|e| ProviderError::Other(e.into()))?;
         }
 
-        fs::write(&self.path, content)
-            .await
+        write_secret_file(&self.path, content.as_bytes())
             .map_err(|e| ProviderError::Other(e.into()))?;
 
         info!(path = %self.path.display(), "created new vault");
@@ -173,8 +206,7 @@ impl LocalVault {
         let content = serde_json::to_string_pretty(&vault_file)
             .map_err(|e| ProviderError::Other(e.into()))?;
 
-        fs::write(&self.path, content)
-            .await
+        write_secret_file(&self.path, content.as_bytes())
             .map_err(|e| ProviderError::Other(e.into()))?;
 
         state.dirty = false;

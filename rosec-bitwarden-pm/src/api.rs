@@ -8,7 +8,7 @@
 //! - tracing → extism_pdk logging macros
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{self, KdfParams};
 use crate::error::BitwardenError;
@@ -151,7 +151,12 @@ impl ApiClient {
             params.push(("twoFactorProvider", tf.provider.to_string()));
         }
 
-        let form_body = url_encode_form(&params);
+        let mut form_body = url_encode_form(&params);
+        // Zeroize sensitive params before proceeding.
+        for (_, v) in &mut params {
+            v.zeroize();
+        }
+        drop(params);
 
         let req = extism_pdk::HttpRequest::new(&url)
             .with_method("POST")
@@ -161,8 +166,9 @@ impl ApiClient {
             .with_header("Device-Type", "8")
             .with_header("auth-email", &auth_email);
 
-        let resp = extism_pdk::http::request::<Vec<u8>>(&req, Some(form_body.into_bytes()))
+        let resp = extism_pdk::http::request::<Vec<u8>>(&req, Some(form_body.as_bytes().to_vec()))
             .map_err(|e| BitwardenError::Http(format!("login request: {e}")))?;
+        form_body.zeroize();
 
         let status = resp.status_code();
         let body = resp.body();
@@ -210,7 +216,7 @@ impl ApiClient {
 
         extism_pdk::debug!("register_device request: email={email}");
 
-        let params = vec![
+        let mut params = vec![
             ("grant_type", "client_credentials".to_string()),
             ("scope", "api".to_string()),
             ("client_id", client_id.to_string()),
@@ -221,7 +227,12 @@ impl ApiClient {
             ("deviceName", "rosec".to_string()),
         ];
 
-        let form_body = url_encode_form(&params);
+        let mut form_body = url_encode_form(&params);
+        // Zeroize sensitive params before proceeding.
+        for (_, v) in &mut params {
+            v.zeroize();
+        }
+        drop(params);
 
         let req = extism_pdk::HttpRequest::new(&url)
             .with_method("POST")
@@ -231,8 +242,9 @@ impl ApiClient {
             .with_header("Device-Type", "8")
             .with_header("auth-email", &auth_email);
 
-        let resp = extism_pdk::http::request::<Vec<u8>>(&req, Some(form_body.into_bytes()))
+        let resp = extism_pdk::http::request::<Vec<u8>>(&req, Some(form_body.as_bytes().to_vec()))
             .map_err(|e| BitwardenError::Http(format!("register_device request: {e}")))?;
+        form_body.zeroize();
 
         let status = resp.status_code();
         if !(200..300).contains(&status) {
@@ -252,13 +264,18 @@ impl ApiClient {
     pub fn refresh_token(&self, refresh_token: &str) -> Result<RefreshResponse, BitwardenError> {
         let url = format!("{}/connect/token", self.urls.identity_url);
 
-        let params = vec![
+        let mut params = vec![
             ("grant_type", "refresh_token".to_string()),
             ("client_id", "cli".to_string()),
             ("refresh_token", refresh_token.to_string()),
         ];
 
-        let form_body = url_encode_form(&params);
+        let mut form_body = url_encode_form(&params);
+        // Zeroize sensitive params before proceeding.
+        for (_, v) in &mut params {
+            v.zeroize();
+        }
+        drop(params);
 
         let req = extism_pdk::HttpRequest::new(&url)
             .with_method("POST")
@@ -267,8 +284,9 @@ impl ApiClient {
             .with_header("Bitwarden-Client-Version", CLIENT_VERSION)
             .with_header("Device-Type", "8");
 
-        let resp = extism_pdk::http::request::<Vec<u8>>(&req, Some(form_body.into_bytes()))
+        let resp = extism_pdk::http::request::<Vec<u8>>(&req, Some(form_body.as_bytes().to_vec()))
             .map_err(|e| BitwardenError::Http(format!("refresh_token request: {e}")))?;
+        form_body.zeroize();
 
         let status = resp.status_code();
         if !(200..300).contains(&status) {
@@ -382,10 +400,19 @@ struct PreloginResponse {
 }
 
 /// Two-factor authentication submission.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TwoFactorSubmission {
     pub token: String,
     pub provider: u8,
+}
+
+impl std::fmt::Debug for TwoFactorSubmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TwoFactorSubmission")
+            .field("token", &"[redacted]")
+            .field("provider", &self.provider)
+            .finish()
+    }
 }
 
 /// Deserialize a `String` field directly into a `Zeroizing<String>`.

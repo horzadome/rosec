@@ -87,7 +87,7 @@ pub fn encrypt(key: &StorageKey, plaintext: &[u8]) -> Result<EncryptedFields, St
 
     // Encrypt in-place with PKCS#7 padding.
     let pad_len = 16 - (plaintext.len() % 16);
-    let mut buf = vec![0u8; plaintext.len() + pad_len];
+    let mut buf = Zeroizing::new(vec![0u8; plaintext.len() + pad_len]);
     buf[..plaintext.len()].copy_from_slice(plaintext);
 
     let encryptor =

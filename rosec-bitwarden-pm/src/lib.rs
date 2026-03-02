@@ -94,18 +94,33 @@ fn bitwarden_attribute_descriptors() -> Vec<WasmAttributeDescriptor> {
     vec![
         // -- Common (all item types) --
         desc("name", false, &[], "Item display name"),
-        desc(ATTR_TYPE, false, &[], "Item type (login, note, card, identity, sshkey)"),
+        desc(
+            ATTR_TYPE,
+            false,
+            &[],
+            "Item type (login, note, card, identity, sshkey)",
+        ),
         desc("folder", false, &[], "Folder name (if assigned)"),
         desc("notes", true, &[], "Free-form notes (always sensitive)"),
         // -- Login --
-        desc("username", false, &["login"], "Login username (public per attribute-model decision)"),
+        desc(
+            "username",
+            false,
+            &["login"],
+            "Login username (public per attribute-model decision)",
+        ),
         desc("password", true, &["login"], "Login password"),
         desc("totp", true, &["login"], "TOTP seed / otpauth URI"),
         desc("uri", false, &["login"], "Primary login URI"),
         // -- Card --
         desc("cardholder", true, &["card"], "Cardholder name (PII)"),
         desc("number", true, &["card"], "Card number"),
-        desc("brand", false, &["card"], "Card brand (Visa, Mastercard, etc.)"),
+        desc(
+            "brand",
+            false,
+            &["card"],
+            "Card brand (Visa, Mastercard, etc.)",
+        ),
         desc("exp_month", true, &["card"], "Card expiration month"),
         desc("exp_year", true, &["card"], "Card expiration year"),
         desc("code", true, &["card"], "Card security code (CVV)"),
@@ -114,7 +129,12 @@ fn bitwarden_attribute_descriptors() -> Vec<WasmAttributeDescriptor> {
         desc("public_key", false, &["sshkey"], "SSH public key"),
         desc("fingerprint", false, &["sshkey"], "SSH key fingerprint"),
         // -- Identity (all PII → sensitive) --
-        desc("title", true, &["identity"], "Identity title (Mr, Ms, etc.)"),
+        desc(
+            "title",
+            true,
+            &["identity"],
+            "Identity title (Mr, Ms, etc.)",
+        ),
         desc("first_name", true, &["identity"], "First name"),
         desc("middle_name", true, &["identity"], "Middle name"),
         desc("last_name", true, &["identity"], "Last name"),
@@ -122,7 +142,12 @@ fn bitwarden_attribute_descriptors() -> Vec<WasmAttributeDescriptor> {
         desc("company", true, &["identity"], "Company name"),
         desc("ssn", true, &["identity"], "Social Security Number"),
         desc("passport_number", true, &["identity"], "Passport number"),
-        desc("license_number", true, &["identity"], "Driver's license number"),
+        desc(
+            "license_number",
+            true,
+            &["identity"],
+            "Driver's license number",
+        ),
         desc("email", true, &["identity"], "Identity email address (PII)"),
         desc("phone", true, &["identity"], "Identity phone number (PII)"),
         desc("address1", true, &["identity"], "Address line 1"),
@@ -136,7 +161,12 @@ fn bitwarden_attribute_descriptors() -> Vec<WasmAttributeDescriptor> {
 }
 
 /// Helper: build a `WasmAttributeDescriptor`.
-fn desc(name: &str, sensitive: bool, item_types: &[&str], description: &str) -> WasmAttributeDescriptor {
+fn desc(
+    name: &str,
+    sensitive: bool,
+    item_types: &[&str],
+    description: &str,
+) -> WasmAttributeDescriptor {
     WasmAttributeDescriptor {
         name: name.to_string(),
         sensitive,
@@ -245,7 +275,10 @@ fn cipher_to_wasm_meta(provider_id: &str, dc: &DecryptedCipher) -> WasmItemMeta 
 /// Build item attributes (public + secret names) for a decrypted cipher.
 ///
 /// Port of `BitwardenProvider::build_item_attributes`.
-fn build_item_attributes(provider_id: &str, dc: &DecryptedCipher) -> (HashMap<String, String>, Vec<String>) {
+fn build_item_attributes(
+    provider_id: &str,
+    dc: &DecryptedCipher,
+) -> (HashMap<String, String>, Vec<String>) {
     let mut public = HashMap::new();
     let mut secret_names = Vec::new();
 
@@ -675,9 +708,10 @@ fn authenticate(
     let hash_b64 = crypto::b64_encode(&password_hash);
     let login_resp = api.login_password(email, &hash_b64, two_factor)?;
 
-    let protected_key = login_resp.key.as_deref().ok_or_else(|| {
-        BitwardenError::Auth("no protected key in login response".to_string())
-    })?;
+    let protected_key = login_resp
+        .key
+        .as_deref()
+        .ok_or_else(|| BitwardenError::Auth("no protected key in login response".to_string()))?;
 
     // Step 4: Initialize vault state from protected key
     let mut vault_state = VaultState::new(&identity_keys, protected_key)?;
@@ -775,10 +809,7 @@ pub fn plugin_manifest(_: ()) -> FnResult<Json<PluginManifest>> {
         kind: "bitwarden-pm".to_string(),
         name: "Bitwarden Password Manager".to_string(),
         description: "Bitwarden password manager vault (cloud or self-hosted)".to_string(),
-        default_allowed_hosts: vec![
-            "*.bitwarden.com".to_string(),
-            "*.bitwarden.eu".to_string(),
-        ],
+        default_allowed_hosts: vec!["*.bitwarden.com".to_string(), "*.bitwarden.eu".to_string()],
         required_options: vec![PluginOptionDescriptor {
             key: "email".to_string(),
             description: "Bitwarden account email".to_string(),
@@ -893,10 +924,7 @@ pub fn init(Json(req): Json<InitRequest>) -> FnResult<Json<InitResponse>> {
     let mut guard = STATE
         .lock()
         .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
-    *guard = Some(GuestState {
-        config,
-        auth: None,
-    });
+    *guard = Some(GuestState { config, auth: None });
 
     Ok(Json(InitResponse {
         ok: true,
@@ -948,8 +976,14 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
 
     // Handle device registration if credentials were supplied
     if let Some(reg_fields) = &req.registration_fields {
-        let client_id = reg_fields.get("client_id").map(String::as_str).unwrap_or_default();
-        let client_secret = reg_fields.get("client_secret").map(String::as_str).unwrap_or_default();
+        let client_id = reg_fields
+            .get("client_id")
+            .map(String::as_str)
+            .unwrap_or_default();
+        let client_secret = reg_fields
+            .get("client_secret")
+            .map(String::as_str)
+            .unwrap_or_default();
 
         if client_id.is_empty() || client_secret.is_empty() {
             return Ok(Json(SimpleResponse {
@@ -963,7 +997,10 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
         if let Err(e) = api.register_device(&state.config.email, client_id, client_secret) {
             return Ok(Json(simple_err(&e)));
         }
-        extism_pdk::info!("device registered for provider '{}'", state.config.provider_id);
+        extism_pdk::info!(
+            "device registered for provider '{}'",
+            state.config.provider_id
+        );
     }
 
     match authenticate(&state.config, &req.password, None) {
@@ -1122,7 +1159,9 @@ pub fn search(Json(req): Json<SearchRequest>) -> FnResult<Json<ItemListResponse>
 
 /// Get full attributes (public + secret names) for a single item.
 #[plugin_fn]
-pub fn get_item_attributes(Json(req): Json<ItemIdRequest>) -> FnResult<Json<ItemAttributesResponse>> {
+pub fn get_item_attributes(
+    Json(req): Json<ItemIdRequest>,
+) -> FnResult<Json<ItemAttributesResponse>> {
     let guard = STATE
         .lock()
         .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
@@ -1267,7 +1306,9 @@ pub fn list_ssh_keys(_input: ()) -> FnResult<Json<SshKeyListResponse>> {
 
 /// Get the PEM-encoded SSH private key for an item.
 #[plugin_fn]
-pub fn get_ssh_private_key(Json(req): Json<SshPrivateKeyRequest>) -> FnResult<Json<SshPrivateKeyResponse>> {
+pub fn get_ssh_private_key(
+    Json(req): Json<SshPrivateKeyRequest>,
+) -> FnResult<Json<SshPrivateKeyResponse>> {
     let guard = STATE
         .lock()
         .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
@@ -1308,7 +1349,10 @@ pub fn get_ssh_private_key(Json(req): Json<SshPrivateKeyRequest>) -> FnResult<Js
         })),
         None => Ok(Json(SshPrivateKeyResponse {
             ok: false,
-            error: Some(format!("no SSH key material found for item: {}", req.item_id)),
+            error: Some(format!(
+                "no SSH key material found for item: {}",
+                req.item_id
+            )),
             error_kind: Some(ErrorKind::NotFound),
             pem: None,
         })),
@@ -1321,10 +1365,7 @@ pub fn get_ssh_private_key(Json(req): Json<SshPrivateKeyRequest>) -> FnResult<Js
 #[plugin_fn]
 pub fn capabilities(_input: ()) -> FnResult<Json<CapabilitiesResponse>> {
     Ok(Json(CapabilitiesResponse {
-        capabilities: vec![
-            "sync".to_string(),
-            "ssh".to_string(),
-        ],
+        capabilities: vec!["sync".to_string(), "ssh".to_string()],
     }))
 }
 

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tracing::debug;
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
@@ -88,10 +88,10 @@ impl AccessToken {
     ///   prk  = HMAC-SHA256(key="bitwarden-accesstoken", data=seed_16_bytes)
     ///   key  = HKDF-Expand(prk, info="sm-access-token", len=64)
     ///   → [enc_key: 32 bytes | mac_key: 32 bytes]
-    pub fn derive_token_enc_key(&self) -> Zeroizing<[u8; 64]> {
+    pub fn derive_token_enc_key(&self) -> Result<Zeroizing<[u8; 64]>, SmApiError> {
         // PRK = HMAC-SHA256(key = "bitwarden-accesstoken", data = seed)
-        let mut mac =
-            HmacSha256::new_from_slice(b"bitwarden-accesstoken").expect("HMAC key size is valid");
+        let mut mac = HmacSha256::new_from_slice(b"bitwarden-accesstoken")
+            .map_err(|e| SmApiError::Crypto(format!("HMAC key init: {e}")))?;
         mac.update(self.enc_key_seed.as_ref());
         let prk_generic = mac.finalize().into_bytes();
         let mut prk = Zeroizing::new([0u8; 32]);
@@ -100,7 +100,7 @@ impl AccessToken {
         let expanded = hkdf_expand_sha256(&*prk, Some(b"sm-access-token"), 64);
         let mut out = Zeroizing::new([0u8; 64]);
         out.copy_from_slice(&expanded);
-        out
+        Ok(out)
     }
 }
 
@@ -188,6 +188,12 @@ impl SmApiClient {
             .send()
             .await
             .map_err(SmApiError::Http)?;
+
+        // Zeroize the form values that contain secrets before processing the response.
+        for val in form.values_mut() {
+            val.zeroize();
+        }
+        drop(form);
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -365,13 +371,22 @@ impl SmApiClient {
 // Wire types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct LoginResponse {
     // Deserialized as plain String then immediately wrapped; the raw String
     // field is consumed (moved) into Zeroizing so no lingering copy exists
     // beyond the serde frame.
     pub access_token: String,
     pub encrypted_payload: String,
+}
+
+impl std::fmt::Debug for LoginResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginResponse")
+            .field("access_token", &"[redacted]")
+            .field("encrypted_payload", &"[redacted]")
+            .finish()
+    }
 }
 
 impl LoginResponse {
@@ -452,14 +467,18 @@ pub fn decrypt_org_key(
         encryption_key: String,
     }
 
-    let payload: Payload = serde_json::from_slice(&payload_bytes)
+    let mut payload: Payload = serde_json::from_slice(&payload_bytes)
         .map_err(|e| SmApiError::Crypto(format!("payload JSON parse: {e}")))?;
 
-    let key_bytes = B64
+    let mut key_bytes = B64
         .decode(&payload.encryption_key)
         .map_err(|e| SmApiError::Crypto(format!("org key base64: {e}")))?;
 
+    // Zeroize intermediates that held the raw key material.
+    payload.encryption_key.zeroize();
+
     if key_bytes.len() != 64 {
+        key_bytes.zeroize();
         return Err(SmApiError::Crypto(format!(
             "org key must be 64 bytes, got {}",
             key_bytes.len()
@@ -468,6 +487,7 @@ pub fn decrypt_org_key(
 
     let mut key = Zeroizing::new([0u8; 64]);
     key.copy_from_slice(&key_bytes);
+    key_bytes.zeroize();
     Ok(key)
 }
 
@@ -537,6 +557,9 @@ pub fn decrypt_field_opt(
         None | Some("") => Ok(Zeroizing::new(String::new())),
         Some(s) => {
             let bytes = decrypt_enc_string(s, org_key)?;
+            // The `bytes` Zeroizing<Vec<u8>> is zeroized when dropped.
+            // `from_utf8` reuses the Vec's allocation as the String buffer,
+            // and the result is wrapped in Zeroizing<String> for drop-zeroization.
             let text = String::from_utf8(bytes.to_vec())
                 .map_err(|e| SmApiError::Crypto(format!("UTF-8 decode: {e}")))?;
             Ok(Zeroizing::new(text))
@@ -636,7 +659,7 @@ pub async fn fetch_secrets(
     let (bearer, encrypted_payload) = login.into_zeroizing_token();
 
     // Step 4: derive org encryption key from the encrypted_payload in the login response
-    let token_enc_key = token.derive_token_enc_key();
+    let token_enc_key = token.derive_token_enc_key()?;
     let org_key = decrypt_org_key(&encrypted_payload, &token_enc_key)?;
 
     // Step 5: list secret identifiers
@@ -714,7 +737,7 @@ mod tests {
     #[test]
     fn derive_token_enc_key_matches_sdk() {
         let t = AccessToken::parse(TEST_TOKEN).unwrap();
-        let key = t.derive_token_enc_key();
+        let key = t.derive_token_enc_key().unwrap();
         assert_eq!(B64.encode(*key), EXPECTED_KEY_B64);
     }
 

@@ -9,7 +9,6 @@ use zvariant::Value;
 use crate::crypto::{SessionAlgorithm, derive_session_key, generate_dh_keypair};
 
 /// Information stored per open session.
-#[derive(Debug)]
 struct SessionInfo {
     /// The negotiated algorithm for this session.
     /// Retained for debug output and future per-algorithm policy decisions.
@@ -19,6 +18,15 @@ struct SessionInfo {
     ///
     /// `None` for `plain` sessions. Zeroized on drop.
     aes_key: Option<Zeroizing<[u8; 16]>>,
+}
+
+impl std::fmt::Debug for SessionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionInfo")
+            .field("algorithm", &self.algorithm)
+            .field("aes_key", &self.aes_key.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Default)]

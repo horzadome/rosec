@@ -114,7 +114,10 @@ impl WasmProvider {
         let wasm = Wasm::file(&config.wasm_path);
         let manifest = Manifest::new([wasm])
             .with_allowed_hosts(config.allowed_hosts.iter().cloned())
-            .with_timeout(GUEST_CALL_TIMEOUT);
+            .with_timeout(GUEST_CALL_TIMEOUT)
+            // Limit WASM linear memory to 256 MiB (4096 pages × 64 KiB/page).
+            // Prevents a misbehaving plugin from consuming unbounded host memory.
+            .with_memory_max(4096);
 
         let mut plugin = Plugin::new(&manifest, [], true).map_err(|e| {
             ProviderError::Other(anyhow::anyhow!(

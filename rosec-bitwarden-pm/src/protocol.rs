@@ -41,13 +41,25 @@ pub struct StatusResponse {
 // ── Unlock / Lock ────────────────────────────────────────────────
 
 /// Sent to `unlock`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct UnlockRequest {
     /// The user's master password.
     pub password: String,
     /// Additional registration fields (for first-time setup).
     #[serde(default)]
     pub registration_fields: Option<HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for UnlockRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnlockRequest")
+            .field("password", &"[redacted]")
+            .field(
+                "registration_fields",
+                &self.registration_fields.as_ref().map(|f| f.len()),
+            )
+            .finish()
+    }
 }
 
 /// Returned by `unlock`, `lock`, `sync`.
@@ -125,7 +137,7 @@ pub struct SecretAttrRequest {
 /// Returned by `get_secret_attr`.
 ///
 /// Secret bytes are base64-encoded for JSON transport.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SecretAttrResponse {
     pub ok: bool,
     #[serde(default)]
@@ -135,6 +147,17 @@ pub struct SecretAttrResponse {
     /// Base64-encoded secret bytes.
     #[serde(default)]
     pub value_b64: Option<String>,
+}
+
+impl std::fmt::Debug for SecretAttrResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretAttrResponse")
+            .field("ok", &self.ok)
+            .field("error", &self.error)
+            .field("error_kind", &self.error_kind)
+            .field("value_b64", &self.value_b64.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 // ── SSH ──────────────────────────────────────────────────────────
@@ -171,7 +194,7 @@ pub struct SshPrivateKeyRequest {
 }
 
 /// Returned by `get_ssh_private_key`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SshPrivateKeyResponse {
     pub ok: bool,
     #[serde(default)]
@@ -181,6 +204,17 @@ pub struct SshPrivateKeyResponse {
     /// PEM-encoded private key.
     #[serde(default)]
     pub pem: Option<String>,
+}
+
+impl std::fmt::Debug for SshPrivateKeyResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshPrivateKeyResponse")
+            .field("ok", &self.ok)
+            .field("error", &self.error)
+            .field("error_kind", &self.error_kind)
+            .field("pem", &self.pem.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 // ── Registration / Auth fields ───────────────────────────────────

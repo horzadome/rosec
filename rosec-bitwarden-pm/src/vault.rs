@@ -305,24 +305,15 @@ impl VaultState {
                             self.org_keys.insert(org.id.clone(), keys);
                         }
                         Err(e) => {
-                            extism_pdk::warn!(
-                                "org_id={}: invalid org key length: {e}",
-                                org.id
-                            );
+                            extism_pdk::warn!("org_id={}: invalid org key length: {e}", org.id);
                         }
                     },
                     Err(e) => {
-                        extism_pdk::warn!(
-                            "org_id={}: failed to decrypt org key: {e}",
-                            org.id
-                        );
+                        extism_pdk::warn!("org_id={}: failed to decrypt org key: {e}", org.id);
                     }
                 },
                 Err(e) => {
-                    extism_pdk::warn!(
-                        "org_id={}: failed to parse org key cipher: {e}",
-                        org.id
-                    );
+                    extism_pdk::warn!("org_id={}: failed to parse org key cipher: {e}", org.id);
                 }
             }
         }
