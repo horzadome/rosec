@@ -232,6 +232,8 @@ SUBCOMMANDS:
     auth <id> [--force]               Authenticate/unlock a provider
     add <kind> [options]              Add a provider to config.toml
     remove <id>                       Remove a provider (local vaults: offers to delete the file)
+    enable <id>                       Enable a disabled provider
+    disable <id>                      Temporarily disable a provider
     attach --path <file> [--id <id>]  Attach an existing vault file to the config
     detach <id>                       Remove provider from config (file stays on disk)
     add-password <id> [--label <l>]   Add a new unlock password to a local vault provider
@@ -850,6 +852,8 @@ async fn cmd_provider(args: &[String]) -> Result<()> {
         "auth" => cmd_provider_auth(&args[1..]).await,
         "add" => cmd_provider_add(&args[1..]).await,
         "remove" | "rm" => cmd_provider_remove(&args[1..]).await,
+        "enable" => cmd_provider_set_enabled(&args[1..], true).await,
+        "disable" => cmd_provider_set_enabled(&args[1..], false).await,
         "attach" => cmd_provider_attach(&args[1..]).await,
         "detach" => cmd_provider_detach(&args[1..]).await,
         "add-password" => cmd_provider_add_password(&args[1..]).await,
@@ -873,6 +877,17 @@ async fn cmd_provider(args: &[String]) -> Result<()> {
 
 /// `rosec provider list` — show all configured providers with lock state.
 async fn cmd_provider_list() -> Result<()> {
+    // Load config to detect disabled providers.
+    let cfg = load_config();
+    if cfg.provider.is_empty() {
+        println!("No providers configured. Run `rosec provider add <kind>` to add one.");
+        return Ok(());
+    }
+
+    // Collect disabled entries from config (they won't appear in D-Bus).
+    let disabled: Vec<&rosec_core::config::ProviderEntry> =
+        cfg.provider.iter().filter(|p| !p.enabled).collect();
+
     // Try D-Bus first for live state.
     if let Ok(conn) = conn().await
         && let Ok(proxy) = zbus::Proxy::new(
@@ -886,29 +901,30 @@ async fn cmd_provider_list() -> Result<()> {
             .call::<_, _, Vec<(String, String, String, bool)>>("ProviderList", &())
             .await
     {
-        if entries.is_empty() {
+        if entries.is_empty() && disabled.is_empty() {
             println!("No providers configured. Run `rosec provider add <kind>` to add one.");
             return Ok(());
         }
 
-        let id_w = entries
+        let all_ids: Vec<&str> = entries
             .iter()
-            .map(|(id, ..)| id.len())
-            .max()
-            .unwrap_or(2)
-            .max(2);
-        let name_w = entries
+            .map(|(id, ..)| id.as_str())
+            .chain(disabled.iter().map(|p| p.id.as_str()))
+            .collect();
+        let all_names: Vec<&str> = entries
             .iter()
-            .map(|(_, n, ..)| n.len())
-            .max()
-            .unwrap_or(4)
-            .max(4);
-        let kind_w = entries
+            .map(|(_, n, ..)| n.as_str())
+            .chain(disabled.iter().map(|p| p.id.as_str()))
+            .collect();
+        let all_kinds: Vec<&str> = entries
             .iter()
-            .map(|(_, _, k, _)| k.len())
-            .max()
-            .unwrap_or(4)
-            .max(4);
+            .map(|(_, _, k, _)| k.as_str())
+            .chain(disabled.iter().map(|p| p.kind.as_str()))
+            .collect();
+
+        let id_w = all_ids.iter().map(|s| s.len()).max().unwrap_or(2).max(2);
+        let name_w = all_names.iter().map(|s| s.len()).max().unwrap_or(4).max(4);
+        let kind_w = all_kinds.iter().map(|s| s.len()).max().unwrap_or(4).max(4);
 
         println!(
             "{:<id_w$}  {:<name_w$}  {:<kind_w$}  STATE",
@@ -924,16 +940,16 @@ async fn cmd_provider_list() -> Result<()> {
                 if *locked { "locked" } else { "unlocked" },
             );
         }
+        for entry in &disabled {
+            println!(
+                "{:<id_w$}  {:<name_w$}  {:<kind_w$}  disabled",
+                entry.id, entry.id, entry.kind,
+            );
+        }
         return Ok(());
     }
 
-    // Fallback: read config directly.
-    let cfg = load_config();
-    if cfg.provider.is_empty() {
-        println!("No providers configured. Run `rosec provider add <kind>` to add one.");
-        return Ok(());
-    }
-
+    // Fallback: read config directly (daemon not running).
     let id_w = cfg
         .provider
         .iter()
@@ -952,10 +968,12 @@ async fn cmd_provider_list() -> Result<()> {
     println!("{:<id_w$}  {:<kind_w$}  STATE", "ID", "KIND");
     println!("{}", "-".repeat(id_w + kind_w + 12));
     for entry in &cfg.provider {
-        println!(
-            "{:<id_w$}  {:<kind_w$}  (daemon not running)",
-            entry.id, entry.kind,
-        );
+        let state = if entry.enabled {
+            "(daemon not running)"
+        } else {
+            "disabled"
+        };
+        println!("{:<id_w$}  {:<kind_w$}  {state}", entry.id, entry.kind,);
     }
     Ok(())
 }
@@ -1302,6 +1320,25 @@ async fn cmd_provider_remove(args: &[String]) -> Result<()> {
         }
     }
 
+    println!("rosecd will hot-reload the config automatically if it is running.");
+    Ok(())
+}
+
+/// `rosec provider enable <id>` / `rosec provider disable <id>`
+async fn cmd_provider_set_enabled(args: &[String], enabled: bool) -> Result<()> {
+    let verb = if enabled { "enable" } else { "disable" };
+    let id = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider {verb} <id>"))?;
+
+    let cfg = config_path();
+    config_edit::set_provider_enabled(&cfg, id, enabled)?;
+
+    if enabled {
+        println!("Provider '{id}' enabled.");
+    } else {
+        println!("Provider '{id}' disabled.");
+    }
     println!("rosecd will hot-reload the config automatically if it is running.");
     Ok(())
 }

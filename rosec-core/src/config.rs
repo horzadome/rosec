@@ -141,6 +141,21 @@ pub struct ProviderEntry {
     /// Provider type: `"local"`, `"bitwarden"`, `"bitwarden-sm"`, etc.
     pub kind: String,
 
+    /// Whether this provider is active.
+    ///
+    /// Disabled providers are skipped during daemon startup and hot-reload.
+    /// The field defaults to `true` and is omitted from the config file when
+    /// true, keeping the common case clean:
+    ///
+    /// ```toml
+    /// [[provider]]
+    /// id      = "bw1"
+    /// kind    = "bitwarden"
+    /// enabled = false          # temporarily disabled
+    /// ```
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
     /// Path to the vault file on disk (required for `kind = "local"`).
     ///
     /// Supports `~` expansion.  If relative, resolved relative to
@@ -199,6 +214,10 @@ pub struct ProviderEntry {
     pub autolock: Option<AutoLockOverride>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Option keys whose values must never appear in logs or debug output.
 const SENSITIVE_OPTION_KEYS: &[&str] = &[
     "password",
@@ -231,6 +250,7 @@ impl std::fmt::Debug for ProviderEntry {
         f.debug_struct("ProviderEntry")
             .field("id", &self.id)
             .field("kind", &self.kind)
+            .field("enabled", &self.enabled)
             .field("path", &self.path)
             .field("options", &redacted)
             .field("return_attr", &self.return_attr)

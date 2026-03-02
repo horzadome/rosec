@@ -773,6 +773,14 @@ async fn build_providers(
     let mut providers: Vec<Arc<dyn Provider>> = Vec::with_capacity(config.provider.len());
 
     for entry in &config.provider {
+        if !entry.enabled {
+            tracing::info!(
+                provider_id = %entry.id,
+                provider_kind = %entry.kind,
+                "provider disabled, skipping"
+            );
+            continue;
+        }
         match entry.kind.as_str() {
             "local" => {
                 let provider = build_vault_provider(entry);
@@ -877,8 +885,9 @@ fn provider_fingerprint(entry: &rosec_core::config::ProviderEntry) -> String {
     let collection = entry.collection.as_deref().unwrap_or_default();
 
     format!(
-        "{}:path={}:{}:return_attr={}:match_attr={}:collection={}",
+        "{}:enabled={}:path={}:{}:return_attr={}:match_attr={}:collection={}",
         entry.kind,
+        entry.enabled,
         path,
         opts.join(","),
         return_attr,
@@ -1053,6 +1062,12 @@ async fn config_watcher(
                 .get(id)
                 .is_some_and(|old_fp| new_map.get(id).is_some_and(|new_fp| old_fp != new_fp));
             if is_new || is_changed {
+                // Skip disabled providers — they were already removed above
+                // (the fingerprint changed), so there is nothing to add back.
+                if !entry.enabled {
+                    tracing::info!(provider_id = id, "hot-reload: provider disabled, skipping");
+                    continue;
+                }
                 match entry.kind.as_str() {
                     "local" => {
                         let provider = build_vault_provider(entry);

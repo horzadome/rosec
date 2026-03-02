@@ -98,6 +98,46 @@ pub fn remove_provider(config_path: &Path, id: &str) -> Result<()> {
     write_doc(config_path, &doc)
 }
 
+/// Enable or disable a `[[provider]]` entry by id.
+///
+/// When `enabled` is `true` the field is removed from the entry entirely
+/// (it defaults to true when absent), keeping the common case clean.
+/// When `false`, the field is set explicitly.
+pub fn set_provider_enabled(config_path: &Path, id: &str, enabled: bool) -> Result<()> {
+    let raw = read_or_empty(config_path)?;
+    let mut doc: DocumentMut = raw.parse().context("failed to parse config as TOML")?;
+
+    let array = doc
+        .get_mut("provider")
+        .and_then(|item| item.as_array_of_tables_mut())
+        .with_context(|| format!("no providers configured in {}", config_path.display()))?;
+
+    // Find the index of the matching entry.
+    let idx = (0..array.len()).find(|&i| {
+        array
+            .get(i)
+            .and_then(|t| t.get("id"))
+            .and_then(|v| v.as_str())
+            == Some(id)
+    });
+
+    let Some(idx) = idx else {
+        bail!("provider '{id}' not found in {}", config_path.display());
+    };
+
+    // get_mut is guaranteed to succeed since we just found the index.
+    let table = array
+        .get_mut(idx)
+        .context("provider entry disappeared unexpectedly")?;
+    if enabled {
+        table.remove("enabled");
+    } else {
+        table["enabled"] = value(false);
+    }
+
+    write_doc(config_path, &doc)
+}
+
 /// Return the known required option keys for a given provider kind.
 ///
 /// Used by `rosec provider add` to prompt for missing options interactively.
@@ -528,5 +568,44 @@ mod tests {
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("[[provider]]"));
         assert!(contents.contains("id = \"bw1\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Enable / disable
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn disable_provider_adds_enabled_false() {
+        let dir = tmp();
+        let path = dir.path().join("config.toml");
+        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
+        set_provider_enabled(&path, "bw1", false).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("enabled = false"));
+    }
+
+    #[test]
+    fn enable_provider_removes_enabled_field() {
+        let dir = tmp();
+        let path = dir.path().join("config.toml");
+        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
+        set_provider_enabled(&path, "bw1", false).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("enabled = false")
+        );
+        set_provider_enabled(&path, "bw1", true).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("enabled"));
+    }
+
+    #[test]
+    fn enable_disable_nonexistent_provider_errors() {
+        let dir = tmp();
+        let path = dir.path().join("config.toml");
+        add_provider(&path, "bw1", "bitwarden", &[]).unwrap();
+        let err = set_provider_enabled(&path, "ghost", false).unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 }
