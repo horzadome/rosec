@@ -1370,13 +1370,8 @@ pub fn registration_info(_input: ()) -> FnResult<Json<RegistrationInfoResponse>>
 /// Return the auth fields for this provider (just the master password).
 #[plugin_fn]
 pub fn auth_fields(_input: ()) -> FnResult<Json<AuthFieldsResponse>> {
-    Ok(Json(AuthFieldsResponse {
-        fields: vec![WasmAuthField {
-            id: "password".to_string(),
-            label: "Master Password".to_string(),
-            placeholder: "Enter your Bitwarden master password".to_string(),
-            required: true,
-            kind: "password".to_string(),
-        }],
-    }))
+    // The password field is already declared via `password_field()` on the
+    // host side.  `auth_fields` is for *additional* authentication fields
+    // beyond the primary password (e.g. 2FA tokens).
+    Ok(Json(AuthFieldsResponse { fields: vec![] }))
 }

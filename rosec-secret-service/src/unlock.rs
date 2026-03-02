@@ -429,18 +429,27 @@ async fn auth_provider_with_tty_inner(
 /// Collect auth field descriptors for a provider into `TtyField` structs.
 pub(crate) fn provider_auth_fields(provider: &dyn rosec_core::Provider) -> Vec<TtyField> {
     let pw = provider.password_field();
+    let pw_id = pw.id;
     let mut fields = vec![TtyField {
         id: pw.id.to_string(),
         label: pw.label.to_string(),
         kind: auth_field_kind_str(&pw.kind),
         placeholder: pw.placeholder.to_string(),
     }];
-    fields.extend(provider.auth_fields().iter().map(|f| TtyField {
-        id: f.id.to_string(),
-        label: f.label.to_string(),
-        kind: auth_field_kind_str(&f.kind),
-        placeholder: f.placeholder.to_string(),
-    }));
+    // Exclude any auth_fields entry that duplicates the password field
+    // (a guest might mistakenly include it).
+    fields.extend(
+        provider
+            .auth_fields()
+            .iter()
+            .filter(|f| f.id != pw_id)
+            .map(|f| TtyField {
+                id: f.id.to_string(),
+                label: f.label.to_string(),
+                kind: auth_field_kind_str(&f.kind),
+                placeholder: f.placeholder.to_string(),
+            }),
+    );
     fields
 }
 

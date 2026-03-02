@@ -1143,14 +1143,18 @@ impl ServiceState {
         // Sources: registration_info fields (first-time setup) and auth_fields (e.g. token
         // rotation). Empty values are excluded so optional fields left blank don't trigger
         // WithRegistration unnecessarily.
+        //
+        // The password field is explicitly excluded — it is always passed via
+        // UnlockInput::Password / WithRegistration::password, never as an extra field.
         let reg_field_ids: std::collections::HashSet<&str> = provider
             .registration_info()
             .map(|ri| ri.fields.iter().map(|f| f.id).collect())
             .unwrap_or_default();
         let auth_field_ids: std::collections::HashSet<&str> =
             provider.auth_fields().iter().map(|f| f.id).collect();
-        let all_extra_ids: std::collections::HashSet<&str> =
+        let mut all_extra_ids: std::collections::HashSet<&str> =
             reg_field_ids.union(&auth_field_ids).copied().collect();
+        all_extra_ids.remove(pw_field_id);
 
         let registration_fields: HashMap<String, Zeroizing<String>> = fields
             .iter()
