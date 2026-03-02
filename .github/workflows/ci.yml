@@ -73,3 +73,25 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  wasm:
+    name: WASM Plugins
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm-plugins
+          workspaces: rosec-bitwarden-wasm
+
+      - name: Build bitwarden-pm plugin
+        working-directory: rosec-bitwarden-wasm
+        run: cargo build --target wasm32-wasip1 --release

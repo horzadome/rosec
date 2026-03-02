@@ -1,0 +1,61 @@
+# Maintainer: John Mylchreest <jmylchreest@gmail.com>
+#
+# AUR package: rosec-provider-bitwarden-pm
+#
+# Builds the Bitwarden Password Manager WASM provider plugin for rosec
+# from source. Requires the wasm32-wasip1 Rust target.
+
+pkgname=rosec-provider-bitwarden-pm
+pkgver=r0.unknown
+pkgrel=1
+pkgdesc="Bitwarden Password Manager provider plugin for rosec"
+arch=('any')
+url="https://github.com/jmylchreest/rosec"
+license=('MIT')
+depends=(
+    'rosec'
+)
+makedepends=(
+    'rust'
+    'cargo'
+)
+provides=('rosec-provider-bitwarden-pm')
+conflicts=('rosec-provider-bitwarden-pm-bin')
+
+source=("${pkgname}::git+https://github.com/jmylchreest/rosec.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "${srcdir}/${pkgname}"
+    # Output: r<commit_count>.<short_hash>
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+    cd "${srcdir}/${pkgname}"
+
+    # Ensure the wasm32-wasip1 target is installed
+    rustup target add wasm32-wasip1
+
+    # Fetch Cargo dependencies for the WASM guest crate
+    cd rosec-bitwarden-wasm
+    cargo fetch --locked 2>/dev/null || cargo fetch
+}
+
+build() {
+    cd "${srcdir}/${pkgname}/rosec-bitwarden-wasm"
+    cargo build --target wasm32-wasip1 --release --locked 2>/dev/null || \
+    cargo build --target wasm32-wasip1 --release
+}
+
+package() {
+    cd "${srcdir}/${pkgname}"
+
+    # WASM plugin
+    install -Dm644 rosec-bitwarden-wasm/target/wasm32-wasip1/release/rosec_bitwarden_wasm.wasm \
+        "${pkgdir}/usr/lib/rosec/plugins/rosec_bitwarden_wasm.wasm"
+
+    # Docs
+    install -Dm644 README.md \
+        "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}

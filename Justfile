@@ -95,6 +95,10 @@ build:
 build-release:
   cargo build --release --locked --bin rosecd --bin rosec
 
+# Build WASM provider plugins (requires wasm32-wasip1 target)
+build-wasm:
+  cargo build --target wasm32-wasip1 --release --manifest-path rosec-bitwarden-wasm/Cargo.toml
+
 # Run all tests
 test:
   cargo test --workspace --locked

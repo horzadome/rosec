@@ -2,14 +2,11 @@
 #
 # AUR package: rosec
 #
-# This PKGBUILD installs pre-built binaries from the GitHub release.
-# The release workflow renders this file by substituting @VERSION@ and
-# @X86_64_SHA256@ / @AARCH64_SHA256@ before committing to the AUR.
-#
-# To build manually, replace the placeholders and run makepkg -si.
+# Builds rosec from source.
+# Use this package for a source-based build of rosec.
 
 pkgname=rosec
-pkgver=@VERSION@
+pkgver=r0.unknown
 pkgrel=1
 pkgdesc="Read-only Secret Service daemon with Bitwarden backend"
 arch=('x86_64' 'aarch64')
@@ -17,56 +14,78 @@ url="https://github.com/jmylchreest/rosec"
 license=('MIT')
 depends=(
     'dbus'
-    'libsecret'   # optional: used by clients that talk to the daemon
+)
+makedepends=(
+    'rust'
+    'cargo'
+    'pkg-config'
 )
 optdepends=(
     'libnotify: desktop notifications on lock/unlock'
     'pam: PAM auto-unlock support via rosec-pam-unlock'
 )
 provides=('secret-service')
-conflicts=('gnome-keyring' 'keepassxc')
+conflicts=('rosec-bin' 'gnome-keyring' 'keepassxc')
 install=rosec.install
 
-source_x86_64=(
-    "${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/jmylchreest/${pkgname}/releases/download/v${pkgver}/${pkgname}-${pkgver}-x86_64-unknown-linux-gnu.tar.gz"
-)
-source_aarch64=(
-    "${pkgname}-${pkgver}-aarch64.tar.gz::https://github.com/jmylchreest/${pkgname}/releases/download/v${pkgver}/${pkgname}-${pkgver}-aarch64-unknown-linux-gnu.tar.gz"
-)
+source=("${pkgname}::git+https://github.com/jmylchreest/rosec.git")
+sha256sums=('SKIP')
 
-sha256sums_x86_64=('@X86_64_SHA256@')
-sha256sums_aarch64=('@AARCH64_SHA256@')
+pkgver() {
+    cd "${srcdir}/${pkgname}"
+    # Output: r<commit_count>.<short_hash>
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+    cd "${srcdir}/${pkgname}"
+    # Fetch all Cargo dependencies into a local cache so the build is
+    # reproducible and does not require internet access at build time.
+    cargo fetch --locked 2>/dev/null || cargo fetch
+}
+
+build() {
+    cd "${srcdir}/${pkgname}"
+
+    export RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+    cargo build --release --locked --bin rosecd --bin rosec --bin rosec-pam-unlock 2>/dev/null || \
+    cargo build --release         --bin rosecd --bin rosec --bin rosec-pam-unlock
+}
+
+check() {
+    cd "${srcdir}/${pkgname}"
+    cargo test --release --locked --workspace 2>/dev/null || \
+    cargo test --release          --workspace
+}
 
 package() {
-    # The tarball unpacks to a directory named after the target triple.
-    local srcdir_inner
-    srcdir_inner=$(find "${srcdir}" -maxdepth 1 -type d -name '*-linux-gnu' | head -1)
+    cd "${srcdir}/${pkgname}"
 
     # Binaries
-    install -Dm755 "${srcdir_inner}/rosecd" "${pkgdir}/usr/bin/rosecd"
-    install -Dm755 "${srcdir_inner}/rosec"  "${pkgdir}/usr/bin/rosec"
+    install -Dm755 target/release/rosecd "${pkgdir}/usr/bin/rosecd"
+    install -Dm755 target/release/rosec  "${pkgdir}/usr/bin/rosec"
 
     # PAM helper (installed to libexec; must match pam_helper_paths in config)
-    install -Dm755 "${srcdir_inner}/rosec-pam-unlock" \
+    install -Dm755 target/release/rosec-pam-unlock \
         "${pkgdir}/usr/lib/rosec/rosec-pam-unlock"
 
     # systemd user units
-    install -Dm644 "${srcdir_inner}/contrib/systemd/rosecd.service" \
+    install -Dm644 contrib/systemd/rosecd.service \
         "${pkgdir}/usr/lib/systemd/user/rosecd.service"
-    install -Dm644 "${srcdir_inner}/contrib/systemd/rosecd.socket" \
+    install -Dm644 contrib/systemd/rosecd.socket \
         "${pkgdir}/usr/lib/systemd/user/rosecd.socket"
 
     # D-Bus session activation
-    install -Dm644 "${srcdir_inner}/contrib/dbus/org.freedesktop.secrets.service" \
+    install -Dm644 contrib/dbus/org.freedesktop.secrets.service \
         "${pkgdir}/usr/share/dbus-1/services/org.freedesktop.secrets.service"
-    install -Dm644 "${srcdir_inner}/contrib/dbus/org.gnome.keyring.service" \
+    install -Dm644 contrib/dbus/org.gnome.keyring.service \
         "${pkgdir}/usr/share/dbus-1/services/org.gnome.keyring.service"
 
     # XDG autostart (for non-systemd compositors)
-    install -Dm644 "${srcdir_inner}/contrib/autostart/rosecd.desktop" \
+    install -Dm644 contrib/autostart/rosecd.desktop \
         "${pkgdir}/etc/xdg/autostart/rosecd.desktop"
 
-    # License
-    install -Dm644 "${srcdir_inner}/README.md" \
-        "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+    # Docs
+    install -Dm644 README.md \
+        "${pkgdir}/usr/share/doc/rosec/README.md"
 }

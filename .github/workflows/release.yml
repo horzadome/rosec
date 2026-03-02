@@ -237,12 +237,70 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # Build WASM provider plugins
+  #
+  # WASM plugins are architecture-independent — one .wasm file works on all
+  # platforms.  Each plugin guest crate is built separately since they are
+  # excluded from the workspace (they target wasm32-wasip1).
+  #
+  # Plugins are packaged as individual tarballs named:
+  #   rosec-provider-{kind}-{version}.wasm.tar.gz
+  # Each tarball contains the .wasm file ready to be placed in
+  # /usr/lib/rosec/plugins/ or ~/.local/share/rosec/plugins/
+  # ---------------------------------------------------------------------------
+  build-wasm:
+    name: Build WASM Plugins
+    runs-on: ubuntu-latest
+    needs: [prepare, ci]
+    if: needs.prepare.outputs.should_skip != 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm-plugins
+          workspaces: rosec-bitwarden-wasm
+
+      - name: Build bitwarden-pm plugin
+        working-directory: rosec-bitwarden-wasm
+        run: cargo build --target wasm32-wasip1 --release
+
+      - name: Package WASM plugins
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          mkdir -p dist/plugins
+
+          # bitwarden-pm
+          cp rosec-bitwarden-wasm/target/wasm32-wasip1/release/rosec_bitwarden_wasm.wasm \
+             dist/plugins/rosec_bitwarden_wasm.wasm
+
+          ARCHIVE="rosec-provider-bitwarden-pm-${VERSION}.wasm.tar.gz"
+          tar -czf "${ARCHIVE}" -C dist/plugins rosec_bitwarden_wasm.wasm
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosec-wasm-plugins
+          path: |
+            rosec-provider-*.wasm.tar.gz
+            rosec-provider-*.wasm.tar.gz.sha256
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # Rolling snapshot release — updated on every push to main
   # ---------------------------------------------------------------------------
   snapshot:
     name: Snapshot Release
     runs-on: ubuntu-latest
-    needs: [prepare, build]
+    needs: [prepare, build, build-wasm]
     if: |
       needs.prepare.outputs.should_skip != 'true' &&
       needs.prepare.outputs.is_release == 'false' &&
@@ -256,7 +314,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: rosec-*
 
       - name: Collect release assets
         run: |
@@ -300,7 +357,7 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [prepare, build]
+    needs: [prepare, build, build-wasm]
     if: |
       needs.prepare.outputs.is_release == 'true' ||
       needs.prepare.outputs.is_prerelease == 'true'
@@ -312,7 +369,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: rosec-*
 
       - name: Collect release assets
         run: |
@@ -370,12 +426,12 @@ jobs:
           sed \
             -e "s|@VERSION@|${VERSION}|g" \
             -e "s|@X86_64_SHA256@|${{ steps.checksums.outputs.x86_64_sha }}|g" \
-            contrib/aur/PKGBUILD.template > /tmp/PKGBUILD
+            contrib/aur/PKGBUILD-bin > /tmp/PKGBUILD
 
       - name: Publish to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v3
         with:
-          pkgname: rosec
+          pkgname: rosec-bin
           pkgbuild: /tmp/PKGBUILD
           commit_username: rosec-bot
           commit_email: bot@rosec

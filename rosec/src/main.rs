@@ -261,6 +261,10 @@ fn cmd_provider_kinds() {
     println!("    Options: --id <id>, --path <path>, --collection <name>");
     println!();
     for kind in config_edit::KNOWN_KINDS {
+        // "local" is already printed above with its custom description.
+        if *kind == "local" {
+            continue;
+        }
         let required = config_edit::required_options_for_kind(kind);
         let optional = config_edit::optional_options_for_kind(kind);
         println!("  {kind}");
