@@ -284,28 +284,27 @@ impl Provider for WasmProvider {
                     .is_some_and(|k| matches!(k, ErrorKind::RegistrationRequired));
                 if is_reg_required && !has_registration {
                     match crate::wasm_cred::load(&self.config.id, password_ref.as_str()) {
-                        Ok(Some(cred)) => {
+                        Ok(Some(stored_fields)) => {
                             debug!(
                                 provider = %self.config.id,
                                 "loaded stored credentials, retrying unlock with registration"
                             );
-                            let mut reg_fields = HashMap::new();
-                            reg_fields.insert("client_id".to_owned(), cred.client_id.clone());
-                            reg_fields.insert(
-                                "client_secret".to_owned(),
-                                cred.client_secret.as_str().to_owned(),
-                            );
+                            // Pass the stored fields directly to the guest — they use
+                            // whatever field names the provider registered with (e.g.
+                            // "access_token" for SM, "client_id"/"client_secret" for PM).
+                            let reg_fields_plain: HashMap<String, String> = stored_fields
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
+                                .collect();
 
-                            // Build a new request with stored registration fields.
                             let mut retry_req = UnlockRequest {
                                 password: password_ref.as_str().to_owned(),
-                                registration_fields: Some(reg_fields),
+                                registration_fields: Some(reg_fields_plain),
                             };
 
                             let retry_result: Result<SimpleResponse, ProviderError> =
                                 call_guest_json_sensitive(&mut plugin, "unlock", &retry_req);
 
-                            // Zeroize the retry request fields.
                             retry_req.password.zeroize();
                             if let Some(ref mut fields) = retry_req.registration_fields {
                                 for v in fields.values_mut() {
@@ -323,14 +322,20 @@ impl Provider for WasmProvider {
                             result
                         }
                         Err(e) => {
-                            // Stored credentials are corrupt or password changed —
-                            // delete them and let the caller handle registration.
+                            // Decryption failed — most likely a wrong password.
+                            // Do NOT clear stored credentials (the user may just
+                            // have mistyped the password).  Return AuthFailed so
+                            // the caller reports "wrong password" rather than
+                            // entering the registration flow.
                             warn!(
                                 provider = %self.config.id,
-                                "failed to load stored credentials, clearing: {e}"
+                                "failed to decrypt stored credentials: {e}"
                             );
-                            let _ = crate::wasm_cred::clear(&self.config.id);
-                            result
+                            Ok(SimpleResponse {
+                                ok: false,
+                                error: Some("wrong password".to_string()),
+                                error_kind: Some(ErrorKind::AuthFailed),
+                            })
                         }
                     }
                 } else {
@@ -357,30 +362,24 @@ impl Provider for WasmProvider {
                     ..
                 } = &input
             {
-                let client_id = registration_fields
-                    .iter()
-                    .find(|(k, _)| k.as_str() == "client_id")
-                    .map(|(_, v)| v.as_str());
-                let client_secret = registration_fields
-                    .iter()
-                    .find(|(k, _)| k.as_str() == "client_secret")
-                    .map(|(_, v)| v.as_str());
-
-                if let (Some(id), Some(secret)) = (client_id, client_secret) {
-                    match crate::wasm_cred::save(&self.config.id, password_ref.as_str(), id, secret)
-                    {
-                        Ok(()) => {
-                            debug!(
-                                provider = %self.config.id,
-                                "saved registration credentials"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                provider = %self.config.id,
-                                "failed to save registration credentials: {e}"
-                            );
-                        }
+                // Save all registration fields so we can restore them on the
+                // next unlock without prompting the user again.
+                match crate::wasm_cred::save(
+                    &self.config.id,
+                    password_ref.as_str(),
+                    registration_fields,
+                ) {
+                    Ok(()) => {
+                        debug!(
+                            provider = %self.config.id,
+                            "saved registration credentials"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            provider = %self.config.id,
+                            "failed to save registration credentials: {e}"
+                        );
                     }
                 }
             }
