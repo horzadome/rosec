@@ -905,7 +905,7 @@ async fn config_watcher(
     config_path: PathBuf,
     initial_config: Config,
     ssh_manager: Option<Arc<ssh::SshManager>>,
-    plugin_registry: rosec_wasm::PluginRegistry,
+    mut plugin_registry: rosec_wasm::PluginRegistry,
 ) -> anyhow::Result<()> {
     use tokio::sync::mpsc;
 
@@ -1026,6 +1026,25 @@ async fn config_watcher(
 
         // Add providers that are new or changed.
         let mut added_any = false;
+
+        // Re-scan WASM plugins if the new config references any provider
+        // kinds that the current registry doesn't know about.  This lets
+        // users deploy a new `.wasm` plugin and immediately reference it
+        // in config without restarting the daemon.
+        let needs_rescan = new_config.provider.iter().any(|entry| {
+            let id = entry.id.as_str();
+            let is_new = !known_ids.contains(id);
+            let is_changed = known_map
+                .get(id)
+                .is_some_and(|old_fp| new_map.get(id).is_some_and(|new_fp| old_fp != new_fp));
+            (is_new || is_changed)
+                && !matches!(entry.kind.as_str(), "local" | "bitwarden" | "bitwarden-sm")
+                && !plugin_registry.contains_kind(&entry.kind)
+        });
+        if needs_rescan {
+            tracing::info!("hot-reload: re-scanning WASM plugins for new provider kinds");
+            plugin_registry = rosec_wasm::discovery::scan_plugins();
+        }
 
         for entry in &new_config.provider {
             let id = entry.id.as_str();
