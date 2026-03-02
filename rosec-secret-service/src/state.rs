@@ -1183,13 +1183,17 @@ impl ServiceState {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        let input = if registration_fields.is_empty() {
-            UnlockInput::Password(password)
-        } else {
+        // Use WithRegistration whenever the provider declares registration_info,
+        // even if no extra fields were collected.  This lets providers (e.g.
+        // LocalVault on first-time creation) distinguish a normal unlock attempt
+        // from a confirmed-creation retry purely from the input variant.
+        let input = if !registration_fields.is_empty() || provider.registration_info().is_some() {
             UnlockInput::WithRegistration {
                 password,
                 registration_fields,
             }
+        } else {
+            UnlockInput::Password(password)
         };
 
         provider.unlock(input).await.map_err(map_provider_error)?;
