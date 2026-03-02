@@ -1266,12 +1266,19 @@ async fn build_single_provider(
                 .unwrap_or_else(|| discovered.manifest.default_allowed_hosts.clone());
 
             // Forward all options except host-consumed ones to the guest.
-            let guest_options: std::collections::HashMap<String, serde_json::Value> = entry
+            let mut guest_options: std::collections::HashMap<String, serde_json::Value> = entry
                 .options
                 .iter()
                 .filter(|(k, _)| !matches!(k.as_str(), "name" | "allowed_hosts"))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+
+            // Inject host-managed device_id if the guest doesn't already have one.
+            // Bitwarden APIs require a stable deviceIdentifier; the WASM sandbox
+            // cannot access the filesystem, so the host provides it.
+            guest_options
+                .entry("device_id".to_string())
+                .or_insert_with(|| serde_json::Value::String(load_or_create_device_id()));
 
             let wasm_config = rosec_wasm::WasmProviderConfig {
                 id: entry.id.clone(),
@@ -1370,4 +1377,77 @@ fn load_config(path: &PathBuf) -> Result<Config> {
     let content = std::fs::read_to_string(path)?;
     let config: Config = toml::from_str(&content)?;
     Ok(config)
+}
+
+// ── Device ID persistence ────────────────────────────────────────
+//
+// Bitwarden APIs require a stable `deviceIdentifier`.  The native
+// provider (`rosec-bitwarden`) manages its own copy; the WASM provider
+// cannot access the filesystem, so the host injects the same device ID
+// into its init options.
+
+/// Return `$XDG_DATA_HOME/rosec/device_id` (default
+/// `~/.local/share/rosec/device_id`).
+fn device_id_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("rosec").join("device_id"))
+}
+
+/// Load an existing device ID or create and persist a new one.
+///
+/// Falls back to an ephemeral UUID when the data directory is
+/// inaccessible.
+fn load_or_create_device_id() -> String {
+    let Some(path) = device_id_path() else {
+        tracing::warn!("cannot determine data directory; using ephemeral device ID");
+        return uuid::Uuid::new_v4().to_string();
+    };
+
+    // Try reading an existing device ID.
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        let id = contents.trim().to_string();
+        if !id.is_empty() {
+            tracing::debug!("loaded persistent device ID from {}", path.display());
+            return id;
+        }
+    }
+
+    // Generate and persist a new one.
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(error = %e, "failed to create data directory; using ephemeral device ID");
+        return id;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| f.write_all(id.as_bytes()))
+        {
+            Ok(()) => tracing::debug!("persisted new device ID to {}", path.display()),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to persist device ID to {}", path.display())
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = std::fs::write(&path, &id) {
+            tracing::warn!(error = %e, "failed to persist device ID to {}", path.display());
+        } else {
+            tracing::debug!("persisted new device ID to {}", path.display());
+        }
+    }
+    id
 }
