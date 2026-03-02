@@ -1147,7 +1147,7 @@ async fn cmd_provider_add(args: &[String]) -> Result<()> {
 /// - anything else: falls back to the kind string itself
 fn derive_provider_id(kind: &str, options: &[(String, String)]) -> String {
     let credential_key = match kind {
-        "bitwarden" => "email",
+        "bitwarden" | "bitwarden-wasm" => "email",
         "bitwarden-sm" => "organization_id",
         _ => return kind.to_string(),
     };

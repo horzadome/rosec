@@ -1212,13 +1212,16 @@ async fn build_single_provider(
                 sm_config,
             )))
         }
-        "wasm" => {
+        "bitwarden-wasm" => {
             let wasm_path = entry
                 .options
                 .get("wasm_path")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    anyhow::anyhow!("wasm provider '{}' requires 'wasm_path' option", entry.id)
+                    anyhow::anyhow!(
+                        "bitwarden-wasm provider '{}' requires 'wasm_path' option",
+                        entry.id
+                    )
                 })?
                 .to_string();
 
@@ -1251,6 +1254,7 @@ async fn build_single_provider(
             let wasm_config = rosec_wasm::WasmProviderConfig {
                 id: entry.id.clone(),
                 name,
+                kind: entry.kind.clone(),
                 wasm_path,
                 allowed_hosts,
                 options: guest_options,

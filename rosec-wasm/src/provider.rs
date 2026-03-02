@@ -35,6 +35,8 @@ pub struct WasmProviderConfig {
     pub id: String,
     /// Human-readable name.
     pub name: String,
+    /// Provider kind string (e.g. `"bitwarden-wasm"`).
+    pub kind: String,
     /// Path to the `.wasm` file.
     pub wasm_path: String,
     /// Allowed HTTP hosts the plugin may contact (e.g. `["*.bitwarden.com"]`).
@@ -153,7 +155,7 @@ impl Provider for WasmProvider {
     }
 
     fn kind(&self) -> &str {
-        "wasm"
+        &self.config.kind
     }
 
     fn capabilities(&self) -> &'static [Capability] {

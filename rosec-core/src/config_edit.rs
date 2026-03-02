@@ -105,6 +105,10 @@ pub fn required_options_for_kind(kind: &str) -> &'static [(&'static str, &'stati
     match kind {
         "bitwarden" => &[("email", "Bitwarden account email")],
         "bitwarden-sm" => &[("organization_id", "Organization UUID")],
+        "bitwarden-wasm" => &[
+            ("wasm_path", "Path to the .wasm plugin file"),
+            ("email", "Bitwarden account email"),
+        ],
         _ => &[],
     }
 }
@@ -139,12 +143,23 @@ pub fn optional_options_for_kind(kind: &str) -> &'static [(&'static str, &'stati
                 "Label stamped on all items as the 'collection' attribute (e.g. 'work')",
             ),
         ],
+        "bitwarden-wasm" => &[
+            ("region", "Cloud region: 'us' or 'eu' (default: us)"),
+            (
+                "base_url",
+                "Self-hosted base URL, e.g. https://vault.example.com",
+            ),
+            (
+                "allowed_hosts",
+                "Comma-separated HTTP hosts the plugin may contact",
+            ),
+        ],
         _ => &[],
     }
 }
 
 /// The list of provider kind strings the daemon knows about.
-pub const KNOWN_KINDS: &[&str] = &["local", "bitwarden", "bitwarden-sm"];
+pub const KNOWN_KINDS: &[&str] = &["local", "bitwarden", "bitwarden-sm", "bitwarden-wasm"];
 
 /// Set a single dotted-path value in the config file.
 ///
