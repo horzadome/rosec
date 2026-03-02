@@ -94,7 +94,8 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
         }
     }
 
-    // Use the first provider's password field descriptor as representative.
+    // Use the first provider's password field descriptor as representative for
+    // the TTY prompt (label, hidden flag, etc.).
     let first_fields = provider_auth_fields(locked[0].as_ref());
     let pw_field = first_fields
         .first()
@@ -102,22 +103,28 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
 
     let collected = collect_tty_on_fd(tty_fd, std::slice::from_ref(pw_field)).await?;
 
-    // Try the collected credentials against every locked provider.
-    // We pass the Zeroizing<String> map directly — no plain String copies.
+    // Extract the raw password value.  The collected map is keyed by the first
+    // provider's field ID, but other providers may use a different field name
+    // (e.g. "unlock_password" vs "password").  We must re-map the value to each
+    // provider's own password_field().id — the same approach opportunistic_sweep() uses.
+    let raw_password: Zeroizing<String> = collected
+        .values()
+        .next()
+        .cloned()
+        .ok_or_else(|| anyhow!("no password value collected"))?;
 
     // Track which providers need a registration flow (password already collected).
-    let mut need_registration: Vec<(String, HashMap<String, Zeroizing<String>>)> = Vec::new();
+    let mut need_registration: Vec<(String, Zeroizing<String>)> = Vec::new();
     // Track which providers had a plain failure.
     let mut need_individual: Vec<String> = Vec::new();
 
     for provider in &locked {
         let id = provider.id().to_string();
-        // Clone the Zeroizing<String> values — each clone is itself zeroized on drop.
-        let fields_clone: HashMap<String, Zeroizing<String>> = collected
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        match state.auth_provider_inner(&id, fields_clone).await {
+        // Map the password to this provider's expected field name.
+        let pw_field_id = provider.password_field().id.to_string();
+        let mut fields_for_provider = HashMap::new();
+        fields_for_provider.insert(pw_field_id, raw_password.clone());
+        match state.auth_provider_inner(&id, fields_for_provider).await {
             Ok(()) => {
                 results.push(UnlockResult {
                     provider_id: id.clone(),
@@ -131,11 +138,7 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
             }
             Err(FdoError::Failed(ref msg)) if msg == "registration_required" => {
                 debug!(provider = %id, "registration required after opportunistic unlock");
-                let prefill: HashMap<String, Zeroizing<String>> = collected
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                need_registration.push((id, prefill));
+                need_registration.push((id, raw_password.clone()));
             }
             Err(e) => {
                 debug!(provider = %id, "opportunistic unlock failed: {e}");
@@ -145,13 +148,19 @@ pub async fn unlock_with_tty(state: Arc<ServiceState>, tty_fd: RawFd) -> Result<
     }
 
     // Handle providers that need registration (password already collected).
-    for (id, prefill) in need_registration {
-        let fields = {
+    for (id, password) in need_registration {
+        let (fields, pw_field_id) = {
             let b = state
                 .provider_by_id(&id)
                 .ok_or_else(|| anyhow!("provider '{id}' not found"))?;
-            provider_auth_fields(b.as_ref())
+            (
+                provider_auth_fields(b.as_ref()),
+                b.password_field().id.to_string(),
+            )
         };
+        // Build prefill map using this provider's own password field name.
+        let mut prefill = HashMap::new();
+        prefill.insert(pw_field_id, password);
         let _password =
             auth_provider_with_tty_inner(&state, tty_fd, &id, &fields, Some(prefill), false)
                 .await?;

@@ -3104,10 +3104,13 @@ async fn cmd_lock() -> Result<()> {
         "org.freedesktop.Secret.Service",
     )
     .await?;
-    let _: (Vec<String>, String) = proxy
+    let _: (Vec<OwnedObjectPath>, OwnedObjectPath) = proxy
         .call(
             "Lock",
-            &(vec!["/org/freedesktop/secrets/collection/default"],),
+            &(vec![
+                OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/default")
+                    .expect("static path"),
+            ],),
         )
         .await?;
 
