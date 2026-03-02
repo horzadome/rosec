@@ -101,19 +101,20 @@ pub fn remove_provider(config_path: &Path, id: &str) -> Result<()> {
 /// Return the known required option keys for a given provider kind.
 ///
 /// Used by `rosec provider add` to prompt for missing options interactively.
+/// Only covers built-in kinds; discovered WASM plugin kinds get their
+/// requirements from the plugin manifest (see `PluginRegistry`).
 pub fn required_options_for_kind(kind: &str) -> &'static [(&'static str, &'static str)] {
     match kind {
         "bitwarden" => &[("email", "Bitwarden account email")],
         "bitwarden-sm" => &[("organization_id", "Organization UUID")],
-        "bitwarden-wasm" => &[
-            ("wasm_path", "Path to the .wasm plugin file"),
-            ("email", "Bitwarden account email"),
-        ],
         _ => &[],
     }
 }
 
 /// Return the optional option keys for a given provider kind.
+///
+/// Only covers built-in kinds; discovered WASM plugin kinds get their
+/// options from the plugin manifest (see `PluginRegistry`).
 pub fn optional_options_for_kind(kind: &str) -> &'static [(&'static str, &'static str)] {
     match kind {
         "bitwarden" => &[
@@ -143,23 +144,15 @@ pub fn optional_options_for_kind(kind: &str) -> &'static [(&'static str, &'stati
                 "Label stamped on all items as the 'collection' attribute (e.g. 'work')",
             ),
         ],
-        "bitwarden-wasm" => &[
-            ("region", "Cloud region: 'us' or 'eu' (default: us)"),
-            (
-                "base_url",
-                "Self-hosted base URL, e.g. https://vault.example.com",
-            ),
-            (
-                "allowed_hosts",
-                "Comma-separated HTTP hosts the plugin may contact",
-            ),
-        ],
         _ => &[],
     }
 }
 
-/// The list of provider kind strings the daemon knows about.
-pub const KNOWN_KINDS: &[&str] = &["local", "bitwarden", "bitwarden-sm", "bitwarden-wasm"];
+/// The list of built-in provider kind strings.
+///
+/// WASM plugin kinds are discovered dynamically from the plugin registry
+/// and are not included here.
+pub const KNOWN_KINDS: &[&str] = &["local", "bitwarden", "bitwarden-sm"];
 
 /// Set a single dotted-path value in the config file.
 ///

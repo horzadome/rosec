@@ -764,6 +764,60 @@ fn simple_ok() -> SimpleResponse {
 // Plugin function exports
 // ═══════════════════════════════════════════════════════════════════
 
+/// Return the plugin manifest for discovery.
+///
+/// Called by the host **before** `init` — no global state is accessed.
+/// This allows the host to scan `.wasm` files and discover provider
+/// kinds, config requirements, and allowed hosts automatically.
+#[plugin_fn]
+pub fn plugin_manifest(_: ()) -> FnResult<Json<PluginManifest>> {
+    Ok(Json(PluginManifest {
+        kind: "bitwarden-pm".to_string(),
+        name: "Bitwarden Password Manager".to_string(),
+        description: "Bitwarden password manager vault (cloud or self-hosted)".to_string(),
+        default_allowed_hosts: vec![
+            "*.bitwarden.com".to_string(),
+            "*.bitwarden.eu".to_string(),
+        ],
+        required_options: vec![PluginOptionDescriptor {
+            key: "email".to_string(),
+            description: "Bitwarden account email".to_string(),
+            kind: "text".to_string(),
+        }],
+        optional_options: vec![
+            PluginOptionDescriptor {
+                key: "region".to_string(),
+                description: "Cloud region: 'us' or 'eu' (default: us)".to_string(),
+                kind: "text".to_string(),
+            },
+            PluginOptionDescriptor {
+                key: "base_url".to_string(),
+                description: "Self-hosted base URL, e.g. https://vault.example.com".to_string(),
+                kind: "text".to_string(),
+            },
+            PluginOptionDescriptor {
+                key: "api_url".to_string(),
+                description: "Explicit API URL override (overrides region/base_url)".to_string(),
+                kind: "text".to_string(),
+            },
+            PluginOptionDescriptor {
+                key: "identity_url".to_string(),
+                description: "Explicit identity URL override (overrides region/base_url)"
+                    .to_string(),
+                kind: "text".to_string(),
+            },
+            PluginOptionDescriptor {
+                key: "collection".to_string(),
+                description:
+                    "Label stamped on all items as the 'collection' attribute (e.g. 'work')"
+                        .to_string(),
+                kind: "text".to_string(),
+            },
+        ],
+        id_derivation_key: Some("email".to_string()),
+    }))
+}
+
 /// Initialise the plugin with provider configuration.
 ///
 /// Called once by the host after loading the WASM module.

@@ -237,6 +237,54 @@ pub struct CapabilitiesResponse {
     pub capabilities: Vec<String>,
 }
 
+// ── Plugin manifest (pre-init discovery) ─────────────────────────
+
+/// Returned by `plugin_manifest` — called before `init` to discover
+/// the plugin's kind, name, config requirements, and allowed hosts.
+///
+/// This enables automatic plugin discovery: the host scans `.wasm`
+/// files in known directories, calls `plugin_manifest()` on each,
+/// and registers the discovered kinds dynamically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginManifest {
+    /// The provider kind string (e.g. `"bitwarden-pm"`).
+    pub kind: String,
+    /// Human-readable plugin name (e.g. `"Bitwarden Password Manager"`).
+    pub name: String,
+    /// Short description shown in `rosec provider kinds`.
+    pub description: String,
+    /// HTTP hosts the plugin needs access to (defaults).
+    /// Users can override via config.
+    #[serde(default)]
+    pub default_allowed_hosts: Vec<String>,
+    /// Config options the plugin requires.
+    #[serde(default)]
+    pub required_options: Vec<PluginOptionDescriptor>,
+    /// Config options the plugin accepts but doesn't require.
+    #[serde(default)]
+    pub optional_options: Vec<PluginOptionDescriptor>,
+    /// Which required option key to hash for auto-generating provider IDs.
+    /// e.g. `"email"` for bitwarden-pm.  If `None`, falls back to the kind.
+    #[serde(default)]
+    pub id_derivation_key: Option<String>,
+}
+
+/// Describes a single config option a plugin accepts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginOptionDescriptor {
+    /// Option key (e.g. `"email"`, `"region"`).
+    pub key: String,
+    /// Human-readable description for prompts.
+    pub description: String,
+    /// Input kind: `"text"`, `"password"`, or `"secret"`.
+    #[serde(default = "default_option_kind")]
+    pub kind: String,
+}
+
+fn default_option_kind() -> String {
+    "text".into()
+}
+
 // ── Error classification ─────────────────────────────────────────
 
 /// Allows the guest to communicate structured error kinds.

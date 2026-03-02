@@ -9,6 +9,7 @@
 //!
 //! | Guest function           | Input type               | Output type                  |
 //! |--------------------------|--------------------------|------------------------------|
+//! | `plugin_manifest`        | *(empty)*                | `PluginManifest`             |
 //! | `init`                   | `InitRequest`            | `InitResponse`               |
 //! | `status`                 | *(empty)*                | `StatusResponse`             |
 //! | `unlock`                 | `UnlockRequest`          | `SimpleResponse`             |
@@ -25,7 +26,9 @@
 //! | `attribute_descriptors`  | *(empty)*                | `AttributeDescriptorsResponse` |
 //! | `capabilities`           | *(empty)*                | `CapabilitiesResponse`       |
 
+pub mod discovery;
 pub mod protocol;
 mod provider;
 
+pub use discovery::PluginRegistry;
 pub use provider::{WasmProvider, WasmProviderConfig};

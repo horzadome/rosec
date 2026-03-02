@@ -278,6 +278,29 @@ fn cmd_provider_kinds() {
         }
         println!();
     }
+
+    // List dynamically discovered WASM plugin kinds.
+    let registry = rosec_wasm::discovery::scan_plugins();
+    for kind in registry.kinds() {
+        let plugin = registry
+            .get(kind)
+            .expect("kind from registry.kinds() must exist");
+        println!("  {kind}");
+        println!("    {}", plugin.manifest.description);
+        if !plugin.manifest.required_options.is_empty() {
+            println!("    Required:");
+            for opt in &plugin.manifest.required_options {
+                println!("      {:<20}  {}", opt.key, opt.description);
+            }
+        }
+        if !plugin.manifest.optional_options.is_empty() {
+            println!("    Optional:");
+            for opt in &plugin.manifest.optional_options {
+                println!("      {:<20}  {}", opt.key, opt.description);
+            }
+        }
+        println!();
+    }
 }
 
 async fn conn() -> Result<Connection> {
@@ -972,18 +995,34 @@ async fn cmd_provider_auth(args: &[String]) -> Result<()> {
 
 /// `rosec provider add <kind> [--id <id>] [key=value ...]`
 async fn cmd_provider_add(args: &[String]) -> Result<()> {
+    // Scan for discovered plugin kinds so we can validate and prompt correctly.
+    let registry = rosec_wasm::discovery::scan_plugins();
+
+    let all_kinds: Vec<String> = {
+        let mut v: Vec<String> = config_edit::KNOWN_KINDS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        for kind in registry.kinds() {
+            if !v.iter().any(|k| k == kind) {
+                v.push(kind.to_string());
+            }
+        }
+        v
+    };
+    let all_kinds_display = all_kinds.join(", ");
+
     let kind = args.first().ok_or_else(|| {
         anyhow::anyhow!(
-            "usage: rosec provider add <kind> [--id <id>] [key=value ...]\nKinds: {}",
-            config_edit::KNOWN_KINDS.join(", ")
+            "usage: rosec provider add <kind> [--id <id>] [key=value ...]\nKinds: {all_kinds_display}"
         )
     })?;
 
-    if !config_edit::KNOWN_KINDS.contains(&kind.as_str()) {
-        bail!(
-            "unknown provider kind '{kind}'. Known kinds: {}",
-            config_edit::KNOWN_KINDS.join(", ")
-        );
+    let is_builtin = config_edit::KNOWN_KINDS.contains(&kind.as_str());
+    let is_discovered = registry.contains_kind(kind);
+
+    if !is_builtin && !is_discovered {
+        bail!("unknown provider kind '{kind}'. Known kinds: {all_kinds_display}");
     }
 
     // Parse --id, --path, --collection flags and key=value pairs from remaining args.
@@ -1039,17 +1078,32 @@ async fn cmd_provider_add(args: &[String]) -> Result<()> {
         options.iter().map(|(k, _)| k.clone()).collect();
 
     // Collect required options first — we need them to auto-generate the ID.
-    for (key, description) in config_edit::required_options_for_kind(kind) {
-        if !supplied.contains(*key) {
-            let field_kind = if key.contains("secret") || key.contains("password") {
-                "secret"
-            } else {
-                "text"
-            };
-            let v = prompt_field(description, "", field_kind).await?;
-            let s = v.as_str().to_string();
-            if !s.is_empty() {
-                options.push((key.to_string(), s));
+    // For built-in kinds, use config_edit; for discovered kinds, use the registry.
+    if is_discovered {
+        if let Some(req_opts) = rosec_wasm::discovery::required_options(&registry, kind) {
+            for opt in &req_opts {
+                if !supplied.contains(&opt.key) {
+                    let v = prompt_field(&opt.description, "", &opt.kind).await?;
+                    let s = v.as_str().to_string();
+                    if !s.is_empty() {
+                        options.push((opt.key.clone(), s));
+                    }
+                }
+            }
+        }
+    } else {
+        for (key, description) in config_edit::required_options_for_kind(kind) {
+            if !supplied.contains(*key) {
+                let field_kind = if key.contains("secret") || key.contains("password") {
+                    "secret"
+                } else {
+                    "text"
+                };
+                let v = prompt_field(description, "", field_kind).await?;
+                let s = v.as_str().to_string();
+                if !s.is_empty() {
+                    options.push((key.to_string(), s));
+                }
             }
         }
     }
@@ -1057,23 +1111,42 @@ async fn cmd_provider_add(args: &[String]) -> Result<()> {
     // Determine the provider ID: explicit --id wins; otherwise derive from credentials.
     let id = match custom_id {
         Some(ref id) => id.clone(),
-        None => derive_provider_id(kind, &options),
+        None => derive_provider_id(kind, &options, &registry),
     };
 
     // Prompt for optional options not already supplied.
     let supplied_after_required: std::collections::HashSet<String> =
         options.iter().map(|(k, _)| k.clone()).collect();
-    for (key, description) in config_edit::optional_options_for_kind(kind) {
-        if !supplied_after_required.contains(*key) {
-            let v = prompt_field(
-                &format!("{description} (optional, Enter to skip)"),
-                "",
-                "text",
-            )
-            .await?;
-            let s = v.as_str().to_string();
-            if !s.is_empty() {
-                options.push((key.to_string(), s));
+    if is_discovered {
+        if let Some(opt_opts) = rosec_wasm::discovery::optional_options(&registry, kind) {
+            for opt in &opt_opts {
+                if !supplied_after_required.contains(&opt.key) {
+                    let v = prompt_field(
+                        &format!("{} (optional, Enter to skip)", opt.description),
+                        "",
+                        &opt.kind,
+                    )
+                    .await?;
+                    let s = v.as_str().to_string();
+                    if !s.is_empty() {
+                        options.push((opt.key.clone(), s));
+                    }
+                }
+            }
+        }
+    } else {
+        for (key, description) in config_edit::optional_options_for_kind(kind) {
+            if !supplied_after_required.contains(*key) {
+                let v = prompt_field(
+                    &format!("{description} (optional, Enter to skip)"),
+                    "",
+                    "text",
+                )
+                .await?;
+                let s = v.as_str().to_string();
+                if !s.is_empty() {
+                    options.push((key.to_string(), s));
+                }
             }
         }
     }
@@ -1145,11 +1218,22 @@ async fn cmd_provider_add(args: &[String]) -> Result<()> {
 /// - `bitwarden`: hashes the email address
 /// - `bitwarden-sm`: hashes the organization_id
 /// - anything else: falls back to the kind string itself
-fn derive_provider_id(kind: &str, options: &[(String, String)]) -> String {
+fn derive_provider_id(
+    kind: &str,
+    options: &[(String, String)],
+    registry: &rosec_wasm::PluginRegistry,
+) -> String {
+    // For built-in kinds, use hardcoded credential keys.
+    // For discovered kinds, use the manifest's id_derivation_key.
+    let discovered_key = rosec_wasm::discovery::id_derivation_key(registry, kind);
+
     let credential_key = match kind {
-        "bitwarden" | "bitwarden-wasm" => "email",
+        "bitwarden" => "email",
         "bitwarden-sm" => "organization_id",
-        _ => return kind.to_string(),
+        _ => match discovered_key.as_deref() {
+            Some(k) => k,
+            None => return kind.to_string(),
+        },
     };
 
     let value = options

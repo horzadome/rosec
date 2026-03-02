@@ -50,6 +50,9 @@ async fn run() -> Result<()> {
         config.provider.iter().filter(|e| e.kind != "local").count()
     );
 
+    // Discover WASM plugins from system and user directories.
+    let plugin_registry = rosec_wasm::discovery::scan_plugins();
+
     let router_config = RouterConfig {
         dedup_strategy: config.service.dedup_strategy,
         dedup_time_fallback: config.service.dedup_time_fallback,
@@ -57,7 +60,7 @@ async fn run() -> Result<()> {
     let router = Arc::new(Router::new(router_config));
     let sessions = Arc::new(SessionManager::new());
 
-    let providers: Vec<Arc<dyn Provider>> = build_providers(&config).await?;
+    let providers: Vec<Arc<dyn Provider>> = build_providers(&config, &plugin_registry).await?;
 
     // Build per-provider return_attr and collection maps from config.
     let return_attr_map: std::collections::HashMap<String, Vec<String>> = config
@@ -148,8 +151,16 @@ async fn run() -> Result<()> {
         let watch_path = config_path.clone();
         let initial_config = config.clone();
         let watch_ssh = ssh_manager.clone();
+        let watch_registry = plugin_registry;
         tokio::spawn(async move {
-            if let Err(e) = config_watcher(watch_state, watch_path, initial_config, watch_ssh).await
+            if let Err(e) = config_watcher(
+                watch_state,
+                watch_path,
+                initial_config,
+                watch_ssh,
+                watch_registry,
+            )
+            .await
             {
                 tracing::warn!("config watcher exited: {e}");
             }
@@ -750,7 +761,10 @@ fn wire_provider_callbacks(
 /// Local vaults (`kind = "local"`) and external providers (`kind = "bitwarden"`,
 /// etc.) are built from the unified `[[provider]]` config entries.  Both go
 /// through the same `Provider` trait.
-async fn build_providers(config: &Config) -> Result<Vec<Arc<dyn Provider>>> {
+async fn build_providers(
+    config: &Config,
+    plugin_registry: &rosec_wasm::PluginRegistry,
+) -> Result<Vec<Arc<dyn Provider>>> {
     if config.provider.is_empty() {
         tracing::warn!("no providers configured");
         return Ok(Vec::new());
@@ -769,7 +783,7 @@ async fn build_providers(config: &Config) -> Result<Vec<Arc<dyn Provider>>> {
                 );
                 providers.push(provider);
             }
-            _ => match build_single_provider(entry).await {
+            _ => match build_single_provider(entry, plugin_registry).await {
                 Ok(provider) => {
                     tracing::info!(
                         provider_id = %entry.id,
@@ -891,6 +905,7 @@ async fn config_watcher(
     config_path: PathBuf,
     initial_config: Config,
     ssh_manager: Option<Arc<ssh::SshManager>>,
+    plugin_registry: rosec_wasm::PluginRegistry,
 ) -> anyhow::Result<()> {
     use tokio::sync::mpsc;
 
@@ -1026,7 +1041,7 @@ async fn config_watcher(
                         tracing::info!(vault_id = id, "hot-reload: added vault");
                         added_any = true;
                     }
-                    _ => match build_single_provider(entry).await {
+                    _ => match build_single_provider(entry, &plugin_registry).await {
                         Ok(provider) => {
                             state.hotreload_add_provider(provider);
                             tracing::info!(provider_id = id, "hot-reload: added provider");
@@ -1113,6 +1128,7 @@ async fn config_watcher(
 /// D-Bus calls once the user supplies credentials interactively.
 async fn build_single_provider(
     entry: &rosec_core::config::ProviderEntry,
+    plugin_registry: &rosec_wasm::PluginRegistry,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     match entry.kind.as_str() {
         "bitwarden" => {
@@ -1212,18 +1228,8 @@ async fn build_single_provider(
                 sm_config,
             )))
         }
-        "bitwarden-wasm" => {
-            let wasm_path = entry
-                .options
-                .get("wasm_path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "bitwarden-wasm provider '{}' requires 'wasm_path' option",
-                        entry.id
-                    )
-                })?
-                .to_string();
+        kind if plugin_registry.contains_kind(kind) => {
+            let discovered = plugin_registry.get(kind).expect("contains_kind was true");
 
             let name = entry
                 .options
@@ -1232,37 +1238,34 @@ async fn build_single_provider(
                 .unwrap_or(&entry.id)
                 .to_string();
 
+            // User-specified allowed_hosts override manifest defaults.
             let allowed_hosts: Vec<String> = entry
                 .options
                 .get("allowed_hosts")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
+                .and_then(|v| v.as_str())
+                .map(|s| s.split(',').map(|h| h.trim().to_string()).collect())
+                .unwrap_or_else(|| discovered.manifest.default_allowed_hosts.clone());
 
-            // Forward all options except the host-consumed ones to the guest.
+            // Forward all options except host-consumed ones to the guest.
             let guest_options: std::collections::HashMap<String, serde_json::Value> = entry
                 .options
                 .iter()
-                .filter(|(k, _)| !matches!(k.as_str(), "wasm_path" | "name" | "allowed_hosts"))
+                .filter(|(k, _)| !matches!(k.as_str(), "name" | "allowed_hosts"))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
 
             let wasm_config = rosec_wasm::WasmProviderConfig {
                 id: entry.id.clone(),
                 name,
-                kind: entry.kind.clone(),
-                wasm_path,
+                kind: kind.to_string(),
+                wasm_path: discovered.wasm_path.display().to_string(),
                 allowed_hosts,
                 options: guest_options,
             };
 
             Ok(Arc::new(
                 rosec_wasm::WasmProvider::new(wasm_config)
-                    .map_err(|e| anyhow::anyhow!("wasm provider '{}': {e}", entry.id))?,
+                    .map_err(|e| anyhow::anyhow!("plugin provider '{}': {e}", entry.id))?,
             ))
         }
         other => anyhow::bail!("unknown provider kind '{other}'"),
