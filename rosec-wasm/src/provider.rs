@@ -76,6 +76,11 @@ pub struct WasmProvider {
     /// Callbacks registered by the daemon — stored here so we can fire them
     /// from the host side when the guest reports state changes.
     callbacks: std::sync::RwLock<ProviderCallbacks>,
+    /// Cached timestamp of the last successful sync.
+    ///
+    /// Updated after `unlock` and `sync` calls succeed.  Queried by
+    /// `last_synced_at()` (synchronous) for the delta-sync check.
+    last_sync_time: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
 }
 
 impl std::fmt::Debug for WasmProvider {
@@ -164,6 +169,7 @@ impl WasmProvider {
             auth_fields,
             registration_info,
             callbacks: std::sync::RwLock::new(ProviderCallbacks::default()),
+            last_sync_time: std::sync::Mutex::new(None),
         })
     }
 }
@@ -379,6 +385,10 @@ impl Provider for WasmProvider {
                 }
             }
 
+            // Update the cached last-sync timestamp (unlock = first sync).
+            if let Ok(mut guard) = self.last_sync_time.lock() {
+                *guard = Some(chrono::Utc::now());
+            }
             // Fire on_unlocked callback.
             if let Ok(cbs) = self.callbacks.read()
                 && let Some(ref cb) = cbs.on_unlocked
@@ -389,6 +399,10 @@ impl Provider for WasmProvider {
         } else {
             Err(map_guest_error(resp.error, resp.error_kind))
         }
+    }
+
+    fn last_synced_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.last_sync_time.lock().ok().and_then(|g| *g)
     }
 
     async fn lock(&self) -> Result<(), ProviderError> {
@@ -413,6 +427,10 @@ impl Provider for WasmProvider {
         }
         let resp: SimpleResponse = call_guest_json_no_input(&mut plugin, "sync")?;
         if resp.ok {
+            // Update the cached last-sync timestamp.
+            if let Ok(mut guard) = self.last_sync_time.lock() {
+                *guard = Some(chrono::Utc::now());
+            }
             if let Ok(cbs) = self.callbacks.read()
                 && let Some(ref cb) = cbs.on_sync_succeeded
             {
@@ -524,6 +542,50 @@ impl Provider for WasmProvider {
         Ok(SshPrivateKeyMaterial {
             pem: Zeroizing::new(pem),
         })
+    }
+
+    /// Check whether the remote has changed since the last sync.
+    ///
+    /// If the guest exports `check_remote_changed`, delegate to it with an
+    /// ISO-8601 timestamp derived from `last_synced_at()`.  This allows
+    /// SM guests to use the lightweight delta-sync endpoint instead of a
+    /// full re-fetch.
+    ///
+    /// If the guest does not export the function, falls back to the trait
+    /// default (`Ok(true)` — assume changed, trigger a full sync).
+    async fn check_remote_changed(&self) -> Result<bool, ProviderError> {
+        // Check if the guest supports this function (requires plugin lock).
+        // Build the ISO-8601 timestamp from the cached last_sync_time before
+        // acquiring the plugin lock to avoid holding two locks simultaneously.
+        let iso8601 = match self.last_synced_at() {
+            Some(dt) => dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+            None => {
+                // No prior sync — assume changed.
+                return Ok(true);
+            }
+        };
+
+        let mut plugin = self.plugin.lock().await;
+        if !plugin.function_exists("check_remote_changed") {
+            // No guest support — assume changed (safe default).
+            return Ok(true);
+        }
+
+        let req = crate::protocol::CheckRemoteChangedRequest {
+            last_synced_iso8601: iso8601,
+        };
+
+        let resp: crate::protocol::CheckRemoteChangedResponse =
+            call_guest_json(&mut plugin, "check_remote_changed", &req)?;
+
+        if !resp.ok {
+            // On guest error, assume changed so the host falls back to full sync.
+            debug!(provider = %self.config.id, error = ?resp.error,
+                "check_remote_changed guest error, assuming changed");
+            return Ok(true);
+        }
+
+        Ok(resp.has_changes)
     }
 }
 

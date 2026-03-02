@@ -1047,7 +1047,7 @@ async fn config_watcher(
                 .get(id)
                 .is_some_and(|old_fp| new_map.get(id).is_some_and(|new_fp| old_fp != new_fp));
             (is_new || is_changed)
-                && !matches!(entry.kind.as_str(), "local" | "bitwarden-sm")
+                && !matches!(entry.kind.as_str(), "local")
                 && !plugin_registry.contains_kind(&entry.kind)
         });
         if needs_rescan {
@@ -1165,42 +1165,6 @@ async fn build_single_provider(
     plugin_registry: &rosec_wasm::PluginRegistry,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     match entry.kind.as_str() {
-        "bitwarden-sm" => {
-            let organization_id = entry
-                .options
-                .get("organization_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "bitwarden-sm provider '{}' requires 'organization_id' option",
-                        entry.id
-                    )
-                })?
-                .to_string();
-
-            let server_url = entry
-                .options
-                .get("server_url")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-
-            let region = match entry.options.get("region").and_then(|v| v.as_str()) {
-                Some("eu") => rosec_bitwarden_sm::SmRegion::Eu,
-                _ => rosec_bitwarden_sm::SmRegion::Us,
-            };
-
-            let sm_config = rosec_bitwarden_sm::BitwardenSmConfig {
-                id: entry.id.clone(),
-                name: Some(entry.id.clone()),
-                region,
-                server_url,
-                organization_id,
-            };
-
-            Ok(Arc::new(rosec_bitwarden_sm::BitwardenSmProvider::new(
-                sm_config,
-            )))
-        }
         kind if plugin_registry.contains_kind(kind) => {
             let discovered = plugin_registry.get(kind).expect("contains_kind was true");
 

@@ -143,36 +143,23 @@ pub fn set_provider_enabled(config_path: &Path, id: &str, enabled: bool) -> Resu
 /// Used by `rosec provider add` to prompt for missing options interactively.
 /// Only covers built-in kinds; discovered WASM plugin kinds get their
 /// requirements from the plugin manifest (see `PluginRegistry`).
-pub fn required_options_for_kind(kind: &str) -> &'static [(&'static str, &'static str)] {
-    match kind {
-        "bitwarden-sm" => &[("organization_id", "Organization UUID")],
-        _ => &[],
-    }
+pub fn required_options_for_kind(_kind: &str) -> &'static [(&'static str, &'static str)] {
+    &[]
 }
 
 /// Return the optional option keys for a given provider kind.
 ///
 /// Only covers built-in kinds; discovered WASM plugin kinds get their
 /// options from the plugin manifest (see `PluginRegistry`).
-pub fn optional_options_for_kind(kind: &str) -> &'static [(&'static str, &'static str)] {
-    match kind {
-        "bitwarden-sm" => &[
-            ("region", "Cloud region: 'us' or 'eu' (default: us)"),
-            ("server_url", "Self-hosted server URL (overrides region)"),
-            (
-                "collection",
-                "Label stamped on all items as the 'collection' attribute (e.g. 'work')",
-            ),
-        ],
-        _ => &[],
-    }
+pub fn optional_options_for_kind(_kind: &str) -> &'static [(&'static str, &'static str)] {
+    &[]
 }
 
 /// The list of built-in provider kind strings.
 ///
-/// WASM plugin kinds are discovered dynamically from the plugin registry
-/// and are not included here.
-pub const KNOWN_KINDS: &[&str] = &["local", "bitwarden-sm"];
+/// WASM plugin kinds (e.g. `bitwarden-pm`, `bitwarden-sm`) are discovered
+/// dynamically from the plugin registry and are not included here.
+pub const KNOWN_KINDS: &[&str] = &["local"];
 
 /// Set a single dotted-path value in the config file.
 ///

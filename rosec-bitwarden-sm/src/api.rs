@@ -1,30 +1,30 @@
-//! Native Bitwarden Secrets Manager API client.
+//! Bitwarden Secrets Manager HTTP API client for the WASM guest.
 //!
-//! Implements the SM authentication and secret-fetch flow without the Bitwarden
-//! SDK, using the same HTTP endpoints and cryptographic operations directly:
+//! Ported from the native `rosec-bitwarden-sm/src/api.rs`.  Major changes:
+//! - `reqwest::Client` → `extism_pdk::http::request` (Extism PDK HTTP, synchronous)
+//! - All methods are synchronous (no async/await)
+//! - `uuid::Uuid` → plain `String` (serde_json handles UUIDs as strings)
+//! - tracing → `extism_pdk` logging macros
+//!
+//! # Flow
 //!
 //! 1. Parse the access token (`0.{uuid}.{secret}:{base64_16_key}`)
-//! 2. Derive the token encryption key via PBKDF-HMAC-SHA256 + HKDF
+//! 2. Derive the token encryption key via HMAC-SHA256 PRK + HKDF-Expand
 //! 3. POST `{identity}/connect/token` (client_credentials) → JWT + encrypted_payload
 //! 4. Decrypt `encrypted_payload` → org encryption key (64-byte AES-256-CBC-HMAC)
 //! 5. GET  `{api}/organizations/{org}/secrets` → list of secret UUIDs
 //! 6. POST `{api}/secrets/get-by-ids`          → encrypted secret blobs
-//! 7. Decrypt each secret's `key`, `value`, `note` with the org key
+//! 7. GET  `{api}/organizations/{org}/projects` → project names (optional)
+//! 8. Decrypt each secret key/value/note with the org key
 
 use std::collections::HashMap;
 
-use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use hmac::{Hmac, Mac};
-use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use tracing::debug;
-use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-type HmacSha256 = Hmac<Sha256>;
-type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+use crate::crypto::{decrypt_field_opt, decrypt_org_key, derive_token_enc_key};
+use crate::error::SmError;
 
 // ---------------------------------------------------------------------------
 // Parsed access token
@@ -34,73 +34,57 @@ type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 ///
 /// Token format: `0.{access_token_id}.{client_secret}:{base64_16_byte_enc_key}`
 pub struct AccessToken {
-    pub access_token_id: Uuid,
+    pub access_token_id: String,
     pub client_secret: Zeroizing<String>,
-    /// Raw 16-byte seed used to derive the token encryption key.
     enc_key_seed: Zeroizing<[u8; 16]>,
 }
 
 impl AccessToken {
     /// Parse a raw access token string.
-    pub fn parse(raw: &str) -> Result<Self, SmApiError> {
+    pub fn parse(raw: &str) -> Result<Self, SmError> {
         let (first, enc_key_b64) = raw
             .split_once(':')
-            .ok_or(SmApiError::InvalidToken("missing ':' separator"))?;
+            .ok_or(SmError::InvalidToken("missing ':' separator"))?;
 
         let parts: Vec<&str> = first.split('.').collect();
         if parts.len() != 3 {
-            return Err(SmApiError::InvalidToken(
+            return Err(SmError::InvalidToken(
                 "expected 3 dot-separated parts before ':'",
             ));
         }
         if parts[0] != "0" {
-            return Err(SmApiError::InvalidToken(
+            return Err(SmError::InvalidToken(
                 "unsupported token version (expected '0')",
             ));
         }
 
-        let access_token_id = parts[1]
-            .parse::<Uuid>()
-            .map_err(|_| SmApiError::InvalidToken("invalid UUID in token"))?;
+        // Validate it looks like a UUID (36 chars).
+        let id = parts[1];
+        if id.len() != 36 {
+            return Err(SmError::InvalidToken("invalid UUID in token"));
+        }
 
         let client_secret = Zeroizing::new(parts[2].to_string());
 
-        // The enc key is a standard base64-encoded 16-byte value (padding optional).
         let key_bytes = B64
             .decode(enc_key_b64)
-            .map_err(|_| SmApiError::InvalidToken("invalid base64 in encryption key"))?;
+            .map_err(|_| SmError::InvalidToken("invalid base64 in encryption key"))?;
         if key_bytes.len() != 16 {
-            return Err(SmApiError::InvalidToken("encryption key must be 16 bytes"));
+            return Err(SmError::InvalidToken("encryption key must be 16 bytes"));
         }
         let mut seed = Zeroizing::new([0u8; 16]);
         seed.copy_from_slice(&key_bytes);
 
         Ok(Self {
-            access_token_id,
+            access_token_id: id.to_string(),
             client_secret,
             enc_key_seed: seed,
         })
     }
 
     /// Derive the 64-byte token encryption key.
-    ///
-    /// Matches the SDK's `derive_shareable_key(seed, "accesstoken", Some("sm-access-token"))`:
-    ///   prk  = HMAC-SHA256(key="bitwarden-accesstoken", data=seed_16_bytes)
-    ///   key  = HKDF-Expand(prk, info="sm-access-token", len=64)
-    ///   → [enc_key: 32 bytes | mac_key: 32 bytes]
-    pub fn derive_token_enc_key(&self) -> Result<Zeroizing<[u8; 64]>, SmApiError> {
-        // PRK = HMAC-SHA256(key = "bitwarden-accesstoken", data = seed)
-        let mut mac = HmacSha256::new_from_slice(b"bitwarden-accesstoken")
-            .map_err(|e| SmApiError::Crypto(format!("HMAC key init: {e}")))?;
-        mac.update(self.enc_key_seed.as_ref());
-        let prk_generic = mac.finalize().into_bytes();
-        let mut prk = Zeroizing::new([0u8; 32]);
-        prk.copy_from_slice(&prk_generic);
-
-        let expanded = hkdf_expand_sha256(&*prk, Some(b"sm-access-token"), 64);
-        let mut out = Zeroizing::new([0u8; 64]);
-        out.copy_from_slice(&expanded);
-        Ok(out)
+    pub fn derive_enc_key(&self) -> Result<Zeroizing<[u8; 64]>, SmError> {
+        derive_token_enc_key(&self.enc_key_seed)
     }
 }
 
@@ -114,7 +98,6 @@ pub struct SmUrls {
 }
 
 impl SmUrls {
-    /// Official Bitwarden cloud — US region (default).
     pub fn official_us() -> Self {
         Self {
             api_url: "https://api.bitwarden.com".to_string(),
@@ -122,7 +105,6 @@ impl SmUrls {
         }
     }
 
-    /// Official Bitwarden cloud — EU region.
     pub fn official_eu() -> Self {
         Self {
             api_url: "https://api.bitwarden.eu".to_string(),
@@ -130,8 +112,6 @@ impl SmUrls {
         }
     }
 
-    /// Self-hosted instance with a single base URL.
-    /// Matches the SDK convention of appending `/api` and `/identity`.
     pub fn from_base(base: &str) -> Self {
         let base = base.trim_end_matches('/');
         Self {
@@ -142,229 +122,40 @@ impl SmUrls {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP client
+// HTTP helpers
 // ---------------------------------------------------------------------------
 
-pub struct SmApiClient {
-    http: HttpClient,
-    urls: SmUrls,
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                let hi = char::from_digit((b >> 4) as u32, 16)
+                    .unwrap_or('0')
+                    .to_ascii_uppercase();
+                let lo = char::from_digit((b & 0xf) as u32, 16)
+                    .unwrap_or('0')
+                    .to_ascii_uppercase();
+                out.push('%');
+                out.push(hi);
+                out.push(lo);
+            }
+        }
+    }
+    out
 }
 
-impl SmApiClient {
-    pub fn new(urls: SmUrls) -> Result<Self, SmApiError> {
-        let http = HttpClient::builder()
-            .user_agent(format!("rosec/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .https_only(true)
-            .build()
-            .map_err(SmApiError::Http)?;
-        Ok(Self { http, urls })
-    }
-
-    /// Step 3: Authenticate with client_credentials grant.
-    ///
-    /// Returns the short-lived Bearer token and the `encrypted_payload` field
-    /// (an EncString containing the org encryption key).
-    pub async fn login(&self, token: &AccessToken) -> Result<LoginResponse, SmApiError> {
-        let url = format!("{}/connect/token", self.urls.identity_url);
-
-        let mut form = HashMap::new();
-        form.insert("grant_type", "client_credentials".to_string());
-        form.insert("scope", "api.secrets".to_string());
-        form.insert("client_id", token.access_token_id.to_string());
-        form.insert("client_secret", token.client_secret.as_str().to_string());
-
-        debug!("SM login request");
-
-        let resp = self
-            .http
-            .post(&url)
-            // DeviceType::SDK = 21 — matches the SDK's default for service-account access tokens.
-            .header("Device-Type", "21")
-            .header("Bitwarden-Client-Name", "rosec")
-            .header("Bitwarden-Client-Version", env!("CARGO_PKG_VERSION"))
-            .form(&form)
-            .send()
-            .await
-            .map_err(SmApiError::Http)?;
-
-        // Zeroize the form values that contain secrets before processing the response.
-        for val in form.values_mut() {
-            val.zeroize();
-        }
-        drop(form);
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SmApiError::Api(format!(
-                "SM login failed ({status}): {body}"
-            )));
-        }
-
-        let login: LoginResponse = resp.json().await.map_err(SmApiError::Http)?;
-        debug!("SM login ok");
-        Ok(login)
-    }
-
-    /// Step 5: List all secret identifiers for the organisation.
-    pub async fn list_secrets(
-        &self,
-        bearer: &str,
-        org_id: Uuid,
-    ) -> Result<Vec<SecretIdentifier>, SmApiError> {
-        let url = format!("{}/organizations/{org_id}/secrets", self.urls.api_url);
-
-        debug!(%org_id, "SM list secrets");
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(bearer)
-            .header("Bitwarden-Client-Name", "cli")
-            .send()
-            .await
-            .map_err(SmApiError::Http)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SmApiError::Api(format!(
-                "SM list secrets failed ({status}): {body}"
-            )));
-        }
-
-        let list: SecretIdentifiersResponse = resp.json().await.map_err(SmApiError::Http)?;
-        debug!(count = list.secrets.len(), "SM secret identifiers fetched");
-        Ok(list.secrets)
-    }
-
-    /// Delta-sync check: returns `true` if the org's secrets have changed since
-    /// `last_synced` (an ISO-8601 UTC timestamp string).
-    ///
-    /// Uses `GET /organizations/{org_id}/secrets/sync?lastSyncedDate={ts}`.
-    /// The response is `{ "hasChanges": bool }`.  A network or parse error is
-    /// propagated as `Err`; the caller should treat that as "assume changed".
-    pub async fn check_secrets_changed(
-        &self,
-        bearer: &str,
-        org_id: Uuid,
-        last_synced: &str,
-    ) -> Result<bool, SmApiError> {
-        let url = format!(
-            "{}/organizations/{org_id}/secrets/sync?lastSyncedDate={last_synced}",
-            self.urls.api_url
-        );
-
-        debug!(%org_id, %last_synced, "SM delta-sync check");
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(bearer)
-            .header("Bitwarden-Client-Name", "rosec")
-            .header("Bitwarden-Client-Version", env!("CARGO_PKG_VERSION"))
-            .send()
-            .await
-            .map_err(SmApiError::Http)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SmApiError::Api(format!(
-                "SM sync check failed ({status}): {body}"
-            )));
-        }
-
-        #[derive(Deserialize)]
-        struct SyncResponse {
-            #[serde(rename = "hasChanges")]
-            has_changes: bool,
-        }
-
-        let sync: SyncResponse = resp.json().await.map_err(SmApiError::Http)?;
-        debug!(
-            has_changes = sync.has_changes,
-            "SM delta-sync check complete"
-        );
-        Ok(sync.has_changes)
-    }
-
-    /// Fetch all projects for the given organisation.
-    ///
-    /// Returns a map of project UUID → project name.  The map is empty if the
-    /// org has no projects or if the server returns a non-2xx status (treated
-    /// as a non-fatal condition — secrets will just lack a `sm.project` name).
-    pub async fn list_projects(
-        &self,
-        bearer: &str,
-        org_id: Uuid,
-    ) -> Result<HashMap<Uuid, String>, SmApiError> {
-        let url = format!("{}/organizations/{org_id}/projects", self.urls.api_url);
-        debug!(%org_id, "SM list projects");
-
-        let resp = self
-            .http
-            .get(&url)
-            .bearer_auth(bearer)
-            .header("Bitwarden-Client-Name", "rosec")
-            .header("Bitwarden-Client-Version", env!("CARGO_PKG_VERSION"))
-            .send()
-            .await
-            .map_err(SmApiError::Http)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(SmApiError::Api(format!(
-                "SM list projects failed ({status}): {body}"
-            )));
-        }
-
-        let list: ProjectsResponse = resp.json().await.map_err(SmApiError::Http)?;
-        debug!(count = list.data.len(), "SM projects fetched");
-        Ok(list.data.into_iter().map(|p| (p.id, p.name)).collect())
-    }
-
-    /// Step 6: Fetch full secret blobs by IDs.
-    pub async fn get_secrets_by_ids(
-        &self,
-        bearer: &str,
-        ids: &[Uuid],
-    ) -> Result<Vec<RawSecret>, SmApiError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let url = format!("{}/secrets/get-by-ids", self.urls.api_url);
-
-        debug!(count = ids.len(), "SM get secrets by IDs");
-
-        let body = SecretsGetRequest { ids: ids.to_vec() };
-
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(bearer)
-            .header("Bitwarden-Client-Name", "cli")
-            .json(&body)
-            .send()
-            .await
-            .map_err(SmApiError::Http)?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(SmApiError::Api(format!(
-                "SM get secrets failed ({status}): {text}"
-            )));
-        }
-
-        let secrets: SecretsResponse = resp.json().await.map_err(SmApiError::Http)?;
-        debug!(count = secrets.data.len(), "SM secrets fetched");
-        Ok(secrets.data)
-    }
+fn url_encode_form(params: &[(&str, String)]) -> Vec<u8> {
+    params
+        .iter()
+        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+        .into_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -373,9 +164,6 @@ impl SmApiClient {
 
 #[derive(Deserialize)]
 pub struct LoginResponse {
-    // Deserialized as plain String then immediately wrapped; the raw String
-    // field is consumed (moved) into Zeroizing so no lingering copy exists
-    // beyond the serde frame.
     pub access_token: String,
     pub encrypted_payload: String,
 }
@@ -389,241 +177,273 @@ impl std::fmt::Debug for LoginResponse {
     }
 }
 
-impl LoginResponse {
-    /// Consume the response, wrapping the bearer token in a Zeroizing guard.
-    pub fn into_zeroizing_token(self) -> (Zeroizing<String>, String) {
-        (Zeroizing::new(self.access_token), self.encrypted_payload)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SecretIdentifier {
-    pub id: Uuid,
-}
-
 #[derive(Debug, Deserialize)]
 struct SecretIdentifiersResponse {
     secrets: Vec<SecretIdentifier>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SecretIdentifier {
+    pub id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SecretsGetRequest {
-    ids: Vec<Uuid>,
+    ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct SecretsResponse {
+struct SecretsGetResponse {
     data: Vec<RawSecret>,
 }
 
-/// A raw (still-encrypted) secret blob from the API.
 #[derive(Debug, Deserialize)]
 pub struct RawSecret {
-    pub id: Uuid,
+    pub id: String,
     pub key: String,
     pub value: Option<String>,
     pub note: Option<String>,
-    #[serde(rename = "projects")]
     pub projects: Option<Vec<SecretProject>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SecretProject {
-    pub id: Uuid,
+    pub id: String,
 }
 
-/// Response from `GET /organizations/{org_id}/projects`.
 #[derive(Debug, Deserialize)]
 struct ProjectsResponse {
     data: Vec<RawProject>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RawProject {
-    pub id: Uuid,
+struct RawProject {
+    pub id: String,
     pub name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SyncCheckResponse {
+    #[serde(rename = "hasChanges")]
+    has_changes: bool,
+}
+
 // ---------------------------------------------------------------------------
-// Cryptography
+// API functions (synchronous — Extism PDK HTTP)
 // ---------------------------------------------------------------------------
 
-/// Decrypt and return the 64-byte organisation encryption key embedded in the
-/// `encrypted_payload` field of the login response.
-///
-/// `encrypted_payload` is an EncString (type 2 = AES-256-CBC-HMAC-SHA256),
-/// encrypted with the token encryption key derived from the access token seed.
-/// Once decrypted, it is JSON of the form `{"encryptionKey":"<base64>"}` where
-/// the base64 value is the raw 64-byte org key.
-pub fn decrypt_org_key(
-    encrypted_payload: &str,
-    token_enc_key: &[u8; 64],
-) -> Result<Zeroizing<[u8; 64]>, SmApiError> {
-    let payload_bytes = decrypt_enc_string(encrypted_payload, token_enc_key)?;
+/// Step 3: Authenticate with the `client_credentials` grant.
+pub fn login(urls: &SmUrls, token: &AccessToken) -> Result<LoginResponse, SmError> {
+    let url = format!("{}/connect/token", urls.identity_url);
 
-    #[derive(Deserialize)]
-    struct Payload {
-        #[serde(rename = "encryptionKey")]
-        encryption_key: String,
+    let mut params: Vec<(&str, String)> = vec![
+        ("grant_type", "client_credentials".to_string()),
+        ("scope", "api.secrets".to_string()),
+        ("client_id", token.access_token_id.clone()),
+        ("client_secret", token.client_secret.as_str().to_string()),
+    ];
+
+    extism_pdk::debug!("SM login request");
+
+    let body = url_encode_form(&params);
+    for (_, v) in &mut params {
+        v.zeroize();
+    }
+    drop(params);
+
+    let req = extism_pdk::HttpRequest::new(&url)
+        .with_method("POST")
+        .with_header("Content-Type", "application/x-www-form-urlencoded")
+        .with_header("Device-Type", "21")
+        .with_header("Bitwarden-Client-Name", "rosec")
+        .with_header("Bitwarden-Client-Version", env!("CARGO_PKG_VERSION"));
+
+    let resp = extism_pdk::http::request::<Vec<u8>>(&req, Some(body))
+        .map_err(|e| SmError::Http(format!("SM login request: {e}")))?;
+
+    let status = resp.status_code();
+    if !(200..300).contains(&status) {
+        let text = String::from_utf8_lossy(&resp.body()).to_string();
+        return Err(SmError::Api(format!("SM login failed ({status}): {text}")));
     }
 
-    let mut payload: Payload = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| SmApiError::Crypto(format!("payload JSON parse: {e}")))?;
+    let login_resp: LoginResponse = serde_json::from_slice(&resp.body())
+        .map_err(|e| SmError::Api(format!("SM login response parse: {e}")))?;
 
-    let mut key_bytes = B64
-        .decode(&payload.encryption_key)
-        .map_err(|e| SmApiError::Crypto(format!("org key base64: {e}")))?;
+    extism_pdk::debug!("SM login ok");
+    Ok(login_resp)
+}
 
-    // Zeroize intermediates that held the raw key material.
-    payload.encryption_key.zeroize();
+/// Step 5: List all secret identifiers for the organisation.
+pub fn list_secrets(
+    urls: &SmUrls,
+    bearer: &str,
+    org_id: &str,
+) -> Result<Vec<SecretIdentifier>, SmError> {
+    let url = format!("{}/organizations/{org_id}/secrets", urls.api_url);
 
-    if key_bytes.len() != 64 {
-        key_bytes.zeroize();
-        return Err(SmApiError::Crypto(format!(
-            "org key must be 64 bytes, got {}",
-            key_bytes.len()
+    extism_pdk::debug!("SM list secrets org={org_id}");
+
+    let req = extism_pdk::HttpRequest::new(&url)
+        .with_method("GET")
+        .with_header("Authorization", format!("Bearer {bearer}"))
+        .with_header("Bitwarden-Client-Name", "rosec")
+        .with_header("Bitwarden-Client-Version", env!("CARGO_PKG_VERSION"));
+
+    let resp = extism_pdk::http::request::<Vec<u8>>(&req, None)
+        .map_err(|e| SmError::Http(format!("SM list secrets request: {e}")))?;
+
+    let status = resp.status_code();
+    if !(200..300).contains(&status) {
+        let text = String::from_utf8_lossy(&resp.body()).to_string();
+        return Err(SmError::Api(format!(
+            "SM list secrets failed ({status}): {text}"
         )));
     }
 
-    let mut key = Zeroizing::new([0u8; 64]);
-    key.copy_from_slice(&key_bytes);
-    key_bytes.zeroize();
-    Ok(key)
+    let list: SecretIdentifiersResponse = serde_json::from_slice(&resp.body())
+        .map_err(|e| SmError::Api(format!("SM list secrets response parse: {e}")))?;
+
+    extism_pdk::debug!(
+        "SM secret identifiers fetched count={}",
+        list.secrets.len()
+    );
+    Ok(list.secrets)
 }
 
-/// Decrypt an EncString field (type 2: `2.{iv_b64}|{data_b64}|{mac_b64}`) using
-/// the given 64-byte AES-256-CBC-HMAC-SHA256 key (`[enc_key_32 | mac_key_32]`).
-pub fn decrypt_enc_string(enc: &str, key64: &[u8; 64]) -> Result<Zeroizing<Vec<u8>>, SmApiError> {
-    // Strip the "2." type prefix.
-    let body = enc.strip_prefix("2.").ok_or_else(|| {
-        SmApiError::Crypto(format!("unsupported EncString type (expected '2.'): {enc}"))
-    })?;
-
-    let parts: Vec<&str> = body.split('|').collect();
-    if parts.len() != 3 {
-        return Err(SmApiError::Crypto(
-            "EncString type 2 must have 3 pipe-separated parts".to_string(),
-        ));
+/// Step 6: Fetch full secret blobs by IDs.
+pub fn get_secrets_by_ids(
+    urls: &SmUrls,
+    bearer: &str,
+    ids: &[String],
+) -> Result<Vec<RawSecret>, SmError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
     }
 
-    let iv = B64
-        .decode(parts[0])
-        .map_err(|e| SmApiError::Crypto(format!("EncString IV base64: {e}")))?;
-    let data = B64
-        .decode(parts[1])
-        .map_err(|e| SmApiError::Crypto(format!("EncString data base64: {e}")))?;
-    let mac = B64
-        .decode(parts[2])
-        .map_err(|e| SmApiError::Crypto(format!("EncString MAC base64: {e}")))?;
+    let url = format!("{}/secrets/get-by-ids", urls.api_url);
 
-    if iv.len() != 16 {
-        return Err(SmApiError::Crypto(
-            "EncString IV must be 16 bytes".to_string(),
-        ));
+    extism_pdk::debug!("SM get secrets by IDs count={}", ids.len());
+
+    let body_req = SecretsGetRequest { ids: ids.to_vec() };
+    let body_bytes = serde_json::to_vec(&body_req)
+        .map_err(|e| SmError::Api(format!("serialize secrets request: {e}")))?;
+
+    let req = extism_pdk::HttpRequest::new(&url)
+        .with_method("POST")
+        .with_header("Authorization", format!("Bearer {bearer}"))
+        .with_header("Content-Type", "application/json")
+        .with_header("Bitwarden-Client-Name", "rosec")
+        .with_header("Bitwarden-Client-Version", env!("CARGO_PKG_VERSION"));
+
+    let resp = extism_pdk::http::request::<Vec<u8>>(&req, Some(body_bytes))
+        .map_err(|e| SmError::Http(format!("SM get secrets request: {e}")))?;
+
+    let status = resp.status_code();
+    if !(200..300).contains(&status) {
+        let text = String::from_utf8_lossy(&resp.body()).to_string();
+        return Err(SmError::Api(format!(
+            "SM get secrets failed ({status}): {text}"
+        )));
     }
-    if mac.len() != 32 {
-        return Err(SmApiError::Crypto(
-            "EncString MAC must be 32 bytes".to_string(),
-        ));
-    }
 
-    let enc_key = &key64[..32];
-    let mac_key = &key64[32..];
+    let secrets: SecretsGetResponse = serde_json::from_slice(&resp.body())
+        .map_err(|e| SmError::Api(format!("SM get secrets response parse: {e}")))?;
 
-    // Verify HMAC-SHA256(mac_key, iv || data) == mac before decrypting.
-    let mut hmac = HmacSha256::new_from_slice(mac_key)
-        .map_err(|e| SmApiError::Crypto(format!("HMAC key: {e}")))?;
-    hmac.update(&iv);
-    hmac.update(&data);
-    hmac.verify_slice(&mac)
-        .map_err(|_| SmApiError::Crypto("EncString MAC verification failed".to_string()))?;
-
-    // AES-256-CBC decrypt with PKCS7 padding.
-    let mut buf = Zeroizing::new(data.clone());
-    let plaintext = Aes256CbcDec::new_from_slices(enc_key, &iv)
-        .map_err(|e| SmApiError::Crypto(format!("AES key/IV: {e}")))?
-        .decrypt_padded_mut::<Pkcs7>(&mut buf)
-        .map_err(|e| SmApiError::Crypto(format!("AES decrypt: {e}")))?;
-
-    Ok(Zeroizing::new(plaintext.to_vec()))
+    extism_pdk::debug!("SM secrets fetched count={}", secrets.data.len());
+    Ok(secrets.data)
 }
 
-/// Decrypt an optional EncString field, returning an empty string if absent.
-pub fn decrypt_field_opt(
-    enc: Option<&str>,
-    org_key: &[u8; 64],
-) -> Result<Zeroizing<String>, SmApiError> {
-    match enc {
-        None | Some("") => Ok(Zeroizing::new(String::new())),
-        Some(s) => {
-            let bytes = decrypt_enc_string(s, org_key)?;
-            // The `bytes` Zeroizing<Vec<u8>> is zeroized when dropped.
-            // `from_utf8` reuses the Vec's allocation as the String buffer,
-            // and the result is wrapped in Zeroizing<String> for drop-zeroization.
-            let text = String::from_utf8(bytes.to_vec())
-                .map_err(|e| SmApiError::Crypto(format!("UTF-8 decode: {e}")))?;
-            Ok(Zeroizing::new(text))
-        }
-    }
-}
-
-/// HKDF-Expand (RFC 5869) using HMAC-SHA256.
+/// Step 6b: Fetch project names for the organisation (non-fatal).
 ///
-/// `prk` is the pseudo-random key (output of HKDF-Extract or PBKDF).
-/// `info` is optional context / application-specific information.
-/// `length` is the desired output length in bytes (≤ 255 * 32).
-fn hkdf_expand_sha256(prk: &[u8], info: Option<&[u8]>, length: usize) -> Zeroizing<Vec<u8>> {
-    use hkdf::Hkdf;
-    // Both error cases represent programming errors (wrong PRK size or oversized
-    // output length), not runtime conditions.  Use unreachable! so violations are
-    // caught clearly in tests without masking them with a panic message that looks
-    // like a handled error.
-    let hk = Hkdf::<Sha256>::from_prk(prk)
-        .unwrap_or_else(|_| unreachable!("PRK must be a valid HKDF pseudo-random key"));
-    let mut okm = Zeroizing::new(vec![0u8; length]);
-    hk.expand(info.unwrap_or(b""), &mut okm)
-        .unwrap_or_else(|_| unreachable!("HKDF output length must be ≤ 255 * HashLen"));
-    okm
-}
+/// Returns a map of project UUID → project name.  Empty map if the org has no
+/// projects or if the request fails.
+pub fn list_projects(urls: &SmUrls, bearer: &str, org_id: &str) -> HashMap<String, String> {
+    let url = format!("{}/organizations/{org_id}/projects", urls.api_url);
 
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
+    extism_pdk::debug!("SM list projects org={org_id}");
 
-#[derive(Debug, thiserror::Error)]
-pub enum SmApiError {
-    #[error("invalid access token: {0}")]
-    InvalidToken(&'static str),
+    let req = extism_pdk::HttpRequest::new(&url)
+        .with_method("GET")
+        .with_header("Authorization", format!("Bearer {bearer}"))
+        .with_header("Bitwarden-Client-Name", "rosec")
+        .with_header("Bitwarden-Client-Version", env!("CARGO_PKG_VERSION"));
 
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    let resp = match extism_pdk::http::request::<Vec<u8>>(&req, None) {
+        Ok(r) => r,
+        Err(e) => {
+            extism_pdk::warn!("SM list projects request failed: {e}");
+            return HashMap::new();
+        }
+    };
 
-    #[error("API error: {0}")]
-    Api(String),
-
-    #[error("crypto error: {0}")]
-    Crypto(String),
-}
-
-impl From<SmApiError> for rosec_core::ProviderError {
-    fn from(e: SmApiError) -> Self {
-        rosec_core::ProviderError::Unavailable(e.to_string())
+    if !(200..300u16).contains(&resp.status_code()) {
+        extism_pdk::warn!("SM list projects returned status {}", resp.status_code());
+        return HashMap::new();
     }
+
+    let list: ProjectsResponse = match serde_json::from_slice(&resp.body()) {
+        Ok(l) => l,
+        Err(e) => {
+            extism_pdk::warn!("SM list projects response parse failed: {e}");
+            return HashMap::new();
+        }
+    };
+
+    extism_pdk::debug!("SM projects fetched count={}", list.data.len());
+    list.data.into_iter().map(|p| (p.id, p.name)).collect()
+}
+
+/// Delta-sync check: returns `true` if the org's secrets have changed since
+/// `last_synced` (an ISO-8601 UTC timestamp string).
+pub fn check_secrets_changed(
+    urls: &SmUrls,
+    bearer: &str,
+    org_id: &str,
+    last_synced: &str,
+) -> Result<bool, SmError> {
+    let url = format!(
+        "{}/organizations/{org_id}/secrets/sync?lastSyncedDate={last_synced}",
+        urls.api_url
+    );
+
+    extism_pdk::debug!("SM delta-sync check org={org_id}");
+
+    let req = extism_pdk::HttpRequest::new(&url)
+        .with_method("GET")
+        .with_header("Authorization", format!("Bearer {bearer}"))
+        .with_header("Bitwarden-Client-Name", "rosec")
+        .with_header("Bitwarden-Client-Version", env!("CARGO_PKG_VERSION"));
+
+    let resp = extism_pdk::http::request::<Vec<u8>>(&req, None)
+        .map_err(|e| SmError::Http(format!("SM sync check request: {e}")))?;
+
+    let status = resp.status_code();
+    if !(200..300).contains(&status) {
+        let text = String::from_utf8_lossy(&resp.body()).to_string();
+        return Err(SmError::Api(format!(
+            "SM sync check failed ({status}): {text}"
+        )));
+    }
+
+    let sync: SyncCheckResponse = serde_json::from_slice(&resp.body())
+        .map_err(|e| SmError::Api(format!("SM sync check response parse: {e}")))?;
+
+    extism_pdk::debug!("SM delta-sync check has_changes={}", sync.has_changes);
+    Ok(sync.has_changes)
 }
 
 // ---------------------------------------------------------------------------
-// High-level convenience: authenticate + fetch all secrets
+// Decrypted secret
 // ---------------------------------------------------------------------------
 
 /// A fully decrypted SM secret.
 pub struct DecryptedSecret {
-    pub id: Uuid,
+    pub id: String,
     pub key: String,
     pub value: Zeroizing<String>,
     pub note: Zeroizing<String>,
-    pub project_id: Option<Uuid>,
-    /// Resolved project name, populated from the projects list fetched at sync
-    /// time.  `None` if the secret has no project or the project fetch failed.
+    pub project_id: Option<String>,
     pub project_name: Option<String>,
 }
 
@@ -640,46 +460,46 @@ impl std::fmt::Debug for DecryptedSecret {
     }
 }
 
+// ---------------------------------------------------------------------------
+// High-level orchestrator: authenticate + fetch all secrets
+// ---------------------------------------------------------------------------
+
 /// Authenticate and fetch all secrets for the given organisation in one call.
 ///
 /// Returns `(bearer_token, secrets)`.  The bearer token is a short-lived JWT
-/// that callers may cache for subsequent lightweight API calls (e.g. the
-/// delta-sync check) without re-authenticating immediately.
-///
-/// This is the replacement for the SDK's `Client::new` + `login_access_token` +
-/// `secrets().list()` + `secrets().get_by_ids()` sequence.
-pub async fn fetch_secrets(
-    client: &SmApiClient,
+/// that callers may cache for subsequent lightweight API calls.
+pub fn fetch_secrets(
+    urls: &SmUrls,
     token: &AccessToken,
-    org_id: Uuid,
-) -> Result<(Zeroizing<String>, Vec<DecryptedSecret>), SmApiError> {
-    // Step 3: authenticate — immediately wrap the bearer token in Zeroizing.
-    let login = client.login(token).await?;
-    debug!("SM access token authenticated");
-    let (bearer, encrypted_payload) = login.into_zeroizing_token();
+    org_id: &str,
+) -> Result<(Zeroizing<String>, Vec<DecryptedSecret>), SmError> {
+    // Step 3: authenticate
+    let login_resp = login(urls, token)?;
+    extism_pdk::debug!("SM access token authenticated");
+    let bearer = Zeroizing::new(login_resp.access_token);
+    let encrypted_payload = login_resp.encrypted_payload;
 
-    // Step 4: derive org encryption key from the encrypted_payload in the login response
-    let token_enc_key = token.derive_token_enc_key()?;
+    // Step 4: derive org encryption key
+    let token_enc_key = token.derive_enc_key()?;
     let org_key = decrypt_org_key(&encrypted_payload, &token_enc_key)?;
 
     // Step 5: list secret identifiers
-    let identifiers = client.list_secrets(&bearer, org_id).await?;
-    debug!(count = identifiers.len(), "SM secret identifiers fetched");
+    let identifiers = list_secrets(urls, &bearer, org_id)?;
+    extism_pdk::debug!(
+        "SM secret identifiers fetched count={}",
+        identifiers.len()
+    );
 
     if identifiers.is_empty() {
         return Ok((bearer, Vec::new()));
     }
 
     // Step 6: fetch encrypted blobs
-    let ids: Vec<Uuid> = identifiers.iter().map(|s| s.id).collect();
-    let raw_secrets = client.get_secrets_by_ids(&bearer, &ids).await?;
+    let ids: Vec<String> = identifiers.into_iter().map(|s| s.id).collect();
+    let raw_secrets = get_secrets_by_ids(urls, &bearer, &ids)?;
 
-    // Step 6b: fetch project names (non-fatal — empty map if endpoint fails or
-    // org has no projects).
-    let project_names: HashMap<Uuid, String> = client
-        .list_projects(&bearer, org_id)
-        .await
-        .unwrap_or_default();
+    // Step 6b: fetch project names (non-fatal)
+    let project_names = list_projects(urls, &bearer, org_id);
 
     // Step 7: decrypt
     let mut secrets = Vec::with_capacity(raw_secrets.len());
@@ -691,8 +511,11 @@ pub async fn fetch_secrets(
             .projects
             .as_deref()
             .and_then(|p| p.first())
-            .map(|p| p.id);
-        let project_name = project_id.and_then(|id| project_names.get(&id).cloned());
+            .map(|p| p.id.clone());
+        let project_name = project_id
+            .as_deref()
+            .and_then(|id| project_names.get(id))
+            .cloned();
 
         secrets.push(DecryptedSecret {
             id: raw.id,
@@ -704,7 +527,10 @@ pub async fn fetch_secrets(
         });
     }
 
-    debug!(count = secrets.len(), "SM secrets loaded and decrypted");
+    extism_pdk::debug!(
+        "SM secrets loaded and decrypted count={}",
+        secrets.len()
+    );
     Ok((bearer, secrets))
 }
 
@@ -716,94 +542,35 @@ pub async fn fetch_secrets(
 mod tests {
     use super::*;
 
-    // Test vector from the Bitwarden SDK access_token.rs test:
-    // "0.ec2c1d46-6a4b-4751-a310-af9601317f2d.C2IgxjjLF7qSshsbwe8JGcbM075YXw:X8vbvA0bduihIDe/qrzIQQ=="
-    // Expected derived key (base64):
-    // "H9/oIRLtL9nGCQOVDjSMoEbJsjWXSOCb3qeyDt6ckzS3FhyboEDWyTP/CQfbIszNmAVg2ExFganG1FVFGXO/Jg=="
-    const TEST_TOKEN: &str = "0.ec2c1d46-6a4b-4751-a310-af9601317f2d.C2IgxjjLF7qSshsbwe8JGcbM075YXw:X8vbvA0bduihIDe/qrzIQQ==";
-    const EXPECTED_KEY_B64: &str =
-        "H9/oIRLtL9nGCQOVDjSMoEbJsjWXSOCb3qeyDt6ckzS3FhyboEDWyTP/CQfbIszNmAVg2ExFganG1FVFGXO/Jg==";
-
     #[test]
-    fn parse_access_token() {
-        let t = AccessToken::parse(TEST_TOKEN).unwrap();
-        assert_eq!(
-            t.access_token_id.to_string(),
-            "ec2c1d46-6a4b-4751-a310-af9601317f2d"
-        );
+    fn parse_access_token_ok() {
+        let raw = "0.ec2c1d46-6a4b-4751-a310-af9601317f2d.C2IgxjjLF7qSshsbwe8JGcbM075YXw:X8vbvA0bduihIDe/qrzIQQ==";
+        let t = AccessToken::parse(raw).unwrap();
+        assert_eq!(t.access_token_id, "ec2c1d46-6a4b-4751-a310-af9601317f2d");
         assert_eq!(t.client_secret.as_str(), "C2IgxjjLF7qSshsbwe8JGcbM075YXw");
     }
 
     #[test]
-    fn derive_token_enc_key_matches_sdk() {
-        let t = AccessToken::parse(TEST_TOKEN).unwrap();
-        let key = t.derive_token_enc_key().unwrap();
-        assert_eq!(B64.encode(*key), EXPECTED_KEY_B64);
-    }
-
-    #[test]
-    fn parse_token_missing_colon() {
+    fn parse_access_token_missing_colon() {
         assert!(AccessToken::parse("0.uuid.secret-no-colon").is_err());
     }
 
     #[test]
-    fn parse_token_wrong_version() {
+    fn parse_access_token_wrong_version() {
+        assert!(AccessToken::parse(
+            "1.ec2c1d46-6a4b-4751-a310-af9601317f2d.secret:X8vbvA0bduihIDe/qrzIQQ=="
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_access_token_bad_key() {
         assert!(
             AccessToken::parse(
-                "1.ec2c1d46-6a4b-4751-a310-af9601317f2d.secret:X8vbvA0bduihIDe/qrzIQQ=="
+                "0.ec2c1d46-6a4b-4751-a310-af9601317f2d.secret:not-valid-b64!"
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn parse_token_bad_uuid() {
-        assert!(AccessToken::parse("0.not-a-uuid.secret:X8vbvA0bduihIDe/qrzIQQ==").is_err());
-    }
-
-    #[test]
-    fn decrypt_enc_string_type2() {
-        // Self-generated test vector using the same key layout:
-        //   key = "hvBMMb1t79YssFZkpetYsM3deyVuQv4r88Uj9gvYe0+G8EwxvW3v1iywVmSl61iwzd17JW5C/ivzxSP2C9h7Tw=="
-        //   enc_key = key[0..32], mac_key = key[32..64]
-        //   iv  = 0x01 * 16 (fixed)
-        //   plaintext = "EncryptMe!"
-        // Generated by encrypting with AES-256-CBC and computing HMAC-SHA256(mac_key, iv||ciphertext).
-        let key_bytes = B64.decode("hvBMMb1t79YssFZkpetYsM3deyVuQv4r88Uj9gvYe0+G8EwxvW3v1iywVmSl61iwzd17JW5C/ivzxSP2C9h7Tw==").unwrap();
-        let mut key64 = [0u8; 64];
-        key64.copy_from_slice(&key_bytes);
-
-        let enc = "2.AQEBAQEBAQEBAQEBAQEBAQ==|kcArgC3nLK58WUYK6yyQ+w==|9HRDjijjSa2tyToYilyG3mvJvHKhw3ZqFE7tFVaQh8Q=";
-        let plaintext = decrypt_enc_string(enc, &key64).unwrap();
-        assert_eq!(std::str::from_utf8(&plaintext).unwrap(), "EncryptMe!");
-    }
-
-    #[test]
-    fn decrypt_enc_string_wrong_type() {
-        let key = [0u8; 64];
-        let result = decrypt_enc_string("0.iv|data", &key);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn decrypt_enc_string_bad_mac() {
-        // Use valid structure but corrupt the MAC
-        let key_bytes = B64.decode("hvBMMb1t79YssFZkpetYsM3deyVuQv4r88Uj9gvYe0+G8EwxvW3v1iywVmSl61iwzd17JW5C/ivzxSP2C9h7Tw==").unwrap();
-        let mut key64 = [0u8; 64];
-        key64.copy_from_slice(&key_bytes);
-
-        // Valid IV and data, but MAC is all zeros (wrong)
-        let bad_mac = B64.encode([0u8; 32]);
-        let enc = format!("2.pMS6/icTQABtulw52pq2lg==|XXbxKxDTh+mWiN1HjH2N1w==|{bad_mac}");
-        let result = decrypt_enc_string(&enc, &key64);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn sm_urls_official() {
-        let urls = SmUrls::official_us();
-        assert!(urls.api_url.contains("bitwarden.com"));
-        assert!(urls.identity_url.contains("bitwarden.com"));
     }
 
     #[test]
@@ -811,5 +578,11 @@ mod tests {
         let urls = SmUrls::from_base("https://vault.example.com");
         assert_eq!(urls.api_url, "https://vault.example.com/api");
         assert_eq!(urls.identity_url, "https://vault.example.com/identity");
+    }
+
+    #[test]
+    fn sm_urls_official_us() {
+        let urls = SmUrls::official_us();
+        assert!(urls.api_url.contains("bitwarden.com"));
     }
 }

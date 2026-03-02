@@ -1,33 +1,30 @@
 [package]
 name = "rosec-bitwarden-sm"
-version.workspace = true
-edition = { workspace = true }
-rust-version = { workspace = true }
-license = { workspace = true }
-repository = { workspace = true }
-description = "Bitwarden Secrets Manager backend for rosec"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "LicenseRef-Bitwarden-SDK"
+description = "Bitwarden Secrets Manager provider as an Extism WASM guest plugin for rosec"
+
+[lib]
+crate-type = ["cdylib"]
 
 [dependencies]
-rosec-core = { path = "../rosec-core" }
-anyhow     = { workspace = true }
-chrono     = { workspace = true }
-thiserror  = { workspace = true }
-serde      = { workspace = true }
-serde_json = { workspace = true }
-tracing    = { workspace = true }
-async-trait = { workspace = true }
-zeroize    = { workspace = true }
-tokio      = { workspace = true }
-hkdf       = { workspace = true }
-sha2       = { workspace = true }
-aes        = { workspace = true }
-cbc        = { workspace = true }
-hmac       = { workspace = true }
-base64     = { workspace = true }
+# Extism guest SDK
+extism-pdk = "1.4.1"
 
-# HTTP client (same config as rosec-bitwarden-pm)
-reqwest = { workspace = true }
-uuid    = { workspace = true, features = ["serde"] }
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+# Crypto (subset of PM — no RSA, no Argon2, no PBKDF2, no SHA-1)
+aes = "0.8"
+cbc = "0.1"
+hmac = "0.12"
+sha2 = "0.10"
+hkdf = "0.12"
+base64 = "0.22"
+block-padding = "0.3"
+
+# Zeroize for secret scrubbing
+zeroize = { version = "1", features = ["derive"] }

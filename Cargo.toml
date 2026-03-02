@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "rosec-core",
     "rosec-secret-service",
-    "rosec-bitwarden-sm",
     "rosec-ssh-agent",
     "rosec-fuse",
     "rosec-vault",
@@ -15,6 +14,7 @@ members = [
 ]
 exclude = [
     "rosec-bitwarden-pm",
+    "rosec-bitwarden-sm",
 ]
 
 [workspace.package]

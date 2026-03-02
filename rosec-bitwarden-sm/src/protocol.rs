@@ -4,10 +4,11 @@
 //! WASM guest plugins.  Both sides serialize/deserialize to JSON via
 //! Extism byte buffers.
 //!
-//! The guest crate duplicates these definitions (it cannot share a crate
-//! because it targets `wasm32-wasip1`).  Keep both copies in sync.
+//! This is a duplicate of `rosec-wasm/src/protocol.rs` (the host side),
+//! with the addition of SM-specific `CheckRemoteChanged` types.
+//! Keep both copies in sync.
 
-use std::{collections::HashMap, fmt};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -41,29 +42,23 @@ pub struct StatusResponse {
 // ── Unlock / Lock ────────────────────────────────────────────────
 
 /// Sent to `unlock`.
-///
-/// `Debug` is manually implemented to redact `password` and
-/// `registration_fields` (which may contain secrets).
 #[derive(Serialize, Deserialize)]
 pub struct UnlockRequest {
-    /// The user's master password.
+    /// The user's unlock password (used by the host for credential persistence).
     pub password: String,
     /// Additional registration fields (for first-time setup).
+    /// For SM: `registration_fields["access_token"]` contains the raw access token.
     #[serde(default)]
     pub registration_fields: Option<HashMap<String, String>>,
 }
 
-impl fmt::Debug for UnlockRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Debug for UnlockRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnlockRequest")
-            .field("password", &"[REDACTED]")
+            .field("password", &"[redacted]")
             .field(
                 "registration_fields",
-                &self.registration_fields.as_ref().map(|m| {
-                    m.keys()
-                        .map(|k| (k.as_str(), "[REDACTED]"))
-                        .collect::<Vec<_>>()
-                }),
+                &self.registration_fields.as_ref().map(|m| m.len()),
             )
             .finish()
     }
@@ -144,7 +139,6 @@ pub struct SecretAttrRequest {
 /// Returned by `get_secret_attr`.
 ///
 /// Secret bytes are base64-encoded for JSON transport.
-/// `Debug` is manually implemented to redact `value_b64`.
 #[derive(Serialize, Deserialize)]
 pub struct SecretAttrResponse {
     pub ok: bool,
@@ -157,72 +151,13 @@ pub struct SecretAttrResponse {
     pub value_b64: Option<String>,
 }
 
-impl fmt::Debug for SecretAttrResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Debug for SecretAttrResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretAttrResponse")
             .field("ok", &self.ok)
             .field("error", &self.error)
             .field("error_kind", &self.error_kind)
-            .field("value_b64", &self.value_b64.as_ref().map(|_| "[REDACTED]"))
-            .finish()
-    }
-}
-
-// ── SSH ──────────────────────────────────────────────────────────
-
-/// Returned by `list_ssh_keys`.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SshKeyListResponse {
-    pub ok: bool,
-    #[serde(default)]
-    pub error: Option<String>,
-    #[serde(default)]
-    pub error_kind: Option<ErrorKind>,
-    #[serde(default)]
-    pub keys: Vec<WasmSshKeyMeta>,
-}
-
-/// A single SSH key's metadata — the WASM equivalent of `SshKeyMeta`.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WasmSshKeyMeta {
-    pub item_id: String,
-    pub item_name: String,
-    pub public_key_openssh: Option<String>,
-    pub fingerprint: Option<String>,
-    pub ssh_hosts: Vec<String>,
-    pub ssh_user: Option<String>,
-    pub require_confirm: bool,
-    pub revision_date_epoch_secs: Option<u64>,
-}
-
-/// Sent to `get_ssh_private_key`.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SshPrivateKeyRequest {
-    pub item_id: String,
-}
-
-/// Returned by `get_ssh_private_key`.
-///
-/// `Debug` is manually implemented to redact `pem`.
-#[derive(Serialize, Deserialize)]
-pub struct SshPrivateKeyResponse {
-    pub ok: bool,
-    #[serde(default)]
-    pub error: Option<String>,
-    #[serde(default)]
-    pub error_kind: Option<ErrorKind>,
-    /// PEM-encoded private key.
-    #[serde(default)]
-    pub pem: Option<String>,
-}
-
-impl fmt::Debug for SshPrivateKeyResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SshPrivateKeyResponse")
-            .field("ok", &self.ok)
-            .field("error", &self.error)
-            .field("error_kind", &self.error_kind)
-            .field("pem", &self.pem.as_ref().map(|_| "[REDACTED]"))
+            .field("value_b64", &self.value_b64.as_ref().map(|_| "[redacted]"))
             .finish()
     }
 }
@@ -285,20 +220,15 @@ pub struct CapabilitiesResponse {
 
 /// Returned by `plugin_manifest` — called before `init` to discover
 /// the plugin's kind, name, config requirements, and allowed hosts.
-///
-/// This enables automatic plugin discovery: the host scans `.wasm`
-/// files in known directories, calls `plugin_manifest()` on each,
-/// and registers the discovered kinds dynamically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
-    /// The provider kind string (e.g. `"bitwarden-pm"`).
+    /// The provider kind string (e.g. `"bitwarden-sm"`).
     pub kind: String,
-    /// Human-readable plugin name (e.g. `"Bitwarden Password Manager"`).
+    /// Human-readable plugin name.
     pub name: String,
     /// Short description shown in `rosec provider kinds`.
     pub description: String,
     /// HTTP hosts the plugin needs access to (defaults).
-    /// Users can override via config.
     #[serde(default)]
     pub default_allowed_hosts: Vec<String>,
     /// Config options the plugin requires.
@@ -308,7 +238,6 @@ pub struct PluginManifest {
     #[serde(default)]
     pub optional_options: Vec<PluginOptionDescriptor>,
     /// Which required option key to hash for auto-generating provider IDs.
-    /// e.g. `"email"` for bitwarden-pm.  If `None`, falls back to the kind.
     #[serde(default)]
     pub id_derivation_key: Option<String>,
 }
@@ -316,11 +245,8 @@ pub struct PluginManifest {
 /// Describes a single config option a plugin accepts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginOptionDescriptor {
-    /// Option key (e.g. `"email"`, `"region"`).
     pub key: String,
-    /// Human-readable description for prompts.
     pub description: String,
-    /// Input kind: `"text"`, `"password"`, or `"secret"`.
     #[serde(default = "default_option_kind")]
     pub kind: String,
 }
@@ -331,14 +257,14 @@ fn default_option_kind() -> String {
 
 // ── SM-specific: delta-sync check ────────────────────────────────
 
-/// Sent to `check_remote_changed` (SM guest only).
+/// Sent to `check_remote_changed`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CheckRemoteChangedRequest {
     /// ISO-8601 UTC timestamp of the last successful sync (e.g. `"2024-01-15T12:00:00.000Z"`).
     pub last_synced_iso8601: String,
 }
 
-/// Returned by `check_remote_changed` (SM guest only).
+/// Returned by `check_remote_changed`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CheckRemoteChangedResponse {
     pub ok: bool,

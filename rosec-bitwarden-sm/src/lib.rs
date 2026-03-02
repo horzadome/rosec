@@ -1,1183 +1,783 @@
-//! Bitwarden Secrets Manager provider for rosec.
+//! Bitwarden Secrets Manager WASM guest plugin for rosec.
 //!
-//! Native implementation — no Bitwarden SDK dependency.  All HTTP requests
-//! and cryptographic operations are performed directly using the same
-//! `reqwest` + `aes`/`cbc`/`hmac` stack used by `rosec-bitwarden-pm`.
+//! This is the Extism guest that implements the Bitwarden Secrets Manager
+//! provider.  It exports plugin functions that the `rosec-wasm` host crate
+//! calls via `Plugin::call()`.
 //!
-//! # Authentication
+//! # Architecture
 //!
-//! SM uses *machine account access tokens* — not Bitwarden master passwords.
-//! The token format is:
-//! ```text
-//! 0.{service-account-uuid}.{client_secret}:{base64_16_byte_enc_key_seed}
-//! ```
-//!
-//! ## Storage key derivation
-//!
-//! The access token is stored encrypted at rest.  The storage key is derived
-//! from **both** a machine-local secret and the user's unlock password:
-//!
-//! ```text
-//! HKDF-SHA256(ikm: machine_secret || password, salt: provider_id) → 64-byte storage key
-//! ```
-//!
-//! This means:
-//! - A password is **always required** to unlock — there is no auto-unlock path.
-//! - The same password participates in the opportunistic unlock sweep alongside
-//!   Bitwarden PM providers, so users with a shared password only type it once.
-//! - Wrong password → wrong storage key → `ProviderError::AuthFailed` (re-prompt
-//!   for the correct password, not re-registration).
-//! - Changing the password or rotating the token requires re-running
-//!   `rosec provider auth`.
-//!
-//! ## First-time setup
-//!
-//! `unlock()` returns `ProviderError::RegistrationRequired` if no encrypted token
-//! is found on disk.  The auth flow then prompts for `registration_info()` fields
-//! (the access token itself) and retries with `UnlockInput::WithRegistration`.
-//! The provider derives the storage key from the password, encrypts the token, and
-//! persists it.  Subsequent unlocks only need the password.
-//!
-//! # Configuration
-//!
-//! ```toml
-//! [[provider]]
-//! id   = "my-sm"
-//! kind = "bitwarden-sm"
-//!
-//! [provider.options]
-//! organization_id = "00000000-…"   # required — filters which secrets to expose
-//! server_url      = "https://…"    # optional — omit for official cloud
-//! ```
-//!
-//! The access token is **not** stored in `config.toml`.  It is collected
-//! interactively on first `rosec provider auth` and persisted encrypted at
-//! `$XDG_DATA_HOME/rosec/oauth/<id>.toml`.
+//! - **Global state**: A `Mutex<Option<GuestState>>` holds the plugin state.
+//!   `init` populates `GuestConfig`; `unlock` populates `AuthState`.
+//! - **No async**: All functions are synchronous — HTTP goes through
+//!   `extism_pdk::http::request`.
+//! - **Credential persistence**: The host handles access token persistence
+//!   via `rosec-wasm/src/wasm_cred.rs`.  The guest receives the raw access
+//!   token in `UnlockRequest.registration_fields["access_token"]`.
+//! - **SM-specific**: Exports `check_remote_changed` (not in PM guest) for
+//!   delta-sync without a full secrets re-fetch.
 
 mod api;
+mod crypto;
+mod error;
+mod protocol;
 
-use std::time::SystemTime;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
-use chrono::{DateTime, Utc};
-use hkdf::Hkdf;
-use rosec_core::credential::StorageKey;
-use rosec_core::{
-    Attributes, AuthField, AuthFieldKind, Capability, ItemAttributes, ItemMeta, Provider,
-    ProviderCallbacks, ProviderError, ProviderStatus, RegistrationInfo, SecretBytes, UnlockInput,
-};
-use sha2::Sha256;
-use std::sync::RwLock;
-
-use tokio::sync::Mutex;
-use tracing::{debug, info};
-use uuid::Uuid;
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use extism_pdk::*;
 use zeroize::Zeroizing;
 
-use api::{AccessToken, DecryptedSecret, SmApiClient, SmUrls, fetch_secrets};
+use crate::api::{AccessToken, DecryptedSecret, SmUrls, fetch_secrets};
+use crate::error::SmError;
+use crate::protocol::*;
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════
+// Global state
+// ═══════════════════════════════════════════════════════════════════
 
-/// Cloud region for official Bitwarden cloud hosting.
-#[derive(Debug, Clone, Default)]
-pub enum SmRegion {
-    #[default]
-    Us,
-    Eu,
+static STATE: Mutex<Option<GuestState>> = Mutex::new(None);
+
+struct GuestState {
+    config: GuestConfig,
+    auth: Option<AuthState>,
 }
 
-/// Configuration for the Bitwarden SM provider.
-#[derive(Debug, Clone)]
-pub struct SmConfig {
-    /// Provider instance ID (used as `Provider::id()`).
-    pub id: String,
-    /// Optional human-readable name.
-    pub name: Option<String>,
-    /// Cloud region (`us` or `eu`) for official Bitwarden cloud.
-    /// Ignored when `server_url` is set.
-    pub region: SmRegion,
-    /// Optional base URL for a self-hosted instance.
-    /// When set, takes precedence over `region`.
-    pub server_url: Option<String>,
-    /// SM organisation UUID — restricts which secrets are fetched.
-    pub organization_id: String,
+struct GuestConfig {
+    provider_id: String,
+    org_id: String,
+    urls: SmUrls,
 }
 
-// ---------------------------------------------------------------------------
-// Internal auth state
-// ---------------------------------------------------------------------------
-
-/// State present after a successful login + secrets fetch.
+/// Authenticated state — populated by `unlock`, cleared by `lock`.
 struct AuthState {
-    /// Cached vault items.
+    /// Raw access token (kept for re-sync).
+    access_token: Zeroizing<String>,
+    /// Decrypted secrets.
     secrets: Vec<DecryptedSecret>,
-    /// Timestamp of last successful sync (legacy; kept for `ProviderStatus`).
-    last_sync: Option<SystemTime>,
-    /// UTC timestamp of the last successful sync (used for delta-sync checks).
-    last_synced_at: DateTime<Utc>,
-    /// Short-lived Bearer token from the most recent login.
-    /// Used by `check_remote_changed` to avoid a redundant login round-trip
-    /// when the token is still fresh.  May be stale — callers must handle
-    /// auth errors by falling back to a full re-login.
+    /// Short-lived Bearer JWT cached for delta-sync checks.
     bearer: Zeroizing<String>,
+    /// Unix epoch seconds of the last successful sync.
+    last_sync_epoch_secs: u64,
+    /// ISO-8601 UTC timestamp of the last successful sync (for delta-sync).
+    last_synced_iso8601: String,
 }
 
-// ---------------------------------------------------------------------------
-// Provider
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════════
 
-/// Bitwarden Secrets Manager provider.
-///
-/// Starts locked.  Call `unlock(UnlockInput::Password(...))` to authenticate;
-/// the token is scrubbed from memory on drop.
-pub struct SmProvider {
-    config: SmConfig,
-    /// Access token stored Zeroizing so it is scrubbed on drop.
-    access_token: Mutex<Option<Zeroizing<String>>>,
-    /// Authenticated state; `None` when locked.
-    state: Mutex<Option<AuthState>>,
-    /// Lifecycle event callbacks (SSH manager, etc.).
-    callbacks: RwLock<ProviderCallbacks>,
-}
+/// Attribute key for item type — mirrors `rosec_core::ATTR_TYPE`.
+const ATTR_TYPE: &str = "rosec:type";
 
-impl std::fmt::Debug for SmProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SmProvider")
-            .field("id", &self.config.id)
-            .field("organization_id", &self.config.organization_id)
-            .finish()
-    }
-}
-
-impl SmProvider {
-    /// Create a new (locked) SM provider.
-    pub fn new(config: SmConfig) -> Self {
-        Self {
-            config,
-            access_token: Mutex::new(None),
-            state: Mutex::new(None),
-            callbacks: RwLock::new(ProviderCallbacks::default()),
-        }
-    }
-
-    /// Build the API client URL set from config.
-    ///
-    /// Priority: explicit `server_url` > `region` (eu/us) > default US cloud.
-    fn urls(&self) -> SmUrls {
-        if let Some(base) = &self.config.server_url {
-            return SmUrls::from_base(base);
-        }
-        match self.config.region {
-            SmRegion::Eu => SmUrls::official_eu(),
-            SmRegion::Us => SmUrls::official_us(),
-        }
-    }
-
-    /// Derive the 64-byte storage key for this SM provider.
-    ///
-    /// Uses HKDF-SHA256 with the provider ID as salt and `machine_secret ||
-    /// password` as IKM.  Both factors are required: the machine secret ties
-    /// the ciphertext to this installation; the password provides the
-    /// interactive access-control gate.  Neither alone is sufficient.
-    fn derive_storage_key(&self, password: &str) -> Result<StorageKey, ProviderError> {
-        let seed = rosec_core::machine_key::load_or_create()
-            .map_err(|e| ProviderError::Unavailable(format!("machine key: {e}")))?;
-        // Concatenate machine secret and password as IKM so both are required.
-        let mut ikm = Zeroizing::new(Vec::with_capacity(seed.len() + password.len()));
-        ikm.extend_from_slice(&seed);
-        ikm.extend_from_slice(password.as_bytes());
-        let (_, hkdf) = Hkdf::<Sha256>::extract(Some(self.config.id.as_bytes()), &ikm);
-        let info = format!("rosec-sm-token-v2:{}", self.config.id);
-        let mut key_material = Zeroizing::new(vec![0u8; 64]);
-        hkdf.expand(info.as_bytes(), &mut key_material)
-            .map_err(|e| ProviderError::Unavailable(format!("SM key derivation failed: {e}")))?;
-        StorageKey::from_bytes(&key_material)
-            .map_err(|e| ProviderError::Unavailable(format!("SM storage key: {e}")))
-    }
-
-    /// Perform the API login + secrets fetch.
-    async fn do_unlock(&self, raw_token: &str) -> Result<AuthState, ProviderError> {
-        let org_id = Uuid::parse_str(&self.config.organization_id).map_err(|e| {
-            ProviderError::Unavailable(format!(
-                "invalid organization_id '{}': {e}",
-                self.config.organization_id
-            ))
-        })?;
-
-        let token = AccessToken::parse(raw_token)
-            .map_err(|e| ProviderError::Unavailable(format!("SM access token parse: {e}")))?;
-
-        let client = SmApiClient::new(self.urls())
-            .map_err(|e| ProviderError::Unavailable(format!("SM HTTP client: {e}")))?;
-
-        let (bearer, secrets) = fetch_secrets(&client, &token, org_id)
-            .await
-            .map_err(|e| ProviderError::Unavailable(format!("SM login/fetch: {e}")))?;
-
-        debug!(provider = %self.config.id, count = secrets.len(), "SM unlock complete");
-
-        let now = Utc::now();
-        Ok(AuthState {
-            secrets,
-            last_sync: Some(SystemTime::now()),
-            last_synced_at: now,
-            bearer,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl Provider for SmProvider {
-    fn id(&self) -> &str {
-        &self.config.id
-    }
-
-    fn name(&self) -> &str {
-        self.config
-            .name
-            .as_deref()
-            .unwrap_or("Bitwarden Secrets Manager")
-    }
-
-    fn kind(&self) -> &str {
-        "bitwarden-sm"
-    }
-
-    fn capabilities(&self) -> &'static [Capability] {
-        &[Capability::Sync, Capability::PasswordChange]
-    }
-
-    fn set_event_callbacks(&self, callbacks: ProviderCallbacks) -> Result<(), ProviderError> {
-        *self
-            .callbacks
-            .write()
-            .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))? =
-            callbacks;
-        Ok(())
-    }
-
-    async fn status(&self) -> Result<ProviderStatus, ProviderError> {
-        let state = self.state.lock().await;
-        Ok(ProviderStatus {
-            locked: state.is_none(),
-            last_sync: state.as_ref().and_then(|s| s.last_sync),
-        })
-    }
-
-    /// The unlock password for SM is not the access token — it is a
-    /// user-chosen passphrase used to derive the storage key that protects
-    /// the encrypted access token on disk.  The same password participates in
-    /// the opportunistic unlock sweep alongside PM providers.
-    fn password_field(&self) -> AuthField {
-        AuthField {
-            id: "password",
-            label: "Unlock Password",
-            placeholder: "Password used to protect the stored access token",
-            required: true,
-            kind: AuthFieldKind::Password,
-        }
-    }
-
-    /// First-time setup requires the Bitwarden SM access token in addition to
-    /// the unlock password.  The token is encrypted with the derived storage
-    /// key and persisted to disk; subsequent unlocks only need the password.
-    fn registration_info(&self) -> Option<RegistrationInfo> {
-        static FIELDS: &[AuthField] = &[AuthField {
-            id: "access_token",
-            label: "Access Token",
-            placeholder: "0.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.xxxxxxxx…",
-            required: true,
-            kind: AuthFieldKind::Secret,
-        }];
-        Some(RegistrationInfo {
-            instructions: "\
-This provider needs a Bitwarden Secrets Manager access token to complete setup.\n\n\
-Generate a machine account access token in the Bitwarden Secrets Manager web app \
-and paste it below.  The token will be encrypted with your unlock password and \
-stored locally — you will not need to enter it again.",
-            fields: FIELDS,
-        })
-    }
-
-    /// Authenticate the SM provider.
-    ///
-    /// Two cases:
-    ///
-    /// - **`Password(pw)`** — normal unlock after initial setup.  Derives the
-    ///   storage key from `pw` and the machine secret, loads the encrypted
-    ///   access token from disk, decrypts it, and authenticates with Bitwarden.
-    ///   Wrong password → wrong key → `ProviderError::AuthFailed` (re-prompt).
-    ///   No stored token → `ProviderError::RegistrationRequired` (first-time
-    ///   setup required).
-    ///
-    /// - **`WithRegistration { password, registration_fields }`** — first-time
-    ///   setup or token rotation.  Derives the storage key from `password`,
-    ///   encrypts the `access_token` from `registration_fields`, persists it,
-    ///   then authenticates.
-    async fn unlock(&self, input: UnlockInput) -> Result<(), ProviderError> {
-        let (password, token_to_save) = match input {
-            UnlockInput::Password(pw) => (pw, None),
-            UnlockInput::WithRegistration {
-                password,
-                ref registration_fields,
-            } => {
-                let token = registration_fields
-                    .get("access_token")
-                    .ok_or_else(|| {
-                        ProviderError::Unavailable(
-                            "registration_fields missing 'access_token'".to_string(),
-                        )
-                    })?
-                    .clone();
-                (password, Some(token))
-            }
-        };
-
-        let storage_key = self.derive_storage_key(password.as_str())?;
-
-        let token = if let Some(new_token) = token_to_save {
-            // First-time setup or token rotation: encrypt and persist the new token.
-            rosec_core::credential::encrypt_and_save(
-                &self.config.id,
-                &storage_key,
-                "access_token",
-                new_token.as_str(),
-            )
-            .map_err(|e| ProviderError::Unavailable(format!("failed to save SM token: {e}")))?;
-            info!(provider = %self.config.id, "SM access token saved (encrypted)");
-            new_token
-        } else {
-            // Normal unlock: derive key from password and decrypt stored token.
-            match rosec_core::credential::load_and_decrypt(&self.config.id, &storage_key) {
-                Ok(Some(cred)) => cred.client_secret,
-                Ok(None) => return Err(ProviderError::RegistrationRequired),
-                Err(e) => {
-                    // Decryption/MAC failure means the password is wrong (it
-                    // derives a different HKDF key).  This is NOT a missing
-                    // credential — the token is stored but we can't decrypt
-                    // it.  Return AuthFailed so the unlock sweep re-prompts
-                    // for the correct password instead of entering the
-                    // registration flow.
-                    debug!(provider = %self.config.id,
-                        "credential decryption failed (wrong password): {e}");
-                    return Err(ProviderError::AuthFailed);
-                }
-            }
-        };
-
-        let auth = self.do_unlock(token.as_str()).await?;
-
-        {
-            let mut token_guard = self.access_token.lock().await;
-            *token_guard = Some(token);
-        }
-        {
-            let mut state_guard = self.state.lock().await;
-            *state_guard = Some(auth);
-        }
-
-        if let Some(cb) = self
-            .callbacks
-            .read()
-            .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
-            .on_unlocked
-            .clone()
-        {
-            cb();
-        }
-        Ok(())
-    }
-
-    /// Change the unlock password that protects the encrypted access token.
-    ///
-    /// Decrypts the stored token using the old-password-derived storage key,
-    /// then re-encrypts it with the new-password-derived key and persists the
-    /// result.  The provider must be unlocked so we can verify the old password
-    /// against the in-memory token (defence-in-depth: even if the MAC passes,
-    /// the decrypted token must match what we hold in memory).
-    ///
-    /// Returns `ProviderError::AuthFailed` if `old_password` is wrong.
-    /// Returns `ProviderError::Locked` if the provider is not unlocked.
-    async fn change_password(
-        &self,
-        old_password: Zeroizing<String>,
-        new_password: Zeroizing<String>,
-    ) -> Result<(), ProviderError> {
-        // Verify the provider is unlocked and snapshot the in-memory token.
-        let in_memory_token = {
-            let guard = self.access_token.lock().await;
-            guard
-                .as_deref()
-                .map(|t| Zeroizing::new(t.to_string()))
-                .ok_or(ProviderError::Locked)?
-        };
-
-        // Derive old storage key and decrypt the stored token.
-        let old_key = self.derive_storage_key(old_password.as_str())?;
-        let stored_token = match rosec_core::credential::load_and_decrypt(&self.config.id, &old_key)
-        {
-            Ok(Some(cred)) => cred.client_secret,
-            Ok(None) => return Err(ProviderError::AuthFailed),
-            Err(_) => return Err(ProviderError::AuthFailed),
-        };
-
-        // Defence-in-depth: the decrypted token must match what we hold in
-        // memory.  A MAC-passing but semantically wrong token would mean the
-        // on-disk credential was replaced out-of-band.
-        if *stored_token != *in_memory_token {
-            return Err(ProviderError::AuthFailed);
-        }
-
-        // Derive new storage key and re-encrypt.
-        let new_key = self.derive_storage_key(new_password.as_str())?;
-        rosec_core::credential::encrypt_and_save(
-            &self.config.id,
-            &new_key,
-            "access_token",
-            stored_token.as_str(),
-        )
-        .map_err(|e| ProviderError::Unavailable(format!("failed to re-encrypt SM token: {e}")))?;
-
-        info!(provider = %self.config.id, "SM unlock password changed");
-        Ok(())
-    }
-
-    /// Re-fetch all secrets from the Bitwarden SM API using the in-memory token.
-    ///
-    /// Requires the provider to be unlocked — the access token is held in memory
-    /// only while unlocked (zeroized on lock/drop).  Returns
-    /// `ProviderError::Locked` if called while locked; the caller must unlock
-    /// first.  There is no disk fallback: the password used to derive the
-    /// storage key is not retained after unlock.
-    async fn sync(&self) -> Result<(), ProviderError> {
-        let token = {
-            let guard = self.access_token.lock().await;
-            guard.as_deref().map(|t| Zeroizing::new(t.to_string()))
-        };
-        let token = token.ok_or(ProviderError::Locked)?;
-
-        // Snapshot the current secret IDs so we can detect changes after sync.
-        let before_ids: std::collections::HashSet<uuid::Uuid> = {
-            let guard = self.state.lock().await;
-            guard
-                .as_ref()
-                .map(|s| s.secrets.iter().map(|x| x.id).collect())
-                .unwrap_or_default()
-        };
-
-        let sync_result = self.do_unlock(token.as_str()).await;
-
-        match sync_result {
-            Ok(auth) => {
-                let changed = {
-                    let after_ids: std::collections::HashSet<uuid::Uuid> =
-                        auth.secrets.iter().map(|x| x.id).collect();
-                    after_ids != before_ids
-                };
-
-                // Atomically replace the in-memory state.
-                {
-                    let mut tok = self.access_token.lock().await;
-                    *tok = Some(token);
-                }
-                {
-                    let mut state_guard = self.state.lock().await;
-                    *state_guard = Some(auth);
-                }
-
-                info!(provider = %self.config.id, changed, "SM secrets synced");
-
-                if let Some(cb) = self
-                    .callbacks
-                    .read()
-                    .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
-                    .on_sync_succeeded
-                    .clone()
-                {
-                    cb(changed);
-                }
-                Ok(())
-            }
-            Err(e) => {
-                if let Some(cb) = self
-                    .callbacks
-                    .read()
-                    .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
-                    .on_sync_failed
-                    .clone()
-                {
-                    cb();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    async fn lock(&self) -> Result<(), ProviderError> {
-        {
-            let mut token_guard = self.access_token.lock().await;
-            *token_guard = None; // Zeroizing<String> is scrubbed on drop
-        }
-        {
-            let mut state_guard = self.state.lock().await;
-            *state_guard = None;
-        }
-        info!(provider = %self.config.id, "SM provider locked");
-
-        if let Some(cb) = self
-            .callbacks
-            .read()
-            .map_err(|_| ProviderError::Other(anyhow::anyhow!("callbacks lock poisoned")))?
-            .on_locked
-            .clone()
-        {
-            cb();
-        }
-        Ok(())
-    }
-
-    fn last_synced_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        // Use `try_lock` so this never blocks on a hot path — if the state
-        // mutex is held by an ongoing sync, we just return the cached value
-        // from the last time we could read it.  Callers tolerate a slightly
-        // stale timestamp here.
-        self.state
-            .try_lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|s| s.last_synced_at))
-    }
-
-    /// Check whether the SM org has changed since our last sync without
-    /// performing a full secrets fetch.
-    ///
-    /// Uses `GET /organizations/{org_id}/secrets/sync?lastSyncedDate=` which
-    /// returns `{ "hasChanges": bool }`.  If the provider is locked (no cached
-    /// bearer / no stored token) we re-authenticate first.  Returns `Ok(true)`
-    /// on any transient error so the caller falls back to a full sync.
-    async fn check_remote_changed(&self) -> Result<bool, ProviderError> {
-        // Snapshot the current bearer + last_synced_at under a single lock hold.
-        // The clone is required: we cannot hold the mutex across the async HTTP
-        // call below.  Zeroizing<String> ensures the copy is zeroed on drop.
-        let (bearer, last_synced_at) = {
-            let guard = self.state.lock().await;
-            match guard.as_ref() {
-                Some(s) => (s.bearer.clone(), s.last_synced_at),
-                // Provider is locked — no state yet, assume changed.
-                None => return Ok(true),
-            }
-        };
-
-        let org_id = Uuid::parse_str(&self.config.organization_id)
-            .map_err(|e| ProviderError::Unavailable(format!("invalid organization_id: {e}")))?;
-
-        let client = SmApiClient::new(self.urls())
-            .map_err(|e| ProviderError::Unavailable(format!("SM HTTP client: {e}")))?;
-
-        let last_synced_str: String = last_synced_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-
-        match client
-            .check_secrets_changed(&bearer, org_id, &last_synced_str)
-            .await
-        {
-            Ok(changed) => {
-                debug!(provider = %self.config.id, changed, "SM delta-sync check");
-                Ok(changed)
-            }
-            Err(e) => {
-                // A 401 means the cached bearer expired — treat as changed so
-                // the caller triggers a full sync (which re-authenticates).
-                // Any other transient error also falls back to sync.
-                debug!(provider = %self.config.id, error = %e,
-                    "SM delta-sync check failed, assuming changed");
-                Ok(true)
-            }
-        }
-    }
-
-    async fn list_items(&self) -> Result<Vec<ItemMeta>, ProviderError> {
-        let state = self.state.lock().await;
-        let auth = state.as_ref().ok_or(ProviderError::Locked)?;
-        Ok(auth
-            .secrets
-            .iter()
-            .map(|s| secret_to_meta(s, &self.config.id))
-            .collect())
-    }
-
-    async fn get_item_attributes(&self, id: &str) -> Result<ItemAttributes, ProviderError> {
-        let state = self.state.lock().await;
-        let auth = state.as_ref().ok_or(ProviderError::Locked)?;
-        let target_id = Uuid::parse_str(id).map_err(|_| ProviderError::NotFound)?;
-        let secret = auth
-            .secrets
-            .iter()
-            .find(|s| s.id == target_id)
-            .ok_or(ProviderError::NotFound)?;
-        let meta = secret_to_meta(secret, &self.config.id);
-        Ok(ItemAttributes {
-            public: meta.attributes,
-            secret_names: vec!["password".to_string()],
-        })
-    }
-
-    async fn get_secret_attr(&self, id: &str, attr: &str) -> Result<SecretBytes, ProviderError> {
-        let state = self.state.lock().await;
-        let auth = state.as_ref().ok_or(ProviderError::Locked)?;
-        let target_id = Uuid::parse_str(id).map_err(|_| ProviderError::NotFound)?;
-        let secret = auth
-            .secrets
-            .iter()
-            .find(|s| s.id == target_id)
-            .ok_or(ProviderError::NotFound)?;
-        match attr {
-            "password" => Ok(secret_value(secret)),
-            _ => Err(ProviderError::NotFound),
-        }
-    }
-
-    async fn search(&self, attrs: &Attributes) -> Result<Vec<ItemMeta>, ProviderError> {
-        let state = self.state.lock().await;
-        let auth = state.as_ref().ok_or(ProviderError::Locked)?;
-        Ok(auth
-            .secrets
-            .iter()
-            .map(|s| secret_to_meta(s, &self.config.id))
-            .filter(|meta| attrs.iter().all(|(k, v)| meta.attributes.get(k) == Some(v)))
-            .collect())
-    }
-}
-
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════
 // Helpers
-// ---------------------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════════
 
-fn secret_to_meta(secret: &DecryptedSecret, provider_id: &str) -> ItemMeta {
-    let mut attributes = Attributes::new();
-    attributes.insert(rosec_core::ATTR_TYPE.to_string(), "secret".to_string());
+/// Build a `WasmItemMeta` from a decrypted SM secret.
+fn secret_to_wasm_meta(provider_id: &str, secret: &DecryptedSecret) -> WasmItemMeta {
+    let mut attributes = HashMap::new();
+    attributes.insert(ATTR_TYPE.to_string(), "secret".to_string());
     attributes.insert("sm.key".to_string(), secret.key.clone());
-    attributes.insert("sm.id".to_string(), secret.id.to_string());
-    if let Some(pid) = secret.project_id {
-        attributes.insert("sm.project_id".to_string(), pid.to_string());
+    attributes.insert("sm.id".to_string(), secret.id.clone());
+    if let Some(pid) = &secret.project_id {
+        attributes.insert("sm.project_id".to_string(), pid.clone());
     }
     if let Some(name) = &secret.project_name {
         attributes.insert("sm.project".to_string(), name.clone());
     }
-    ItemMeta {
-        id: secret.id.to_string(),
-        provider_id: provider_id.to_string(),
+    // Inject provider_id for the host
+    attributes.insert("rosec:provider".to_string(), provider_id.to_string());
+
+    WasmItemMeta {
+        id: secret.id.clone(),
         label: secret.key.clone(),
         attributes,
-        created: None,
-        modified: None,
-        locked: false,
+        created_epoch_secs: None,
+        modified_epoch_secs: None,
     }
 }
 
-fn secret_value(secret: &DecryptedSecret) -> SecretBytes {
+/// Get the secret bytes for a decrypted secret.
+///
+/// Returns `value` if non-empty, otherwise falls back to `note`.
+fn secret_value_b64(secret: &DecryptedSecret) -> String {
     let src = if !secret.value.is_empty() {
         secret.value.as_bytes()
     } else {
         secret.note.as_bytes()
     };
-    SecretBytes::from_zeroizing(Zeroizing::new(src.to_vec()))
+    B64.encode(src)
 }
 
-// ---------------------------------------------------------------------------
-// Re-export for consumers
-// ---------------------------------------------------------------------------
+/// Return current Unix epoch seconds (using WASM-compatible SystemTime).
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
-pub use SmConfig as BitwardenSmConfig;
-pub use SmProvider as BitwardenSmProvider;
+/// Format epoch seconds as an ISO-8601 UTC timestamp for delta-sync.
+///
+/// Simple formatter — no chrono dependency.  Outputs `"YYYY-MM-DDTHH:MM:SS.000Z"`.
+fn epoch_to_iso8601(secs: u64) -> String {
+    let s = secs;
+    let second = s % 60;
+    let m = s / 60;
+    let minute = m % 60;
+    let h = m / 60;
+    let hour = h % 24;
+    let days = h / 24;
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+    // Compute year/month/day from days since epoch (2000-03-01 epoch trick).
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+        year, month, day, hour, minute, second
+    )
+}
 
-    /// Mutex that serialises tests which manipulate process-wide env vars.
-    /// Without this, parallel test threads race on `XDG_DATA_HOME`, causing
-    /// `credential_path()` to resolve against the wrong temp directory.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII guard that sets an env var for the duration of a test and restores
-    /// (or removes) it on drop.  All callers must hold `ENV_MUTEX` for the
-    /// duration of the guard's lifetime to prevent races.
-    struct ScopedEnv {
-        key: &'static str,
-        previous: Option<String>,
+/// Build an error `SimpleResponse` from a `SmError`.
+fn simple_err(e: &SmError) -> SimpleResponse {
+    SimpleResponse {
+        ok: false,
+        error: Some(e.to_string()),
+        error_kind: Some(e.to_error_kind()),
     }
+}
 
-    fn scoped_env(key: &'static str, value: &str) -> ScopedEnv {
-        let previous = std::env::var(key).ok();
-        // SAFETY: tests are the only callers; env mutation is inherently
-        // unsafe in multi-threaded contexts — callers hold ENV_MUTEX.
-        unsafe { std::env::set_var(key, value) };
-        ScopedEnv { key, previous }
+fn simple_ok() -> SimpleResponse {
+    SimpleResponse {
+        ok: true,
+        error: None,
+        error_kind: None,
     }
+}
 
-    impl Drop for ScopedEnv {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
+/// Resolve `SmUrls` from provider options.
+fn urls_from_options(options: &HashMap<String, serde_json::Value>) -> SmUrls {
+    if let Some(base) = options.get("server_url").and_then(|v| v.as_str()) {
+        SmUrls::from_base(base)
+    } else {
+        let region = options
+            .get("region")
+            .and_then(|v| v.as_str())
+            .unwrap_or("us");
+        match region.to_ascii_lowercase().as_str() {
+            "eu" => SmUrls::official_eu(),
+            _ => SmUrls::official_us(),
         }
     }
+}
 
-    fn make_provider() -> SmProvider {
-        SmProvider::new(SmConfig {
-            id: "test-sm".to_string(),
-            name: Some("Test SM".to_string()),
-            region: SmRegion::Us,
-            server_url: None,
-            organization_id: "00000000-0000-0000-0000-000000000000".to_string(),
+// ═══════════════════════════════════════════════════════════════════
+// Plugin function exports
+// ═══════════════════════════════════════════════════════════════════
+
+/// Return the plugin manifest for discovery.
+///
+/// Called by the host **before** `init` — no global state is accessed.
+#[plugin_fn]
+pub fn plugin_manifest(_: ()) -> FnResult<Json<PluginManifest>> {
+    Ok(Json(PluginManifest {
+        kind: "bitwarden-sm".to_string(),
+        name: "Bitwarden Secrets Manager".to_string(),
+        description: "Bitwarden Secrets Manager machine account access token provider".to_string(),
+        default_allowed_hosts: vec!["*.bitwarden.com".to_string(), "*.bitwarden.eu".to_string()],
+        required_options: vec![PluginOptionDescriptor {
+            key: "organization_id".to_string(),
+            description: "Bitwarden organisation UUID (restricts which secrets are fetched)"
+                .to_string(),
+            kind: "text".to_string(),
+        }],
+        optional_options: vec![
+            PluginOptionDescriptor {
+                key: "region".to_string(),
+                description: "Cloud region: 'us' or 'eu' (default: us)".to_string(),
+                kind: "text".to_string(),
+            },
+            PluginOptionDescriptor {
+                key: "server_url".to_string(),
+                description: "Self-hosted base URL, e.g. https://vault.example.com".to_string(),
+                kind: "text".to_string(),
+            },
+        ],
+        id_derivation_key: Some("organization_id".to_string()),
+    }))
+}
+
+/// Initialise the plugin with provider configuration.
+#[plugin_fn]
+pub fn init(Json(req): Json<InitRequest>) -> FnResult<Json<InitResponse>> {
+    let org_id = req
+        .options
+        .get("organization_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if org_id.is_empty() {
+        return Ok(Json(InitResponse {
+            ok: false,
+            error: Some("missing required option: organization_id".to_string()),
+        }));
+    }
+
+    let urls = urls_from_options(&req.options);
+
+    let config = GuestConfig {
+        provider_id: req.provider_id.clone(),
+        org_id,
+        urls,
+    };
+
+    extism_pdk::info!(
+        "bitwarden-sm plugin initialised: provider_id={}",
+        req.provider_id
+    );
+
+    let mut guard = STATE
+        .lock()
+        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    *guard = Some(GuestState { config, auth: None });
+
+    Ok(Json(InitResponse {
+        ok: true,
+        error: None,
+    }))
+}
+
+/// Return the current provider status (locked/unlocked + last sync time).
+#[plugin_fn]
+pub fn status(_input: ()) -> FnResult<Json<StatusResponse>> {
+    let guard = STATE
+        .lock()
+        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+
+    let Some(state) = guard.as_ref() else {
+        return Ok(Json(StatusResponse {
+            locked: true,
+            last_sync_epoch_secs: None,
+        }));
+    };
+
+    match &state.auth {
+        Some(auth) => Ok(Json(StatusResponse {
+            locked: false,
+            last_sync_epoch_secs: Some(auth.last_sync_epoch_secs),
+        })),
+        None => Ok(Json(StatusResponse {
+            locked: true,
+            last_sync_epoch_secs: None,
+        })),
+    }
+}
+
+/// Unlock the SM provider.
+///
+/// The raw access token is provided in `registration_fields["access_token"]`.
+/// The host persists it encrypted between sessions and passes it back here.
+///
+/// If `registration_fields` is absent or empty, return `RegistrationRequired`
+/// so the host prompts the user to enter their access token.
+#[plugin_fn]
+pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> {
+    let mut guard = STATE
+        .lock()
+        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+
+    let Some(state) = guard.as_mut() else {
+        return Ok(Json(SimpleResponse {
+            ok: false,
+            error: Some("plugin not initialised".to_string()),
+            error_kind: Some(ErrorKind::Unavailable),
+        }));
+    };
+
+    // Extract access token from registration_fields.
+    let raw_token = req
+        .registration_fields
+        .as_ref()
+        .and_then(|rf| rf.get("access_token"))
+        .map(String::as_str)
+        .unwrap_or("");
+
+    if raw_token.is_empty() {
+        // No token supplied — host must provide one via registration.
+        return Ok(Json(SimpleResponse {
+            ok: false,
+            error: Some("access token required".to_string()),
+            error_kind: Some(ErrorKind::RegistrationRequired),
+        }));
+    }
+
+    let token = match AccessToken::parse(raw_token) {
+        Ok(t) => t,
+        Err(e) => {
+            extism_pdk::warn!("SM access token parse failed: {e}");
+            return Ok(Json(SimpleResponse {
+                ok: false,
+                error: Some(format!("invalid access token: {e}")),
+                error_kind: Some(ErrorKind::AuthFailed),
+            }));
+        }
+    };
+
+    match fetch_secrets(&state.config.urls, &token, &state.config.org_id) {
+        Ok((bearer, secrets)) => {
+            let count = secrets.len();
+            let now = now_epoch_secs();
+            state.auth = Some(AuthState {
+                access_token: Zeroizing::new(raw_token.to_string()),
+                secrets,
+                bearer,
+                last_sync_epoch_secs: now,
+                last_synced_iso8601: epoch_to_iso8601(now),
+            });
+            extism_pdk::info!(
+                "SM provider unlocked: provider_id={} secrets={count}",
+                state.config.provider_id
+            );
+            Ok(Json(simple_ok()))
+        }
+        Err(e) => {
+            extism_pdk::warn!("SM unlock failed: {e}");
+            Ok(Json(simple_err(&e)))
+        }
+    }
+}
+
+/// Lock the provider — drop all sensitive state.
+#[plugin_fn]
+pub fn lock(_input: ()) -> FnResult<Json<SimpleResponse>> {
+    let mut guard = STATE
+        .lock()
+        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+
+    if let Some(state) = guard.as_mut() {
+        state.auth = None;
+        extism_pdk::info!("SM provider locked");
+    }
+
+    Ok(Json(simple_ok()))
+}
+
+/// Re-sync secrets from the Bitwarden SM API using the cached access token.
+#[plugin_fn]
+pub fn sync(_input: ()) -> FnResult<Json<SimpleResponse>> {
+    let mut guard = STATE
+        .lock()
+        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+
+    let Some(state) = guard.as_mut() else {
+        return Ok(Json(SimpleResponse {
+            ok: false,
+            error: Some("plugin not initialised".to_string()),
+            error_kind: Some(ErrorKind::Unavailable),
+        }));
+    };
+
+    let Some(auth) = state.auth.as_mut() else {
+        return Ok(Json(SimpleResponse {
+            ok: false,
+            error: Some("provider is locked".to_string()),
+            error_kind: Some(ErrorKind::Locked),
+        }));
+    };
+
+    // Re-parse the cached access token and fetch fresh secrets.
+    let token = match AccessToken::parse(&auth.access_token) {
+        Ok(t) => t,
+        Err(e) => {
+            extism_pdk::warn!("SM sync: access token parse failed: {e}");
+            return Ok(Json(SimpleResponse {
+                ok: false,
+                error: Some(format!("access token parse: {e}")),
+                error_kind: Some(ErrorKind::AuthFailed),
+            }));
+        }
+    };
+
+    match fetch_secrets(&state.config.urls, &token, &state.config.org_id) {
+        Ok((bearer, secrets)) => {
+            let count = secrets.len();
+            let now = now_epoch_secs();
+            auth.secrets = secrets;
+            auth.bearer = bearer;
+            auth.last_sync_epoch_secs = now;
+            auth.last_synced_iso8601 = epoch_to_iso8601(now);
+            extism_pdk::info!("SM secrets synced: secrets={count}");
+            Ok(Json(simple_ok()))
+        }
+        Err(e) => {
+            extism_pdk::warn!("SM sync failed: {e}");
+            Ok(Json(simple_err(&e)))
+        }
+    }
+}
+
+/// List all SM secrets as item metadata.
+#[plugin_fn]
+pub fn list_items(_input: ()) -> FnResult<Json<ItemListResponse>> {
+    let guard = STATE
+        .lock()
+        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+
+    let Some(state) = guard.as_ref() else {
+        return Ok(Json(ItemListResponse {
+            ok: false,
+            error: Some("plugin not initialised".to_string()),
+            error_kind: Some(ErrorKind::Unavailable),
+            items: Vec::new(),
+        }));
+    };
+
+    let Some(auth) = &state.auth else {
+        return Ok(Json(ItemListResponse {
+            ok: false,
+            error: Some("provider is locked".to_string()),
+            error_kind: Some(ErrorKind::Locked),
+            items: Vec::new(),
+        }));
+    };
+
+    let provider_id = &state.config.provider_id;
+    let items: Vec<WasmItemMeta> = auth
+        .secrets
+        .iter()
+        .map(|s| secret_to_wasm_meta(provider_id, s))
+        .collect();
+
+    Ok(Json(ItemListResponse {
+        ok: true,
+        error: None,
+        error_kind: None,
+        items,
+    }))
+}
+
+/// Search for SM secrets matching the given attributes.
+#[plugin_fn]
+pub fn search(Json(req): Json<SearchRequest>) -> FnResult<Json<ItemListResponse>> {
+    let guard = STATE
+        .lock()
+        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+
+    let Some(state) = guard.as_ref() else {
+        return Ok(Json(ItemListResponse {
+            ok: false,
+            error: Some("plugin not initialised".to_string()),
+            error_kind: Some(ErrorKind::Unavailable),
+            items: Vec::new(),
+        }));
+    };
+
+    let Some(auth) = &state.auth else {
+        return Ok(Json(ItemListResponse {
+            ok: false,
+            error: Some("provider is locked".to_string()),
+            error_kind: Some(ErrorKind::Locked),
+            items: Vec::new(),
+        }));
+    };
+
+    let provider_id = &state.config.provider_id;
+    let items: Vec<WasmItemMeta> = auth
+        .secrets
+        .iter()
+        .filter_map(|s| {
+            let meta = secret_to_wasm_meta(provider_id, s);
+            if req
+                .attributes
+                .iter()
+                .all(|(k, v)| meta.attributes.get(k) == Some(v))
+            {
+                Some(meta)
+            } else {
+                None
+            }
         })
+        .collect();
+
+    Ok(Json(ItemListResponse {
+        ok: true,
+        error: None,
+        error_kind: None,
+        items,
+    }))
+}
+
+/// Return public attributes + secret attribute names for a secret.
+#[plugin_fn]
+pub fn get_item_attributes(
+    Json(req): Json<ItemIdRequest>,
+) -> FnResult<Json<ItemAttributesResponse>> {
+    let guard = STATE
+        .lock()
+        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+
+    let Some(state) = guard.as_ref() else {
+        return Ok(Json(ItemAttributesResponse {
+            ok: false,
+            error: Some("plugin not initialised".to_string()),
+            error_kind: Some(ErrorKind::Unavailable),
+            public: HashMap::new(),
+            secret_names: Vec::new(),
+        }));
+    };
+
+    let Some(auth) = &state.auth else {
+        return Ok(Json(ItemAttributesResponse {
+            ok: false,
+            error: Some("provider is locked".to_string()),
+            error_kind: Some(ErrorKind::Locked),
+            public: HashMap::new(),
+            secret_names: Vec::new(),
+        }));
+    };
+
+    let secret = auth.secrets.iter().find(|s| s.id == req.id);
+
+    let Some(secret) = secret else {
+        return Ok(Json(ItemAttributesResponse {
+            ok: false,
+            error: Some(format!("secret not found: {}", req.id)),
+            error_kind: Some(ErrorKind::NotFound),
+            public: HashMap::new(),
+            secret_names: Vec::new(),
+        }));
+    };
+
+    let meta = secret_to_wasm_meta(&state.config.provider_id, secret);
+
+    Ok(Json(ItemAttributesResponse {
+        ok: true,
+        error: None,
+        error_kind: None,
+        public: meta.attributes,
+        secret_names: vec!["password".to_string()],
+    }))
+}
+
+/// Return the secret bytes for a named attribute of a secret.
+#[plugin_fn]
+pub fn get_secret_attr(
+    Json(req): Json<SecretAttrRequest>,
+) -> FnResult<Json<SecretAttrResponse>> {
+    let guard = STATE
+        .lock()
+        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+
+    let Some(state) = guard.as_ref() else {
+        return Ok(Json(SecretAttrResponse {
+            ok: false,
+            error: Some("plugin not initialised".to_string()),
+            error_kind: Some(ErrorKind::Unavailable),
+            value_b64: None,
+        }));
+    };
+
+    let Some(auth) = &state.auth else {
+        return Ok(Json(SecretAttrResponse {
+            ok: false,
+            error: Some("provider is locked".to_string()),
+            error_kind: Some(ErrorKind::Locked),
+            value_b64: None,
+        }));
+    };
+
+    let secret = auth.secrets.iter().find(|s| s.id == req.id);
+
+    let Some(secret) = secret else {
+        return Ok(Json(SecretAttrResponse {
+            ok: false,
+            error: Some(format!("secret not found: {}", req.id)),
+            error_kind: Some(ErrorKind::NotFound),
+            value_b64: None,
+        }));
+    };
+
+    match req.attr.as_str() {
+        "password" => Ok(Json(SecretAttrResponse {
+            ok: true,
+            error: None,
+            error_kind: None,
+            value_b64: Some(secret_value_b64(secret)),
+        })),
+        _ => Ok(Json(SecretAttrResponse {
+            ok: false,
+            error: Some(format!("unknown attribute: {}", req.attr)),
+            error_kind: Some(ErrorKind::NotFound),
+            value_b64: None,
+        })),
     }
+}
 
-    async fn inject_state(b: &SmProvider, secrets: Vec<DecryptedSecret>) {
-        let mut state = b.state.lock().await;
-        *state = Some(AuthState {
-            secrets,
-            last_sync: Some(SystemTime::now()),
-            last_synced_at: chrono::Utc::now(),
-            bearer: Zeroizing::new(String::new()),
-        });
-    }
+/// Return the capabilities this plugin supports.
+///
+/// SM supports `Sync` only.  `PasswordChange` is handled host-side by
+/// `WasmProvider` (re-encrypts stored credentials).
+#[plugin_fn]
+pub fn capabilities(_input: ()) -> FnResult<Json<CapabilitiesResponse>> {
+    Ok(Json(CapabilitiesResponse {
+        capabilities: vec!["sync".to_string()],
+    }))
+}
 
-    #[tokio::test]
-    async fn starts_locked() {
-        assert!(make_provider().status().await.unwrap().locked);
-    }
+/// Return attribute descriptors for SM secrets.
+#[plugin_fn]
+pub fn attribute_descriptors(_input: ()) -> FnResult<Json<AttributeDescriptorsResponse>> {
+    let descriptors = vec![
+        WasmAttributeDescriptor {
+            name: ATTR_TYPE.to_string(),
+            sensitive: false,
+            item_types: vec![],
+            description: "Item type (always 'secret' for SM items)".to_string(),
+        },
+        WasmAttributeDescriptor {
+            name: "sm.key".to_string(),
+            sensitive: false,
+            item_types: vec!["secret".to_string()],
+            description: "Secret name/key in Bitwarden Secrets Manager".to_string(),
+        },
+        WasmAttributeDescriptor {
+            name: "sm.id".to_string(),
+            sensitive: false,
+            item_types: vec!["secret".to_string()],
+            description: "Secret UUID in Bitwarden Secrets Manager".to_string(),
+        },
+        WasmAttributeDescriptor {
+            name: "sm.project_id".to_string(),
+            sensitive: false,
+            item_types: vec!["secret".to_string()],
+            description: "Project UUID the secret belongs to (if any)".to_string(),
+        },
+        WasmAttributeDescriptor {
+            name: "sm.project".to_string(),
+            sensitive: false,
+            item_types: vec!["secret".to_string()],
+            description: "Project name the secret belongs to (if any)".to_string(),
+        },
+        WasmAttributeDescriptor {
+            name: "password".to_string(),
+            sensitive: true,
+            item_types: vec!["secret".to_string()],
+            description: "Secret value (falls back to note if value is empty)".to_string(),
+        },
+    ];
 
-    #[tokio::test]
-    async fn list_items_when_locked_returns_error() {
-        assert!(matches!(
-            make_provider().list_items().await,
-            Err(ProviderError::Locked)
-        ));
-    }
+    Ok(Json(AttributeDescriptorsResponse { descriptors }))
+}
 
-    #[tokio::test]
-    async fn get_secret_attr_when_locked_returns_error() {
-        assert!(matches!(
-            make_provider()
-                .get_secret_attr("00000000-0000-0000-0000-000000000000", "password")
-                .await,
-            Err(ProviderError::Locked)
-        ));
-    }
+/// Return registration info for first-time setup.
+///
+/// SM requires the user to provide their machine account access token
+/// (format: `0.{uuid}.{secret}:{base64_key}`).
+#[plugin_fn]
+pub fn registration_info(_input: ()) -> FnResult<Json<RegistrationInfoResponse>> {
+    Ok(Json(RegistrationInfoResponse {
+        has_registration: true,
+        instructions: Some(
+            "This provider needs a Bitwarden Secrets Manager access token.\n\n\
+             Generate a machine account access token in the Bitwarden Secrets Manager \
+             web app and paste it below.  The token will be encrypted with your unlock \
+             password and stored locally."
+                .to_string(),
+        ),
+        fields: vec![WasmAuthField {
+            id: "access_token".to_string(),
+            label: "Access Token".to_string(),
+            placeholder: "0.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.xxxxxxxx\u{2026}".to_string(),
+            required: true,
+            kind: "secret".to_string(),
+        }],
+    }))
+}
 
-    #[tokio::test]
-    async fn unlock_without_stored_token_returns_registration_required() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Normal unlock with no token on disk → RegistrationRequired (first-time setup).
-        let tmp = std::env::temp_dir().join(format!("rosec-sm-test-{}-noreg", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let result = {
-            let _env = scoped_env("XDG_DATA_HOME", tmp.to_str().unwrap());
-            make_provider()
-                .unlock(UnlockInput::Password(Zeroizing::new(
-                    "my-unlock-password".to_string(),
-                )))
-                .await
-        };
-        let _ = std::fs::remove_dir_all(&tmp);
-        assert!(matches!(result, Err(ProviderError::RegistrationRequired)));
-    }
+/// Return the unlock password field descriptor.
+#[plugin_fn]
+pub fn auth_fields(_input: ()) -> FnResult<Json<AuthFieldsResponse>> {
+    Ok(Json(AuthFieldsResponse {
+        fields: vec![WasmAuthField {
+            id: "password".to_string(),
+            label: "Unlock Password".to_string(),
+            placeholder: "Password used to protect the stored access token".to_string(),
+            required: true,
+            kind: "password".to_string(),
+        }],
+    }))
+}
 
-    #[tokio::test]
-    async fn unlock_with_wrong_password_returns_auth_failed() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Store a token encrypted with one password, then try to unlock with a
-        // different password.  The MAC check should fail and return AuthFailed
-        // (not RegistrationRequired) so the user gets re-prompted.
-        let tmp =
-            std::env::temp_dir().join(format!("rosec-sm-test-{}-wrongpw", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let result = {
-            let _env = scoped_env("XDG_DATA_HOME", tmp.to_str().unwrap());
-            let b = make_provider();
+/// SM-specific: delta-sync check.
+///
+/// Returns `{ ok: true, has_changes: bool }` — `has_changes = true` means
+/// secrets have changed since the last sync.  On any error, returns
+/// `{ ok: true, has_changes: true }` so the host falls back to a full sync.
+///
+/// The host calls this before deciding whether to do a full `sync`.
+#[plugin_fn]
+pub fn check_remote_changed(
+    Json(req): Json<CheckRemoteChangedRequest>,
+) -> FnResult<Json<CheckRemoteChangedResponse>> {
+    let guard = STATE
+        .lock()
+        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
 
-            // First, store a token with the correct password via registration.
-            let correct_pw = Zeroizing::new("correct-password".to_string());
-            let storage_key = b.derive_storage_key(correct_pw.as_str()).unwrap();
-            rosec_core::credential::encrypt_and_save(
-                &b.config.id,
-                &storage_key,
-                "access_token",
-                "0.fake-uuid.fake-secret:AAAAAAAAAAAAAAAAAAAAAA==",
-            )
-            .unwrap();
+    let Some(state) = guard.as_ref() else {
+        // Not initialised — assume changed.
+        return Ok(Json(CheckRemoteChangedResponse {
+            ok: true,
+            error: None,
+            error_kind: None,
+            has_changes: true,
+        }));
+    };
 
-            // Now try to unlock with the wrong password.
-            b.unlock(UnlockInput::Password(Zeroizing::new(
-                "wrong-password".to_string(),
-            )))
-            .await
-        };
-        let _ = std::fs::remove_dir_all(&tmp);
-        assert!(matches!(result, Err(ProviderError::AuthFailed)));
-    }
+    let Some(auth) = &state.auth else {
+        // Locked — assume changed.
+        return Ok(Json(CheckRemoteChangedResponse {
+            ok: true,
+            error: None,
+            error_kind: None,
+            has_changes: true,
+        }));
+    };
 
-    #[tokio::test]
-    async fn lock_clears_state() {
-        let b = make_provider();
-        inject_state(&b, Vec::new()).await;
-        assert!(!b.status().await.unwrap().locked);
-        b.lock().await.unwrap();
-        assert!(b.status().await.unwrap().locked);
-    }
-
-    #[tokio::test]
-    async fn list_items_returns_secrets_when_unlocked() {
-        let b = make_provider();
-        let secret_id = Uuid::new_v4();
-        inject_state(
-            &b,
-            vec![DecryptedSecret {
-                id: secret_id,
-                key: "MY_API_KEY".to_string(),
-                value: Zeroizing::new("s3cr3t".to_string()),
-                note: Zeroizing::new("".to_string()),
-                project_id: None,
-                project_name: None,
-            }],
-        )
-        .await;
-        let items = b.list_items().await.unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].label, "MY_API_KEY");
-        assert_eq!(items[0].provider_id, "test-sm");
-        assert_eq!(
-            items[0].attributes.get("sm.key").map(String::as_str),
-            Some("MY_API_KEY")
-        );
-        assert_eq!(
-            items[0].attributes.get("sm.id").map(String::as_str),
-            Some(secret_id.to_string().as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn get_secret_attr_returns_value() {
-        let b = make_provider();
-        let secret_id = Uuid::new_v4();
-        inject_state(
-            &b,
-            vec![DecryptedSecret {
-                id: secret_id,
-                key: "DB_PASS".to_string(),
-                value: Zeroizing::new("hunter2".to_string()),
-                note: Zeroizing::new("".to_string()),
-                project_id: None,
-                project_name: None,
-            }],
-        )
-        .await;
-        assert_eq!(
-            b.get_secret_attr(&secret_id.to_string(), "password")
-                .await
-                .unwrap()
-                .as_slice(),
-            b"hunter2"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_secret_attr_falls_back_to_note_when_value_empty() {
-        let b = make_provider();
-        let secret_id = Uuid::new_v4();
-        inject_state(
-            &b,
-            vec![DecryptedSecret {
-                id: secret_id,
-                key: "NOTE_ONLY".to_string(),
-                value: Zeroizing::new("".to_string()),
-                note: Zeroizing::new("from-note".to_string()),
-                project_id: None,
-                project_name: None,
-            }],
-        )
-        .await;
-        assert_eq!(
-            b.get_secret_attr(&secret_id.to_string(), "password")
-                .await
-                .unwrap()
-                .as_slice(),
-            b"from-note"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_secret_attr_not_found() {
-        let b = make_provider();
-        inject_state(&b, Vec::new()).await;
-        assert!(matches!(
-            b.get_secret_attr("00000000-0000-0000-0000-000000000001", "password")
-                .await,
-            Err(ProviderError::NotFound)
-        ));
-    }
-
-    #[tokio::test]
-    async fn get_secret_attr_unknown_attr_returns_not_found() {
-        let b = make_provider();
-        let secret_id = Uuid::new_v4();
-        inject_state(
-            &b,
-            vec![DecryptedSecret {
-                id: secret_id,
-                key: "SOME_KEY".to_string(),
-                value: Zeroizing::new("val".to_string()),
-                note: Zeroizing::new("".to_string()),
-                project_id: None,
-                project_name: None,
-            }],
-        )
-        .await;
-        assert!(matches!(
-            b.get_secret_attr(&secret_id.to_string(), "nonexistent")
-                .await,
-            Err(ProviderError::NotFound)
-        ));
-    }
-
-    #[tokio::test]
-    async fn search_filters_by_attributes() {
-        let b = make_provider();
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
-        inject_state(
-            &b,
-            vec![
-                DecryptedSecret {
-                    id: id1,
-                    key: "KEY_A".to_string(),
-                    value: Zeroizing::new("a".to_string()),
-                    note: Zeroizing::new("".to_string()),
-                    project_id: None,
-                    project_name: None,
-                },
-                DecryptedSecret {
-                    id: id2,
-                    key: "KEY_B".to_string(),
-                    value: Zeroizing::new("b".to_string()),
-                    note: Zeroizing::new("".to_string()),
-                    project_id: None,
-                    project_name: None,
-                },
-            ],
-        )
-        .await;
-        let mut query = Attributes::new();
-        query.insert("sm.key".to_string(), "KEY_A".to_string());
-        let results = b.search(&query).await.unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].label, "KEY_A");
-    }
-
-    #[test]
-    fn secret_to_meta_sets_attributes() {
-        let secret = DecryptedSecret {
-            id: Uuid::nil(),
-            key: "MY_SECRET".to_string(),
-            value: Zeroizing::new("v".to_string()),
-            note: Zeroizing::new("n".to_string()),
-            project_id: Some(Uuid::nil()),
-            project_name: Some("my-project".to_string()),
-        };
-        let meta = secret_to_meta(&secret, "provider-x");
-        assert_eq!(meta.label, "MY_SECRET");
-        assert_eq!(meta.provider_id, "provider-x");
-        assert_eq!(
-            meta.attributes
-                .get(rosec_core::ATTR_TYPE)
-                .map(String::as_str),
-            Some("secret")
-        );
-        assert!(meta.attributes.contains_key("sm.key"));
-        assert!(meta.attributes.contains_key("sm.id"));
-        assert!(meta.attributes.contains_key("sm.project_id"));
-        assert_eq!(
-            meta.attributes.get("sm.project").map(String::as_str),
-            Some("my-project")
-        );
-    }
-
-    #[tokio::test]
-    async fn get_item_attributes_when_locked_returns_error() {
-        assert!(matches!(
-            make_provider()
-                .get_item_attributes("00000000-0000-0000-0000-000000000000")
-                .await,
-            Err(ProviderError::Locked)
-        ));
-    }
-
-    #[tokio::test]
-    async fn get_item_attributes_found_and_not_found() {
-        let b = make_provider();
-        let secret_id = Uuid::new_v4();
-        inject_state(
-            &b,
-            vec![DecryptedSecret {
-                id: secret_id,
-                key: "FOUND_KEY".to_string(),
-                value: Zeroizing::new("found-value".to_string()),
-                note: Zeroizing::new("".to_string()),
-                project_id: None,
-                project_name: None,
-            }],
-        )
-        .await;
-        let attrs = b.get_item_attributes(&secret_id.to_string()).await.unwrap();
-        assert_eq!(
-            attrs.public.get("sm.key").map(String::as_str),
-            Some("FOUND_KEY")
-        );
-        assert!(attrs.secret_names.contains(&"password".to_string()));
-        // Verify we can retrieve the secret via get_secret_attr.
-        assert_eq!(
-            b.get_secret_attr(&secret_id.to_string(), "password")
-                .await
-                .unwrap()
-                .as_slice(),
-            b"found-value"
-        );
-        assert!(matches!(
-            b.get_item_attributes("00000000-0000-0000-0000-000000000099")
-                .await,
-            Err(ProviderError::NotFound)
-        ));
-    }
-
-    #[tokio::test]
-    async fn search_returns_empty_when_no_match() {
-        let b = make_provider();
-        inject_state(
-            &b,
-            vec![DecryptedSecret {
-                id: Uuid::new_v4(),
-                key: "UNRELATED".to_string(),
-                value: Zeroizing::new("x".to_string()),
-                note: Zeroizing::new("".to_string()),
-                project_id: None,
-                project_name: None,
-            }],
-        )
-        .await;
-        let mut query = Attributes::new();
-        query.insert("sm.key".to_string(), "DOES_NOT_EXIST".to_string());
-        assert!(b.search(&query).await.unwrap().is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // change_password tests
-    // -----------------------------------------------------------------------
-
-    /// Fake access token used in change_password tests.
-    const FAKE_TOKEN: &str =
-        "0.00000000-0000-0000-0000-000000000000.fake-secret:AAAAAAAAAAAAAAAAAAAAAA==";
-
-    /// Store a token encrypted with `password` on disk, inject it into memory,
-    /// and inject auth state so the provider appears unlocked.
-    async fn setup_unlocked_with_token(b: &SmProvider, password: &str) {
-        let storage_key = b.derive_storage_key(password).unwrap_or_else(|e| {
-            panic!("derive_storage_key failed in test setup: {e}");
-        });
-        rosec_core::credential::encrypt_and_save(
-            &b.config.id,
-            &storage_key,
-            "access_token",
-            FAKE_TOKEN,
-        )
-        .unwrap_or_else(|e| {
-            panic!("encrypt_and_save failed in test setup: {e}");
-        });
-
-        // Inject access_token in memory (mimics what unlock() does).
-        {
-            let mut guard = b.access_token.lock().await;
-            *guard = Some(Zeroizing::new(FAKE_TOKEN.to_string()));
+    match crate::api::check_secrets_changed(
+        &state.config.urls,
+        &auth.bearer,
+        &state.config.org_id,
+        &req.last_synced_iso8601,
+    ) {
+        Ok(has_changes) => {
+            extism_pdk::debug!("SM delta-sync check has_changes={has_changes}");
+            Ok(Json(CheckRemoteChangedResponse {
+                ok: true,
+                error: None,
+                error_kind: None,
+                has_changes,
+            }))
         }
-        inject_state(&b, Vec::new()).await;
-    }
-
-    #[tokio::test]
-    async fn change_password_happy_path() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp =
-            std::env::temp_dir().join(format!("rosec-sm-test-{}-chpw-ok", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let result = {
-            let _env = scoped_env("XDG_DATA_HOME", tmp.to_str().unwrap());
-            let b = make_provider();
-            setup_unlocked_with_token(&b, "old-password").await;
-
-            let res = b
-                .change_password(
-                    Zeroizing::new("old-password".to_string()),
-                    Zeroizing::new("new-password".to_string()),
-                )
-                .await;
-
-            // Verify: old password can no longer decrypt, new password can.
-            if res.is_ok() {
-                let old_key = b.derive_storage_key("old-password").unwrap();
-                let old_load = rosec_core::credential::load_and_decrypt(&b.config.id, &old_key);
-                assert!(
-                    old_load.is_err() || matches!(old_load, Ok(None)),
-                    "old password should no longer decrypt the stored token"
-                );
-
-                let new_key = b.derive_storage_key("new-password").unwrap();
-                let new_load = rosec_core::credential::load_and_decrypt(&b.config.id, &new_key);
-                assert!(
-                    matches!(&new_load, Ok(Some(cred)) if cred.client_secret.as_str() == FAKE_TOKEN),
-                    "new password should decrypt to the original token"
-                );
-            }
-            res
-        };
-        let _ = std::fs::remove_dir_all(&tmp);
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn change_password_wrong_old_password() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp =
-            std::env::temp_dir().join(format!("rosec-sm-test-{}-chpw-wrong", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let result = {
-            let _env = scoped_env("XDG_DATA_HOME", tmp.to_str().unwrap());
-            let b = make_provider();
-            setup_unlocked_with_token(&b, "real-password").await;
-
-            b.change_password(
-                Zeroizing::new("wrong-password".to_string()),
-                Zeroizing::new("new-password".to_string()),
-            )
-            .await
-        };
-        let _ = std::fs::remove_dir_all(&tmp);
-        assert!(matches!(result, Err(ProviderError::AuthFailed)));
-    }
-
-    #[tokio::test]
-    async fn change_password_when_locked() {
-        let b = make_provider();
-        // Provider is locked (default state) — no access_token in memory.
-        let result = b
-            .change_password(
-                Zeroizing::new("old".to_string()),
-                Zeroizing::new("new".to_string()),
-            )
-            .await;
-        assert!(matches!(result, Err(ProviderError::Locked)));
+        Err(e) => {
+            // Treat errors as "assume changed" — safe fallback.
+            extism_pdk::warn!("SM delta-sync check failed, assuming changed: {e}");
+            Ok(Json(CheckRemoteChangedResponse {
+                ok: true,
+                error: None,
+                error_kind: None,
+                has_changes: true,
+            }))
+        }
     }
 }
