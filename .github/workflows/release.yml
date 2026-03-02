@@ -266,10 +266,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: wasm-plugins
-          workspaces: rosec-bitwarden-wasm
+          workspaces: rosec-bitwarden-pm
 
       - name: Build bitwarden-pm plugin
-        working-directory: rosec-bitwarden-wasm
+        working-directory: rosec-bitwarden-pm
         run: cargo build --target wasm32-wasip1 --release
 
       - name: Package WASM plugins
@@ -278,11 +278,11 @@ jobs:
           mkdir -p dist/plugins
 
           # bitwarden-pm
-          cp rosec-bitwarden-wasm/target/wasm32-wasip1/release/rosec_bitwarden_wasm.wasm \
-             dist/plugins/rosec_bitwarden_wasm.wasm
+          cp rosec-bitwarden-pm/target/wasm32-wasip1/release/rosec_bitwarden_pm.wasm \
+             dist/plugins/rosec_bitwarden_pm.wasm
 
           ARCHIVE="rosec-provider-bitwarden-pm-${VERSION}.wasm.tar.gz"
-          tar -czf "${ARCHIVE}" -C dist/plugins rosec_bitwarden_wasm.wasm
+          tar -czf "${ARCHIVE}" -C dist/plugins rosec_bitwarden_pm.wasm
           sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
 
       - name: Upload artifact

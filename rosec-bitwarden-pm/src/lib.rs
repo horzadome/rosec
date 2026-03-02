@@ -1317,14 +1317,13 @@ pub fn get_ssh_private_key(Json(req): Json<SshPrivateKeyRequest>) -> FnResult<Js
 
 /// Return the provider's capabilities.
 ///
-/// Bitwarden PM supports: Sync, Ssh, PasswordChange (NOT Write).
+/// Bitwarden PM supports: Sync, Ssh (NOT Write, NOT PasswordChange).
 #[plugin_fn]
 pub fn capabilities(_input: ()) -> FnResult<Json<CapabilitiesResponse>> {
     Ok(Json(CapabilitiesResponse {
         capabilities: vec![
             "sync".to_string(),
             "ssh".to_string(),
-            "password_change".to_string(),
         ],
     }))
 }

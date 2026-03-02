@@ -7,7 +7,7 @@
 //! The guest crate duplicates these definitions (it cannot share a crate
 //! because it targets `wasm32-wasip1`).  Keep both copies in sync.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,13 +41,32 @@ pub struct StatusResponse {
 // ── Unlock / Lock ────────────────────────────────────────────────
 
 /// Sent to `unlock`.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// `Debug` is manually implemented to redact `password` and
+/// `registration_fields` (which may contain secrets).
+#[derive(Serialize, Deserialize)]
 pub struct UnlockRequest {
     /// The user's master password.
     pub password: String,
     /// Additional registration fields (for first-time setup).
     #[serde(default)]
     pub registration_fields: Option<HashMap<String, String>>,
+}
+
+impl fmt::Debug for UnlockRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnlockRequest")
+            .field("password", &"[REDACTED]")
+            .field(
+                "registration_fields",
+                &self.registration_fields.as_ref().map(|m| {
+                    m.keys()
+                        .map(|k| (k.as_str(), "[REDACTED]"))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .finish()
+    }
 }
 
 /// Returned by `unlock`, `lock`, `sync`.
@@ -125,7 +144,8 @@ pub struct SecretAttrRequest {
 /// Returned by `get_secret_attr`.
 ///
 /// Secret bytes are base64-encoded for JSON transport.
-#[derive(Debug, Serialize, Deserialize)]
+/// `Debug` is manually implemented to redact `value_b64`.
+#[derive(Serialize, Deserialize)]
 pub struct SecretAttrResponse {
     pub ok: bool,
     #[serde(default)]
@@ -135,6 +155,17 @@ pub struct SecretAttrResponse {
     /// Base64-encoded secret bytes.
     #[serde(default)]
     pub value_b64: Option<String>,
+}
+
+impl fmt::Debug for SecretAttrResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretAttrResponse")
+            .field("ok", &self.ok)
+            .field("error", &self.error)
+            .field("error_kind", &self.error_kind)
+            .field("value_b64", &self.value_b64.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 // ── SSH ──────────────────────────────────────────────────────────
@@ -171,7 +202,9 @@ pub struct SshPrivateKeyRequest {
 }
 
 /// Returned by `get_ssh_private_key`.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// `Debug` is manually implemented to redact `pem`.
+#[derive(Serialize, Deserialize)]
 pub struct SshPrivateKeyResponse {
     pub ok: bool,
     #[serde(default)]
@@ -181,6 +214,17 @@ pub struct SshPrivateKeyResponse {
     /// PEM-encoded private key.
     #[serde(default)]
     pub pem: Option<String>,
+}
+
+impl fmt::Debug for SshPrivateKeyResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SshPrivateKeyResponse")
+            .field("ok", &self.ok)
+            .field("error", &self.error)
+            .field("error_kind", &self.error_kind)
+            .field("pem", &self.pem.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 // ── Registration / Auth fields ───────────────────────────────────

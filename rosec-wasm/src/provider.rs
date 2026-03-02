@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use rosec_core::{
     AttributeDescriptor, Attributes, AuthField, AuthFieldKind, Capability, ItemAttributes,
@@ -27,6 +27,15 @@ use crate::protocol::{
 };
 
 // ── Configuration ────────────────────────────────────────────────
+
+/// Default timeout for guest function calls (60 seconds).
+///
+/// This covers the worst-case network latency for operations like
+/// `unlock` and `sync` that hit Bitwarden's API.  If a guest call
+/// exceeds this duration the WASM execution is interrupted via
+/// wasmtime epoch interruption, and the provider returns an error
+/// instead of blocking indefinitely.
+const GUEST_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Configuration for constructing a `WasmProvider`.
 #[derive(Debug, Clone)]
@@ -89,9 +98,23 @@ impl WasmProvider {
     /// The static-lifetime slices are created via `Box::leak`; this is
     /// acceptable because providers live for the process lifetime.
     pub fn new(config: WasmProviderConfig) -> Result<Self, ProviderError> {
+        // Warn if the allowed-hosts list grants unrestricted network access.
+        for host in &config.allowed_hosts {
+            if host.trim() == "*" {
+                warn!(
+                    provider = %config.id,
+                    wasm = %config.wasm_path,
+                    "WASM plugin has unrestricted network access (allowed_hosts contains '*'). \
+                     Consider restricting to specific hosts for security.",
+                );
+                break;
+            }
+        }
+
         let wasm = Wasm::file(&config.wasm_path);
-        let manifest =
-            Manifest::new([wasm]).with_allowed_hosts(config.allowed_hosts.iter().cloned());
+        let manifest = Manifest::new([wasm])
+            .with_allowed_hosts(config.allowed_hosts.iter().cloned())
+            .with_timeout(GUEST_CALL_TIMEOUT);
 
         let mut plugin = Plugin::new(&manifest, [], true).map_err(|e| {
             ProviderError::Other(anyhow::anyhow!(
@@ -211,7 +234,13 @@ impl Provider for WasmProvider {
     }
 
     async fn unlock(&self, input: UnlockInput) -> Result<(), ProviderError> {
-        let req = match &input {
+        // Extract the password (needed for credential persistence key derivation).
+        let password_ref: &Zeroizing<String> = match &input {
+            UnlockInput::Password(pw) => pw,
+            UnlockInput::WithRegistration { password, .. } => password,
+        };
+
+        let mut req = match &input {
             UnlockInput::Password(pw) => UnlockRequest {
                 password: pw.as_str().to_owned(),
                 registration_fields: None,
@@ -230,9 +259,123 @@ impl Provider for WasmProvider {
             },
         };
 
+        let has_registration = req.registration_fields.is_some();
         let mut plugin = self.plugin.lock().await;
-        let resp: SimpleResponse = call_guest_json(&mut plugin, "unlock", &req)?;
+
+        let result: Result<SimpleResponse, ProviderError> =
+            call_guest_json_sensitive(&mut plugin, "unlock", &req);
+
+        // If the guest requires registration and none was provided, try
+        // loading stored credentials from a previous session.
+        let result = match result {
+            Ok(ref resp) if !resp.ok => {
+                let is_reg_required = resp
+                    .error_kind
+                    .as_ref()
+                    .is_some_and(|k| matches!(k, ErrorKind::RegistrationRequired));
+                if is_reg_required && !has_registration {
+                    match crate::wasm_cred::load(&self.config.id, password_ref.as_str()) {
+                        Ok(Some(cred)) => {
+                            debug!(
+                                provider = %self.config.id,
+                                "loaded stored credentials, retrying unlock with registration"
+                            );
+                            let mut reg_fields = HashMap::new();
+                            reg_fields.insert("client_id".to_owned(), cred.client_id.clone());
+                            reg_fields.insert(
+                                "client_secret".to_owned(),
+                                cred.client_secret.as_str().to_owned(),
+                            );
+
+                            // Build a new request with stored registration fields.
+                            let mut retry_req = UnlockRequest {
+                                password: password_ref.as_str().to_owned(),
+                                registration_fields: Some(reg_fields),
+                            };
+
+                            let retry_result: Result<SimpleResponse, ProviderError> =
+                                call_guest_json_sensitive(&mut plugin, "unlock", &retry_req);
+
+                            // Zeroize the retry request fields.
+                            retry_req.password.zeroize();
+                            if let Some(ref mut fields) = retry_req.registration_fields {
+                                for v in fields.values_mut() {
+                                    v.zeroize();
+                                }
+                            }
+
+                            retry_result
+                        }
+                        Ok(None) => {
+                            debug!(
+                                provider = %self.config.id,
+                                "no stored credentials found"
+                            );
+                            result
+                        }
+                        Err(e) => {
+                            // Stored credentials are corrupt or password changed —
+                            // delete them and let the caller handle registration.
+                            warn!(
+                                provider = %self.config.id,
+                                "failed to load stored credentials, clearing: {e}"
+                            );
+                            let _ = crate::wasm_cred::clear(&self.config.id);
+                            result
+                        }
+                    }
+                } else {
+                    result
+                }
+            }
+            _ => result,
+        };
+
+        // Zeroize the original request fields.
+        req.password.zeroize();
+        if let Some(ref mut fields) = req.registration_fields {
+            for v in fields.values_mut() {
+                v.zeroize();
+            }
+        }
+
+        let resp = result?;
         if resp.ok {
+            // If registration fields were provided, persist them for next time.
+            if has_registration
+                && let UnlockInput::WithRegistration {
+                    registration_fields,
+                    ..
+                } = &input
+            {
+                let client_id = registration_fields
+                    .iter()
+                    .find(|(k, _)| k.as_str() == "client_id")
+                    .map(|(_, v)| v.as_str());
+                let client_secret = registration_fields
+                    .iter()
+                    .find(|(k, _)| k.as_str() == "client_secret")
+                    .map(|(_, v)| v.as_str());
+
+                if let (Some(id), Some(secret)) = (client_id, client_secret) {
+                    match crate::wasm_cred::save(&self.config.id, password_ref.as_str(), id, secret)
+                    {
+                        Ok(()) => {
+                            debug!(
+                                provider = %self.config.id,
+                                "saved registration credentials"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                provider = %self.config.id,
+                                "failed to save registration credentials: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+
             // Fire on_unlocked callback.
             if let Ok(cbs) = self.callbacks.read()
                 && let Some(ref cb) = cbs.on_unlocked
@@ -336,11 +479,13 @@ impl Provider for WasmProvider {
         if !resp.ok {
             return Err(map_guest_error(resp.error, resp.error_kind));
         }
-        let b64 = resp.value_b64.ok_or(ProviderError::NotFound)?;
+        let mut b64 = resp.value_b64.ok_or(ProviderError::NotFound)?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&b64)
-            .map_err(|e| ProviderError::Other(anyhow::anyhow!("invalid base64 from guest: {e}")))?;
-        Ok(SecretBytes::new(bytes))
+            .map_err(|e| ProviderError::Other(anyhow::anyhow!("invalid base64 from guest: {e}")));
+        // Zeroize the base64 string — it contained the secret in encoded form.
+        b64.zeroize();
+        Ok(SecretBytes::new(bytes?))
     }
 
     async fn list_ssh_keys(&self) -> Result<Vec<SshKeyMeta>, ProviderError> {
@@ -509,6 +654,37 @@ fn call_guest_json<I: Serialize, O: DeserializeOwned>(
             "failed to deserialize output from {func}: {e}"
         ))
     })
+}
+
+/// Call a guest function with JSON input that may contain secrets.
+///
+/// Like [`call_guest_json`] but zeroizes the serialized input bytes after
+/// the call completes, regardless of success or failure.  Use this for
+/// any guest call whose input contains passwords or other sensitive data.
+fn call_guest_json_sensitive<I: Serialize, O: DeserializeOwned>(
+    plugin: &mut Plugin,
+    func: &str,
+    input: &I,
+) -> Result<O, ProviderError> {
+    let mut input_bytes = serde_json::to_vec(input).map_err(|e| {
+        ProviderError::Other(anyhow::anyhow!("failed to serialize input for {func}: {e}"))
+    })?;
+
+    let result = plugin
+        .call(func, &input_bytes)
+        .map_err(|e| ProviderError::Other(anyhow::anyhow!("WASM call to {func} failed: {e}")))
+        .and_then(|output_bytes: &[u8]| {
+            serde_json::from_slice(output_bytes).map_err(|e| {
+                ProviderError::Other(anyhow::anyhow!(
+                    "failed to deserialize output from {func}: {e}"
+                ))
+            })
+        });
+
+    // Zeroize the JSON buffer that contained the password / secrets.
+    input_bytes.zeroize();
+
+    result
 }
 
 /// Call a guest function with no input (empty bytes), deserialize JSON output.

@@ -29,6 +29,7 @@
 pub mod discovery;
 pub mod protocol;
 mod provider;
+mod wasm_cred;
 
 pub use discovery::PluginRegistry;
 pub use provider::{WasmProvider, WasmProviderConfig};

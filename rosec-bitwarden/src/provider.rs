@@ -1075,11 +1075,7 @@ impl Provider for BitwardenProvider {
     }
 
     fn capabilities(&self) -> &'static [Capability] {
-        &[
-            Capability::Sync,
-            Capability::Ssh,
-            Capability::PasswordChange,
-        ]
+        &[Capability::Sync, Capability::Ssh]
     }
 
     fn set_event_callbacks(&self, callbacks: ProviderCallbacks) -> Result<(), ProviderError> {

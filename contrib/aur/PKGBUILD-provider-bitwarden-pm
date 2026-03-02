@@ -38,12 +38,12 @@ prepare() {
     rustup target add wasm32-wasip1
 
     # Fetch Cargo dependencies for the WASM guest crate
-    cd rosec-bitwarden-wasm
+    cd rosec-bitwarden-pm
     cargo fetch --locked 2>/dev/null || cargo fetch
 }
 
 build() {
-    cd "${srcdir}/${pkgname}/rosec-bitwarden-wasm"
+    cd "${srcdir}/${pkgname}/rosec-bitwarden-pm"
     cargo build --target wasm32-wasip1 --release --locked 2>/dev/null || \
     cargo build --target wasm32-wasip1 --release
 }
@@ -52,8 +52,8 @@ package() {
     cd "${srcdir}/${pkgname}"
 
     # WASM plugin
-    install -Dm644 rosec-bitwarden-wasm/target/wasm32-wasip1/release/rosec_bitwarden_wasm.wasm \
-        "${pkgdir}/usr/lib/rosec/plugins/rosec_bitwarden_wasm.wasm"
+    install -Dm644 rosec-bitwarden-pm/target/wasm32-wasip1/release/rosec_bitwarden_pm.wasm \
+        "${pkgdir}/usr/lib/rosec/plugins/rosec_bitwarden_pm.wasm"
 
     # Docs
     install -Dm644 README.md \

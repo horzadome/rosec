@@ -97,7 +97,7 @@ build-release:
 
 # Build WASM provider plugins (requires wasm32-wasip1 target)
 build-wasm:
-  cargo build --target wasm32-wasip1 --release --manifest-path rosec-bitwarden-wasm/Cargo.toml
+  cargo build --target wasm32-wasip1 --release --manifest-path rosec-bitwarden-pm/Cargo.toml
 
 # Run all tests
 test:

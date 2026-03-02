@@ -15,7 +15,7 @@ members = [
     "rosec-wasm",
 ]
 exclude = [
-    "rosec-bitwarden-wasm",
+    "rosec-bitwarden-pm",
 ]
 
 [workspace.package]

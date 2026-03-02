@@ -28,7 +28,7 @@ source=(
 sha256sums=('@WASM_SHA256@')
 
 package() {
-    # The tarball contains rosec_bitwarden_wasm.wasm at the root
-    install -Dm644 "${srcdir}/rosec_bitwarden_wasm.wasm" \
-        "${pkgdir}/usr/lib/rosec/plugins/rosec_bitwarden_wasm.wasm"
+    # The tarball contains rosec_bitwarden_pm.wasm at the root
+    install -Dm644 "${srcdir}/rosec_bitwarden_pm.wasm" \
+        "${pkgdir}/usr/lib/rosec/plugins/rosec_bitwarden_pm.wasm"
 }
