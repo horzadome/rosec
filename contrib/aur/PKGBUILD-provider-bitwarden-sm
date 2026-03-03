@@ -1,14 +1,14 @@
 # Maintainer: John Mylchreest <jmylchreest@gmail.com>
 #
-# AUR package: rosec-provider-bitwarden-pm
+# AUR package: rosec-provider-bitwarden-sm
 #
-# Builds the Bitwarden Password Manager WASM provider for rosec from
+# Builds the Bitwarden Secrets Manager WASM provider for rosec from
 # source. Requires the wasm32-wasip1 Rust target.
 
-pkgname=rosec-provider-bitwarden-pm
+pkgname=rosec-provider-bitwarden-sm
 pkgver=r0.unknown
 pkgrel=1
-pkgdesc="Bitwarden Password Manager provider for rosec"
+pkgdesc="Bitwarden Secrets Manager provider for rosec"
 arch=('any')
 url="https://github.com/jmylchreest/rosec"
 license=('MIT')
@@ -19,8 +19,8 @@ makedepends=(
     'rust'
     'cargo'
 )
-provides=('rosec-provider-bitwarden-pm')
-conflicts=('rosec-provider-bitwarden-pm-bin')
+provides=('rosec-provider-bitwarden-sm')
+conflicts=('rosec-provider-bitwarden-sm-bin')
 
 source=("${pkgname}::git+https://github.com/jmylchreest/rosec.git")
 sha256sums=('SKIP')
@@ -38,12 +38,12 @@ prepare() {
     rustup target add wasm32-wasip1
 
     # Fetch Cargo dependencies for the WASM guest crate
-    cd rosec-bitwarden-pm
+    cd rosec-bitwarden-sm
     cargo fetch --locked 2>/dev/null || cargo fetch
 }
 
 build() {
-    cd "${srcdir}/${pkgname}/rosec-bitwarden-pm"
+    cd "${srcdir}/${pkgname}/rosec-bitwarden-sm"
     cargo build --target wasm32-wasip1 --release --locked 2>/dev/null || \
     cargo build --target wasm32-wasip1 --release
 }
@@ -51,8 +51,8 @@ build() {
 package() {
     cd "${srcdir}/${pkgname}"
 
-    install -Dm644 rosec-bitwarden-pm/target/wasm32-wasip1/release/rosec_bitwarden_pm.wasm \
-        "${pkgdir}/usr/lib/rosec/providers/rosec_bitwarden_pm.wasm"
+    install -Dm644 rosec-bitwarden-sm/target/wasm32-wasip1/release/rosec_bitwarden_sm.wasm \
+        "${pkgdir}/usr/lib/rosec/providers/rosec_bitwarden_sm.wasm"
 
     install -Dm644 README.md \
         "${pkgdir}/usr/share/doc/${pkgname}/README.md"

@@ -3,7 +3,7 @@
 # AUR package: rosec-provider-bitwarden-pm-bin
 #
 # This PKGBUILD installs the pre-built Bitwarden Password Manager WASM
-# provider plugin for rosec from the GitHub release.
+# provider for rosec from the GitHub release.
 # The release workflow renders this file by substituting @VERSION@ and
 # @WASM_SHA256@ before committing to the AUR.
 #
@@ -12,7 +12,7 @@
 pkgname=rosec-provider-bitwarden-pm-bin
 pkgver=@VERSION@
 pkgrel=1
-pkgdesc="Bitwarden Password Manager provider plugin for rosec (prebuilt)"
+pkgdesc="Bitwarden Password Manager provider for rosec (prebuilt)"
 arch=('any')
 url="https://github.com/jmylchreest/rosec"
 license=('MIT')
@@ -28,7 +28,6 @@ source=(
 sha256sums=('@WASM_SHA256@')
 
 package() {
-    # The tarball contains rosec_bitwarden_pm.wasm at the root
     install -Dm644 "${srcdir}/rosec_bitwarden_pm.wasm" \
-        "${pkgdir}/usr/lib/rosec/plugins/rosec_bitwarden_pm.wasm"
+        "${pkgdir}/usr/lib/rosec/providers/rosec_bitwarden_pm.wasm"
 }
