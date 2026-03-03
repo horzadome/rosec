@@ -1,22 +1,39 @@
-//! rosec-pam-unlock — pam_exec hook for auto-unlocking rosec vaults at login.
+//! rosec-pam-unlock — pam_exec hook for unlocking rosec vaults on screen unlock.
 //!
 //! This binary is intended to be invoked by `pam_exec.so` with the
-//! `expose_authtok` option, which provides the user's login password on
-//! stdin (null-terminated).
+//! `expose_authtok` option, which provides the user's password on stdin
+//! (null-terminated).
 //!
 //! It connects to the D-Bus session bus, enumerates locked vault providers,
-//! and attempts to unlock each one using the login password via the
+//! and attempts to unlock each one using the supplied password via the
 //! `AuthProviderFromPipe` method on `org.rosec.Daemon`.  The password is
 //! passed through a pipe fd (SCM_RIGHTS), never as a D-Bus message payload,
 //! so it is invisible to `dbus-monitor`.
 //!
+//! # Scope: screen unlock only, not initial login
+//!
+//! This helper only works during **re-authentication** (screen unlock), not at
+//! initial login.  At initial login the user's D-Bus session bus does not exist
+//! yet and rosecd has not started, so `$DBUS_SESSION_BUS_ADDRESS` is unset and
+//! the connection will fail.  The helper returns `PAM_IGNORE` silently in that
+//! case, which means login is never blocked — vaults simply remain locked until
+//! the user unlocks them interactively (e.g. via `rosec provider auth`).
+//!
+//! For screen-unlock use, rosecd is already running and the session bus is
+//! available, so the helper can connect, pass the password through the pipe,
+//! and have the daemon unlock the vaults transparently.
+//!
 //! # PAM configuration
 //!
-//! Add to the appropriate PAM config (e.g. `/etc/pam.d/system-login`):
+//! Add to the appropriate PAM config for your screen locker
+//! (e.g. `/etc/pam.d/hyprlock`, `/etc/pam.d/swaylock`):
 //!
 //! ```text
 //! auth  optional  pam_exec.so  expose_authtok quiet /usr/lib/rosec/rosec-pam-unlock
 //! ```
+//!
+//! Do NOT add this to `/etc/pam.d/system-login` or `/etc/pam.d/login` —
+//! it will silently fail there (PAM_IGNORE) and has no effect at initial login.
 //!
 //! # Security
 //!

@@ -3542,16 +3542,16 @@ Restart=on-failure
 RestartSec=5
 
 NoNewPrivileges=yes
-ProtectHome=read-only
 ProtectSystem=strict
-ReadWritePaths=%h/.config/rosec %h/.local/share/rosec %h/.local/state/rosec
+ReadWritePaths=%h/.config/rosec %h/.local/share/rosec
 PrivateTmp=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
-MemoryDenyWriteExecute=yes
+# MemoryDenyWriteExecute is intentionally omitted: wasmtime's JIT compiler
+# requires the ability to map pages as both writable and executable.
 PrivateNetwork=no
 Environment=RUST_LOG=info
 
@@ -3718,7 +3718,11 @@ fn cmd_enable(args: &[String]) -> Result<()> {
 
     println!();
     println!("rosec is now enabled as the Secret Service provider.");
-    println!("Run `rosec status` to verify.");
+    println!();
+    println!("Note: the D-Bus mask prevents future auto-activation of competing providers,");
+    println!("but cannot stop one that is already running (e.g. started by your compositor");
+    println!("autostart config). If another Secret Service daemon is running, remove it");
+    println!("from your autostart and log out/in for rosec to take effect.");
     Ok(())
 }
 

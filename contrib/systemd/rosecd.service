@@ -33,12 +33,11 @@ RestartSec=5
 # --------------------------------------------------------------------------
 NoNewPrivileges=yes
 
-# rosecd needs read access to $HOME for its config and credential store.
-ProtectHome=read-only
-
 # The filesystem is read-only except for the user's XDG data directories.
+# Note: ProtectHome=read-only is intentionally omitted — it conflicts with
+# ProtectSystem=strict + ReadWritePaths and produces misleading behaviour.
 ProtectSystem=strict
-ReadWritePaths=%h/.config/rosec %h/.local/share/rosec %h/.local/state/rosec
+ReadWritePaths=%h/.config/rosec %h/.local/share/rosec
 
 PrivateTmp=yes
 ProtectKernelTunables=yes
@@ -47,9 +46,8 @@ ProtectControlGroups=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 
-# Secrets are kept in mlock'd memory pages.  Deny W^X so injected
-# shellcode cannot be made executable.
-MemoryDenyWriteExecute=yes
+# MemoryDenyWriteExecute is intentionally omitted: wasmtime's JIT compiler
+# requires the ability to map pages as both writable and executable.
 
 # Allow outbound network for Bitwarden API calls.
 PrivateNetwork=no
