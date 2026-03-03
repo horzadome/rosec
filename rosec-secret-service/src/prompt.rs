@@ -124,7 +124,8 @@ impl SecretPrompt {
         #[zbus(signal_emitter)] ctxt: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
         self.state.cancel_prompt(&self.path);
-        Self::completed(&ctxt, true, &zvariant::Value::from(to_object_path("/")))
+        // Dismissed result is an empty string per the Secret Service spec.
+        Self::completed(&ctxt, true, &zvariant::Value::from(""))
             .await
             .map_err(|e| zbus::fdo::Error::Failed(format!("signal: {e}")))?;
         Ok(())
@@ -158,10 +159,10 @@ async fn run_prompt_task(
     const MAX_ATTEMPTS: u32 = 3;
 
     // Inline helper: emit Completed(dismissed=true).
+    // Per the Secret Service spec the result variant for a dismissed prompt
+    // is an empty string "s" — not an object path.
     async fn emit_dismissed(ctxt: &SignalEmitter<'_>) {
-        if let Err(e) =
-            SecretPrompt::completed(ctxt, true, &zvariant::Value::from(to_object_path("/"))).await
-        {
+        if let Err(e) = SecretPrompt::completed(ctxt, true, &zvariant::Value::from("")).await {
             tracing::debug!(error = %e, "failed to emit Completed(dismissed)");
         }
     }
@@ -255,10 +256,12 @@ async fn run_prompt_task(
                         item_path,
                     }) => execute_deferred_delete(&state, &pid, &item_id, &item_path).await,
                     Some(PendingOperation::Unlock) | None => {
-                        // Plain unlock — return the collection path.
-                        Some(zvariant::Value::from(to_object_path(
+                        // Plain unlock — return ao (array of object paths) of the
+                        // unlocked collection, per the Secret Service spec.
+                        // Clients such as Signal expect ao, not a bare o.
+                        Some(zvariant::Value::from(vec![to_object_path(
                             "/org/freedesktop/secrets/collection/default",
-                        )))
+                        )]))
                     }
                 };
 

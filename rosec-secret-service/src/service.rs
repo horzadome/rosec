@@ -185,7 +185,10 @@ impl SecretService {
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(), FdoError> {
         log_caller("SetAlias", &header);
-        Err(FdoError::NotSupported("read-only".to_string()))
+        // No-op: we always serve a single default collection and do not support
+        // mutable aliases.  Returning NotSupported breaks clients (e.g. GNOME
+        // apps) that call SetAlias as part of normal startup — silently succeed.
+        Ok(())
     }
 
     async fn lock(
@@ -315,11 +318,22 @@ impl SecretService {
     fn create_collection(
         &self,
         _properties: HashMap<String, zvariant::Value<'_>>,
-        _alias: String,
+        alias: String,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), FdoError> {
         log_caller("CreateCollection", &header);
-        Err(FdoError::NotSupported("read-only".to_string()))
+        // We don't support creating new collections, but returning NotSupported
+        // breaks clients that call CreateCollection("", "default") at startup.
+        // Return the existing default collection with no prompt needed, which
+        // is spec-compliant behaviour for when the requested alias already exists.
+        let collection = if alias == "default" || alias.is_empty() {
+            to_object_path("/org/freedesktop/secrets/collection/default")
+        } else {
+            // For named aliases we don't support, return "/" + no prompt —
+            // the client can inspect the returned "/" path to know it failed.
+            to_object_path("/")
+        };
+        Ok((collection, to_object_path("/")))
     }
 }
 
