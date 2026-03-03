@@ -17,14 +17,13 @@ url="https://github.com/jmylchreest/rosec"
 license=('MIT')
 depends=(
     'dbus'
-    'libsecret'   # optional: used by clients that talk to the daemon
 )
 optdepends=(
     'libnotify: desktop notifications on lock/unlock'
     'pam: PAM auto-unlock support via rosec-pam-unlock'
 )
-provides=('rosec' 'secret-service')
-conflicts=('rosec' 'gnome-keyring' 'keepassxc')
+provides=('rosec' 'org.freedesktop.secrets')
+conflicts=('rosec')
 install=rosec.install
 
 source_x86_64=(
@@ -50,23 +49,24 @@ package() {
     install -Dm755 "${srcdir_inner}/rosec-pam-unlock" \
         "${pkgdir}/usr/lib/rosec/rosec-pam-unlock"
 
-    # systemd user units
+    # Service activation files (shipped as reference examples — use
+    # `rosec enable` to generate them with correct binary paths at runtime)
     install -Dm644 "${srcdir_inner}/contrib/systemd/rosecd.service" \
-        "${pkgdir}/usr/lib/systemd/user/rosecd.service"
+        "${pkgdir}/usr/share/doc/${pkgname}/systemd/rosecd.service"
     install -Dm644 "${srcdir_inner}/contrib/systemd/rosecd.socket" \
-        "${pkgdir}/usr/lib/systemd/user/rosecd.socket"
-
-    # D-Bus session activation
+        "${pkgdir}/usr/share/doc/${pkgname}/systemd/rosecd.socket"
     install -Dm644 "${srcdir_inner}/contrib/dbus/org.freedesktop.secrets.service" \
-        "${pkgdir}/usr/share/dbus-1/services/org.freedesktop.secrets.service"
+        "${pkgdir}/usr/share/doc/${pkgname}/dbus/org.freedesktop.secrets.service"
     install -Dm644 "${srcdir_inner}/contrib/dbus/org.gnome.keyring.service" \
-        "${pkgdir}/usr/share/dbus-1/services/org.gnome.keyring.service"
-
-    # XDG autostart (for non-systemd compositors)
+        "${pkgdir}/usr/share/doc/${pkgname}/dbus/org.gnome.keyring.service"
     install -Dm644 "${srcdir_inner}/contrib/autostart/rosecd.desktop" \
-        "${pkgdir}/etc/xdg/autostart/rosecd.desktop"
+        "${pkgdir}/usr/share/doc/${pkgname}/autostart/rosecd.desktop"
 
-    # License
+    # Docs
     install -Dm644 "${srcdir_inner}/README.md" \
         "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+
+    # License
+    install -Dm644 "${srcdir_inner}/LICENSE" \
+        "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

@@ -1,65 +1,96 @@
 # Maintainer: John Mylchreest <jmylchreest@gmail.com>
 #
-# AUR package: rosec
+# AUR split package: rosec + rosec-provider-bitwarden-pm
+#                          + rosec-provider-bitwarden-sm
 #
-# Builds rosec from source.
-# Use this package for a source-based build of rosec.
+# Builds rosec and all WASM providers from source in a single build step.
 
-pkgname=rosec
+pkgbase=rosec
+pkgname=(
+    'rosec'
+    'rosec-provider-bitwarden-pm'
+    'rosec-provider-bitwarden-sm'
+)
 pkgver=r0.unknown
 pkgrel=1
 pkgdesc="Read-only Secret Service daemon with Bitwarden backend"
 arch=('x86_64' 'aarch64')
 url="https://github.com/jmylchreest/rosec"
 license=('MIT')
-depends=(
-    'dbus'
-)
+# Disable GCC LTO: makepkg appends -flto=auto to CFLAGS which produces
+# GCC LTO IR in vendored C static libs (zstd, ittapi, wasmtime helpers).
+# rust-lld cannot link GCC LTO objects, causing undefined symbol errors.
+# Rust has its own LTO via codegen-units/lto profile settings.
+options=(!lto)
 makedepends=(
+    'git'
     'rust'
     'cargo'
     'pkg-config'
+    'dbus'
 )
-optdepends=(
-    'libnotify: desktop notifications on lock/unlock'
-    'pam: PAM auto-unlock support via rosec-pam-unlock'
-)
-provides=('secret-service')
-conflicts=('rosec-bin' 'gnome-keyring' 'keepassxc')
-install=rosec.install
 
-source=("${pkgname}::git+https://github.com/jmylchreest/rosec.git")
+source=("${pkgbase}::git+https://github.com/jmylchreest/rosec.git")
 sha256sums=('SKIP')
 
 pkgver() {
-    cd "${srcdir}/${pkgname}"
-    # Output: r<commit_count>.<short_hash>
+    cd "${srcdir}/${pkgbase}"
     printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 prepare() {
-    cd "${srcdir}/${pkgname}"
-    # Fetch all Cargo dependencies into a local cache so the build is
-    # reproducible and does not require internet access at build time.
+    cd "${srcdir}/${pkgbase}"
+
+    # Ensure the WASM target is available for provider builds
+    rustup target add wasm32-wasip1
+
+    # Fetch workspace dependencies
+    cargo fetch --locked 2>/dev/null || cargo fetch
+
+    # Fetch dependencies for the out-of-workspace WASM guest crates
+    cd "${srcdir}/${pkgbase}/rosec-bitwarden-pm"
+    cargo fetch --locked 2>/dev/null || cargo fetch
+
+    cd "${srcdir}/${pkgbase}/rosec-bitwarden-sm"
     cargo fetch --locked 2>/dev/null || cargo fetch
 }
 
 build() {
-    cd "${srcdir}/${pkgname}"
-
-    export RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+    # Build native binaries (rosecd, rosec, rosec-pam-unlock)
+    cd "${srcdir}/${pkgbase}"
     cargo build --release --locked --bin rosecd --bin rosec --bin rosec-pam-unlock 2>/dev/null || \
     cargo build --release         --bin rosecd --bin rosec --bin rosec-pam-unlock
+
+    # Build WASM providers
+    cd "${srcdir}/${pkgbase}/rosec-bitwarden-pm"
+    cargo build --target wasm32-wasip1 --release --locked 2>/dev/null || \
+    cargo build --target wasm32-wasip1 --release
+
+    cd "${srcdir}/${pkgbase}/rosec-bitwarden-sm"
+    cargo build --target wasm32-wasip1 --release --locked 2>/dev/null || \
+    cargo build --target wasm32-wasip1 --release
 }
 
 check() {
-    cd "${srcdir}/${pkgname}"
+    cd "${srcdir}/${pkgbase}"
     cargo test --release --locked --workspace 2>/dev/null || \
     cargo test --release          --workspace
 }
 
-package() {
-    cd "${srcdir}/${pkgname}"
+package_rosec() {
+    pkgdesc="Read-only Secret Service daemon with Bitwarden backend"
+    depends=('dbus')
+    optdepends=(
+        'rosec-provider-bitwarden-pm: Bitwarden Password Manager provider'
+        'rosec-provider-bitwarden-sm: Bitwarden Secrets Manager provider'
+        'libnotify: desktop notifications on lock/unlock'
+        'pam: PAM auto-unlock support via rosec-pam-unlock'
+    )
+    provides=('org.freedesktop.secrets')
+    conflicts=('rosec-bin')
+    install=rosec.install
+
+    cd "${srcdir}/${pkgbase}"
 
     # Binaries
     install -Dm755 target/release/rosecd "${pkgdir}/usr/bin/rosecd"
@@ -69,23 +100,54 @@ package() {
     install -Dm755 target/release/rosec-pam-unlock \
         "${pkgdir}/usr/lib/rosec/rosec-pam-unlock"
 
-    # systemd user units
+    # Service activation files (shipped as reference examples — use
+    # `rosec enable` to generate them with correct binary paths at runtime)
     install -Dm644 contrib/systemd/rosecd.service \
-        "${pkgdir}/usr/lib/systemd/user/rosecd.service"
+        "${pkgdir}/usr/share/doc/rosec/systemd/rosecd.service"
     install -Dm644 contrib/systemd/rosecd.socket \
-        "${pkgdir}/usr/lib/systemd/user/rosecd.socket"
-
-    # D-Bus session activation
+        "${pkgdir}/usr/share/doc/rosec/systemd/rosecd.socket"
     install -Dm644 contrib/dbus/org.freedesktop.secrets.service \
-        "${pkgdir}/usr/share/dbus-1/services/org.freedesktop.secrets.service"
+        "${pkgdir}/usr/share/doc/rosec/dbus/org.freedesktop.secrets.service"
     install -Dm644 contrib/dbus/org.gnome.keyring.service \
-        "${pkgdir}/usr/share/dbus-1/services/org.gnome.keyring.service"
-
-    # XDG autostart (for non-systemd compositors)
+        "${pkgdir}/usr/share/doc/rosec/dbus/org.gnome.keyring.service"
     install -Dm644 contrib/autostart/rosecd.desktop \
-        "${pkgdir}/etc/xdg/autostart/rosecd.desktop"
+        "${pkgdir}/usr/share/doc/rosec/autostart/rosecd.desktop"
 
     # Docs
     install -Dm644 README.md \
         "${pkgdir}/usr/share/doc/rosec/README.md"
+
+    # License
+    install -Dm644 LICENSE \
+        "${pkgdir}/usr/share/licenses/rosec/LICENSE"
+}
+
+package_rosec-provider-bitwarden-pm() {
+    pkgdesc="Bitwarden Password Manager provider for rosec"
+    arch=('any')
+    depends=('rosec')
+    conflicts=('rosec-provider-bitwarden-pm-bin')
+
+    cd "${srcdir}/${pkgbase}"
+
+    install -Dm644 rosec-bitwarden-pm/target/wasm32-wasip1/release/rosec_bitwarden_pm.wasm \
+        "${pkgdir}/usr/lib/rosec/providers/rosec_bitwarden_pm.wasm"
+
+    install -Dm644 LICENSE \
+        "${pkgdir}/usr/share/licenses/rosec-provider-bitwarden-pm/LICENSE"
+}
+
+package_rosec-provider-bitwarden-sm() {
+    pkgdesc="Bitwarden Secrets Manager provider for rosec"
+    arch=('any')
+    depends=('rosec')
+    conflicts=('rosec-provider-bitwarden-sm-bin')
+
+    cd "${srcdir}/${pkgbase}"
+
+    install -Dm644 rosec-bitwarden-sm/target/wasm32-wasip1/release/rosec_bitwarden_sm.wasm \
+        "${pkgdir}/usr/lib/rosec/providers/rosec_bitwarden_sm.wasm"
+
+    install -Dm644 LICENSE \
+        "${pkgdir}/usr/share/licenses/rosec-provider-bitwarden-sm/LICENSE"
 }

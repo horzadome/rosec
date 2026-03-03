@@ -35,6 +35,8 @@ async fn main() -> Result<()> {
         "inspect" => cmd_inspect(&args[1..]).await,
         "lock" => cmd_lock().await,
         "unlock" => cmd_unlock().await,
+        "enable" => cmd_enable(&args[1..]),
+        "disable" => cmd_disable(&args[1..]),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -81,6 +83,8 @@ COMMANDS:
     inspect <id>                        Show full item detail: label, attributes, secret
     lock                                Lock all providers
     unlock                              Unlock (triggers GUI/TTY prompt)
+    enable [flags]                      Activate rosec as the Secret Service provider
+    disable [flags]                     Deactivate rosec (remove D-Bus overrides)
     help                                Show this help
 
 PROVIDER KINDS:
@@ -147,7 +151,12 @@ EXAMPLES:
     rosec inspect -s a1b2c3d4e5f60718                       # sync/unlock then inspect
     rosec inspect -s --all-attrs a1b2c3d4e5f60718           # include sensitive attrs (password, totp…)
     rosec inspect --all-attrs --format=json a1b2c3d4e5f60718 # JSON with all attrs
-    rosec inspect /org/freedesktop/secrets/collection/default/… # full D-Bus path"
+    rosec inspect /org/freedesktop/secrets/collection/default/… # full D-Bus path
+
+    rosec enable                                            # activate rosec as Secret Service
+    rosec enable --no-mask                                  # don't mask gnome-keyring
+    rosec enable --no-systemd                               # skip systemd enable/start
+    rosec disable                                           # deactivate, restore gnome-keyring"
     );
 }
 
@@ -3384,4 +3393,496 @@ fn cmd_config_set(key: &str, value: &str) -> Result<()> {
 
     println!("{key} = {value}");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// rosec enable / disable — manage D-Bus activation + systemd unit files
+// ---------------------------------------------------------------------------
+
+/// File names we manage.
+const DBUS_SECRETS_SERVICE: &str = "org.freedesktop.secrets.service";
+const DBUS_KEYRING_SERVICE: &str = "org.gnome.keyring.service";
+const SYSTEMD_SERVICE_UNIT: &str = "rosecd.service";
+const SYSTEMD_SOCKET_UNIT: &str = "rosecd.socket";
+
+/// Known Secret Service providers that may already own the bus name.
+const KNOWN_PROVIDERS: &[(&str, &str)] = &[
+    (
+        "gnome-keyring",
+        "/usr/share/dbus-1/services/org.freedesktop.secrets.service",
+    ),
+    (
+        "gnome-keyring",
+        "/usr/share/dbus-1/services/org.gnome.keyring.service",
+    ),
+    (
+        "kwallet/ksecretd",
+        "/usr/share/dbus-1/services/org.kde.secretservicecompat.service",
+    ),
+    (
+        "keepassxc",
+        "/usr/share/dbus-1/services/org.keepassxc.KeePassXC.BrowserServer.service",
+    ),
+];
+
+/// Return `~/.local/share/dbus-1/services/`.
+fn user_dbus_services_dir() -> Result<std::path::PathBuf> {
+    let data_home = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
+            PathBuf::from(home).join(".local/share")
+        });
+    Ok(data_home.join("dbus-1/services"))
+}
+
+/// Return `~/.config/systemd/user/`.
+fn user_systemd_dir() -> Result<std::path::PathBuf> {
+    let config_home = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
+            PathBuf::from(home).join(".config")
+        });
+    Ok(config_home.join("systemd/user"))
+}
+
+/// Resolve the absolute path to `rosecd`.
+///
+/// Strategy:
+///   1. Sibling of the current executable (same directory as `rosec`).
+///   2. Fall back to `$PATH` lookup via `which rosecd`.
+///   3. Error if neither works.
+fn resolve_rosecd() -> Result<PathBuf> {
+    // Try sibling of current executable.
+    if let Ok(self_exe) = std::env::current_exe() {
+        let candidate = self_exe
+            .canonicalize()
+            .unwrap_or(self_exe)
+            .parent()
+            .map(|dir| dir.join("rosecd"));
+        if let Some(p) = candidate
+            && p.is_file()
+        {
+            return Ok(p);
+        }
+    }
+
+    // Fall back to $PATH.
+    let output = std::process::Command::new("which").arg("rosecd").output();
+    if let Ok(out) = output
+        && out.status.success()
+    {
+        let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !path_str.is_empty() {
+            let p = PathBuf::from(&path_str);
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+    }
+
+    bail!(
+        "could not locate rosecd binary.\n\
+         Ensure rosecd is installed and either:\n\
+         - in the same directory as rosec, or\n\
+         - on your $PATH"
+    )
+}
+
+/// Detect which Secret Service providers already have system-wide D-Bus
+/// activation files installed.
+fn detect_existing_providers() -> Vec<(&'static str, &'static str)> {
+    KNOWN_PROVIDERS
+        .iter()
+        .filter(|(_, path)| std::path::Path::new(path).exists())
+        .copied()
+        .collect()
+}
+
+/// Generate D-Bus service file contents with the resolved binary path.
+fn gen_dbus_secrets_service(rosecd: &std::path::Path) -> String {
+    format!(
+        "\
+[D-BUS Service]
+Name=org.freedesktop.secrets
+Exec={rosecd}
+SystemdService=rosecd.service
+",
+        rosecd = rosecd.display()
+    )
+}
+
+/// Generate the gnome-keyring mask file contents.
+fn gen_dbus_keyring_mask() -> &'static str {
+    "\
+[D-BUS Service]
+Name=org.gnome.keyring
+Exec=/bin/false
+"
+}
+
+/// Generate systemd user service unit with the resolved binary path.
+fn gen_systemd_service(rosecd: &std::path::Path) -> String {
+    format!(
+        "\
+[Unit]
+Description=rosec - read-only Secret Service daemon
+Documentation=https://github.com/jmylchreest/rosec
+After=dbus.service
+Requires=dbus.service
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.secrets
+ExecStart={rosecd}
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=%h/.config/rosec %h/.local/share/rosec %h/.local/state/rosec
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+PrivateNetwork=no
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target
+Also=rosecd.socket
+",
+        rosecd = rosecd.display()
+    )
+}
+
+/// Generate systemd user socket unit (path-independent).
+fn gen_systemd_socket() -> &'static str {
+    "\
+[Unit]
+Description=rosec Secret Service socket
+Documentation=https://github.com/jmylchreest/rosec
+
+[Socket]
+ListenStream=%t/rosec/secrets.socket
+DirectoryMode=0700
+Accept=no
+
+[Install]
+WantedBy=sockets.target
+"
+}
+
+/// Write a file, creating parent directories as needed. Returns Ok(true) if
+/// written, Ok(false) if the file already has identical contents (skip).
+fn install_file(path: &std::path::Path, contents: &str) -> Result<bool> {
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && existing == contents
+    {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, contents)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+    Ok(true)
+}
+
+/// Remove a file if it exists. Returns whether a file was actually removed.
+fn remove_file_if_exists(path: &std::path::Path) -> Result<bool> {
+    if path.exists() {
+        std::fs::remove_file(path)
+            .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", path.display()))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn cmd_enable(args: &[String]) -> Result<()> {
+    let mut enable_systemd = true;
+    let mut no_mask = false;
+    let mut force = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "--no-systemd" => enable_systemd = false,
+            "--no-mask" => no_mask = true,
+            "--force" | "-f" => force = true,
+            "--help" | "-h" => {
+                print_enable_help();
+                return Ok(());
+            }
+            other => bail!("unknown flag: {other}\nrun `rosec enable --help` for usage"),
+        }
+    }
+
+    // --- resolve rosecd binary path ------------------------------------------
+
+    let rosecd = resolve_rosecd()?;
+    println!("using rosecd: {}", rosecd.display());
+
+    let dbus_dir = user_dbus_services_dir()?;
+    let systemd_dir = user_systemd_dir()?;
+    let secrets_path = dbus_dir.join(DBUS_SECRETS_SERVICE);
+    let keyring_path = dbus_dir.join(DBUS_KEYRING_SERVICE);
+    let service_path = systemd_dir.join(SYSTEMD_SERVICE_UNIT);
+    let socket_path = systemd_dir.join(SYSTEMD_SOCKET_UNIT);
+
+    // --- pre-flight checks ---------------------------------------------------
+
+    if secrets_path.exists() && !force {
+        let existing = std::fs::read_to_string(&secrets_path).unwrap_or_default();
+        if existing.contains("rosecd") {
+            println!("rosec is already enabled ({})", secrets_path.display());
+            println!("run `rosec enable --force` to overwrite");
+            return Ok(());
+        }
+        bail!(
+            "{} already exists but points to another service.\n\
+             Use `rosec enable --force` to overwrite it.",
+            secrets_path.display()
+        );
+    }
+
+    // Report detected providers.
+    let existing = detect_existing_providers();
+    if !existing.is_empty() {
+        println!("Detected existing Secret Service providers:");
+        for (name, path) in &existing {
+            println!("  {name:<20} {path}");
+        }
+        println!();
+        let has_gnome_keyring = existing.iter().any(|(n, _)| *n == "gnome-keyring");
+        if has_gnome_keyring && !no_mask {
+            println!(
+                "gnome-keyring will be masked via user-local D-Bus override.\n\
+                 (pass --no-mask to skip masking)"
+            );
+        }
+        println!();
+    }
+
+    // --- install D-Bus service files -----------------------------------------
+
+    let contents = gen_dbus_secrets_service(&rosecd);
+    if install_file(&secrets_path, &contents)? {
+        println!("installed {}", secrets_path.display());
+    } else {
+        println!("unchanged {}", secrets_path.display());
+    }
+
+    // Write gnome-keyring mask (unless --no-mask).
+    if !no_mask {
+        let has_gnome_keyring = existing.iter().any(|(n, _)| *n == "gnome-keyring");
+        if has_gnome_keyring || force {
+            let mask = gen_dbus_keyring_mask();
+            if install_file(&keyring_path, mask)? {
+                println!("installed {} (masks gnome-keyring)", keyring_path.display());
+            } else {
+                println!("unchanged {}", keyring_path.display());
+            }
+        }
+    }
+
+    // --- install systemd user units ------------------------------------------
+
+    if enable_systemd {
+        let svc_contents = gen_systemd_service(&rosecd);
+        if install_file(&service_path, &svc_contents)? {
+            println!("installed {}", service_path.display());
+        } else {
+            println!("unchanged {}", service_path.display());
+        }
+
+        let sock_contents = gen_systemd_socket();
+        if install_file(&socket_path, sock_contents)? {
+            println!("installed {}", socket_path.display());
+        } else {
+            println!("unchanged {}", socket_path.display());
+        }
+
+        // Reload, then enable + start.
+        run_systemctl(&["daemon-reload"]);
+        run_systemctl(&["enable", "--now", "rosecd.service"]);
+    }
+
+    println!();
+    println!("rosec is now enabled as the Secret Service provider.");
+    println!("Run `rosec status` to verify.");
+    Ok(())
+}
+
+fn cmd_disable(args: &[String]) -> Result<()> {
+    let mut disable_systemd = true;
+
+    for arg in args {
+        match arg.as_str() {
+            "--no-systemd" => disable_systemd = false,
+            "--help" | "-h" => {
+                print_disable_help();
+                return Ok(());
+            }
+            other => bail!("unknown flag: {other}\nrun `rosec disable --help` for usage"),
+        }
+    }
+
+    let dbus_dir = user_dbus_services_dir()?;
+    let systemd_dir = user_systemd_dir()?;
+    let secrets_path = dbus_dir.join(DBUS_SECRETS_SERVICE);
+    let keyring_path = dbus_dir.join(DBUS_KEYRING_SERVICE);
+    let service_path = systemd_dir.join(SYSTEMD_SERVICE_UNIT);
+    let socket_path = systemd_dir.join(SYSTEMD_SOCKET_UNIT);
+
+    let mut removed_any = false;
+
+    // --- systemd: stop + disable first (before removing unit files) -----------
+
+    if disable_systemd {
+        run_systemctl(&["disable", "--now", "rosecd.service"]);
+        run_systemctl(&["disable", "--now", "rosecd.socket"]);
+    }
+
+    // --- remove D-Bus service files ------------------------------------------
+
+    if remove_file_if_exists(&secrets_path)? {
+        println!("removed {}", secrets_path.display());
+        removed_any = true;
+    }
+
+    if keyring_path.exists() {
+        let contents = std::fs::read_to_string(&keyring_path).unwrap_or_default();
+        if contents.contains("/bin/false") {
+            std::fs::remove_file(&keyring_path)
+                .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", keyring_path.display()))?;
+            println!("removed {} (gnome-keyring mask)", keyring_path.display());
+            removed_any = true;
+        } else {
+            eprintln!(
+                "warning: {} does not look like a rosec mask file, leaving it alone",
+                keyring_path.display()
+            );
+        }
+    }
+
+    // --- remove systemd unit files -------------------------------------------
+
+    if disable_systemd {
+        if remove_file_if_exists(&service_path)? {
+            println!("removed {}", service_path.display());
+            removed_any = true;
+        }
+        if remove_file_if_exists(&socket_path)? {
+            println!("removed {}", socket_path.display());
+            removed_any = true;
+        }
+        run_systemctl(&["daemon-reload"]);
+    }
+
+    if !removed_any {
+        println!("rosec was not enabled (nothing to disable)");
+    } else {
+        println!();
+        println!("rosec has been disabled as the Secret Service provider.");
+        let existing = detect_existing_providers();
+        let has_gnome_keyring = existing.iter().any(|(n, _)| *n == "gnome-keyring");
+        if has_gnome_keyring {
+            println!("gnome-keyring will resume handling Secret Service requests.");
+        }
+    }
+    Ok(())
+}
+
+/// Run `systemctl --user <args>`, printing warnings on failure but never
+/// aborting — systemd may not be available (e.g. WSL, containers).
+fn run_systemctl(extra_args: &[&str]) {
+    let mut args = vec!["--user"];
+    args.extend_from_slice(extra_args);
+    let display_cmd = format!("systemctl {}", args.join(" "));
+
+    let status = std::process::Command::new("systemctl").args(&args).status();
+    match status {
+        Ok(s) if s.success() => println!("{display_cmd} ... ok"),
+        Ok(s) => {
+            eprintln!(
+                "warning: {display_cmd} exited with {}",
+                s.code().map_or("signal".to_string(), |c| c.to_string())
+            );
+        }
+        Err(e) => {
+            eprintln!("warning: could not run systemctl: {e}");
+        }
+    }
+}
+
+fn print_enable_help() {
+    println!(
+        "\
+rosec enable - activate rosec as the Secret Service provider
+
+USAGE:
+    rosec enable [flags]
+
+Generates and installs user-local D-Bus activation files and systemd user
+units so that org.freedesktop.secrets is handled by rosecd.
+
+The rosecd binary path is resolved automatically (sibling of the rosec
+binary, or from $PATH) and embedded into all generated files.
+
+FILES INSTALLED:
+    ~/.local/share/dbus-1/services/org.freedesktop.secrets.service
+        Routes D-Bus activation of org.freedesktop.secrets to rosecd.
+
+    ~/.local/share/dbus-1/services/org.gnome.keyring.service
+        Masks gnome-keyring D-Bus auto-activation (only if gnome-keyring
+        is detected). User-local files take priority over system-wide
+        files in /usr/share/dbus-1/services/.
+
+    ~/.config/systemd/user/rosecd.service
+        systemd user service unit with the resolved rosecd path.
+
+    ~/.config/systemd/user/rosecd.socket
+        systemd user socket unit for private-socket activation.
+
+FLAGS:
+    --no-systemd    Do not install/enable systemd user units
+    --no-mask       Do not install the gnome-keyring mask file
+    --force, -f     Overwrite existing files even if already enabled
+
+NOTES:
+    This command does NOT modify any system files or conflict with
+    installed packages. All files are written to user-local directories.
+    Run `rosec disable` to reverse all changes."
+    );
+}
+
+fn print_disable_help() {
+    println!(
+        "\
+rosec disable - deactivate rosec as the Secret Service provider
+
+USAGE:
+    rosec disable [flags]
+
+Removes all files installed by `rosec enable`:
+  - D-Bus activation files from ~/.local/share/dbus-1/services/
+  - systemd user units from ~/.config/systemd/user/
+
+FLAGS:
+    --no-systemd    Do not remove/disable systemd user units
+
+NOTES:
+    Only removes files that rosec created. If gnome-keyring was masked,
+    removing the mask file allows it to resume handling Secret Service
+    requests via its system-wide D-Bus activation file."
+    );
 }
