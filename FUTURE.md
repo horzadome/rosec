@@ -850,22 +850,100 @@ which is the standard mechanism — no client changes required.
 rosecd --socket /run/user/1000/rosec/bus
 export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/rosec/bus
 rosec search name=github
+secret-tool search name github   # standard clients work unmodified
 ```
 
-### Implementation notes
+### Why not raw zbus peer-to-peer
 
-- zbus supports this via `ConnectionBuilder::unix_listener(listener)` —
-  `rosecd` would call `tokio::net::UnixListener::bind(path)` and pass it to
-  `ConnectionBuilder` instead of `Connection::session()`.
-- The socket path defaults to `$XDG_RUNTIME_DIR/rosec/bus`; configurable via
-  `--socket` flag or `ROSEC_SOCKET` env var.
-- When `--socket` is given, rosecd skips claiming `org.freedesktop.secrets` on
-  the session bus (there may not be one) and instead acts as the bus itself.
-- `rosec` CLI would auto-detect the socket via `ROSEC_SOCKET` /
-  `XDG_RUNTIME_DIR/rosec/bus` before falling back to the session bus, so
-  `eval $(rosecd --socket ...)` shell integration works naturally.
-- This is the correct path for containers: no new IPC surface, same protocol,
-  existing Secret Service clients work unmodified.
+The original plan assumed `ConnectionBuilder::unix_listener(listener)` exists in
+zbus — it does not.  The actual API is `Builder::unix_stream(stream)`, which
+takes a single already-connected stream.  In p2p mode each `accept()`ed client
+gets its own `Connection` with its own `ObjectServer`; there is no shared bus.
+
+Standard Secret Service clients (`secret-tool`, `libsecret`, `seahorse`) call
+bus-level operations on connect: `Hello()`, `RequestName()`,
+`GetNameOwner("org.freedesktop.secrets")`.  These operations only exist in a bus
+broker — p2p connections have no name registry, no signal routing, and no match
+rules.
+
+Additionally, `ServiceState` stores a single `self.conn` and uses it to
+dynamically register/deregister `SecretItem` D-Bus objects
+(`rosec-secret-service/src/state.rs`).  This design requires a single bus
+connection, not per-client p2p connections.
+
+### Chosen approach: embedded busd
+
+[`busd`](https://crates.io/crates/busd) (MIT license) is a D-Bus bus broker
+written by the zbus author (zeenix).  It exposes a library API:
+
+```rust
+let bus = busd::bus::Bus::for_address(Some("unix:path=/run/user/1000/rosec/bus"))?;
+bus.run().await?;  // accept loop — handles multi-client multiplexing
+```
+
+busd provides everything a real bus broker needs: multi-client multiplexing,
+name registry (`Hello()`, `RequestName()`), signal routing/broadcasting, and
+match rules.  It has 583 commits and is actively maintained.  6 of its 7 unique
+dependencies are already in our `Cargo.lock` as transitive deps of zbus — only
+`xdg-home` would be new.
+
+**Architecture when `--socket` is given:**
+
+```
+┌───────────────────────────────────┐
+│           rosecd process          │
+│                                   │
+│  ┌─────────────────────────────┐  │
+│  │  busd::bus::Bus (tokio task)│  │
+│  │  listening on /run/.../bus  │  │
+│  └────────────┬────────────────┘  │
+│               │ unix socket       │
+│  ┌────────────▼────────────────┐  │
+│  │  Connection::session()      │  │
+│  │  (DBUS_SESSION_BUS_ADDRESS  │  │
+│  │   = unix:path=.../bus)      │  │
+│  └────────────┬────────────────┘  │
+│               │                   │
+│  ┌────────────▼────────────────┐  │
+│  │  register_objects_with_     │  │
+│  │  full_config() — unchanged  │  │
+│  └─────────────────────────────┘  │
+└───────────────────────────────────┘
+         ▲            ▲
+         │            │
+    secret-tool    libsecret app
+    (unmodified)   (unmodified)
+```
+
+**Zero changes to existing service code.** The daemon spawns busd in-process on
+the private socket, sets `DBUS_SESSION_BUS_ADDRESS` to point to it, then
+connects via `Connection::session()` as normal.  The same
+`register_objects_with_full_config()`, same `ObjectServer`, same dynamic item
+registration all work unchanged.
+
+### Implementation details
+
+- **Cargo feature:** `private-socket` in the `rosecd` crate, adding `busd` as
+  an optional dependency.  Disabled by default — no impact on the normal
+  session bus path.
+- **Socket path:** defaults to `$XDG_RUNTIME_DIR/rosec/bus`; configurable via
+  `--socket <path>` flag or `ROSEC_SOCKET` env var.
+- **CLI auto-detection:** `rosec` CLI checks `ROSEC_SOCKET` env var, then
+  `$XDG_RUNTIME_DIR/rosec/bus` (if the file exists), before falling back to
+  the session bus.  This makes `eval $(rosecd --socket ...)` shell integration
+  work naturally.
+- **Logind watcher:** skipped in private socket mode — no system bus is
+  available.  Lock-on-sleep would rely on idle timeouts instead.
+- **Permissions:** the socket file is created with mode `0o600` and placed under
+  the user's `XDG_RUNTIME_DIR` (which is itself `0o700`).
+
+### Implementation phases
+
+1. Add `--socket` flag to `rosecd` and embedded busd startup behind
+   `private-socket` feature.
+2. CLI auto-detection of `ROSEC_SOCKET` / `XDG_RUNTIME_DIR/rosec/bus`.
+3. Config file `socket_path` option in `[daemon]` section.
+4. Systemd integration documentation (`rosecd.socket` activation example).
 
 ### Why not the gnome-keyring control socket approach
 
@@ -873,9 +951,9 @@ rosec search name=github
   Service spec.  No other implementation supports it.
 - Exposing a raw socket with a bespoke framing would require maintaining a
   second protocol implementation in perpetuity.
-- A private D-Bus socket is strictly superior: same protocol, zero extra code
-  beyond `ConnectionBuilder::unix_listener`, and fully interoperable with any
-  conforming Secret Service client.
+- A private D-Bus socket via embedded busd is strictly superior: same protocol,
+  zero changes to service code, and fully interoperable with any conforming
+  Secret Service client.
 
 ---
 
@@ -975,3 +1053,193 @@ Currently, only Duo passcode (plain text) is supported.
 - Guest challenge extraction: **not started**
 - Host FIDO2 client: **not started**
 - Duo browser redirect: **not started**
+
+---
+
+## Cross-Platform Support
+
+### Overview
+
+rosec's architecture separates cleanly into platform-agnostic crates and
+platform-specific ones.  The goal is not to port the entire stack to every OS,
+but to ensure the core crates compile everywhere and platform-specific
+functionality is properly gated behind `cfg` attributes.
+
+### D-Bus dependency audit
+
+| Crate | D-Bus? | Cross-platform? | Notes |
+|-------|--------|-----------------|-------|
+| `rosec-core` | No | Yes | Pure Rust, config/crypto/types |
+| `rosec-vault` | No | Yes | Local encrypted storage |
+| `rosec-wasm` | No | Yes | Extism host, provider trait bridge |
+| WASM guests (bitwarden-pm, bitwarden-sm) | No | Yes | Pure Rust, compile to wasm32-wasi |
+| `rosec-ssh-agent` | No | Mostly | Unix sockets need `cfg` gating |
+| `rosec-fuse` | No | Linux-only | FUSE is Linux/macOS (macFUSE) |
+| `rosec-prompt` | No | Mostly | Wayland-specific structs need gating |
+| `rosec-secret-service` | **Yes** | Linux-only | Core D-Bus interface |
+| `rosecd` | **Yes** | Linux-only | Daemon, logind integration |
+| `rosec` (CLI) | **Yes** | Linux-only | D-Bus client connection |
+| `rosec-pam` | No | Linux-only | PAM is Linux-specific |
+
+### Compilation blockers
+
+These are specific locations where ungated platform-specific code prevents
+compilation on non-Linux targets.  All are fixable with `cfg` gates and
+fallbacks.
+
+| File | Line(s) | Issue | Fix |
+|------|---------|-------|-----|
+| `rosec-core/src/config_edit.rs` | 297 | Ungated `use std::os::unix::fs::OpenOptionsExt` + `.mode(0o600)` | `#[cfg(unix)]` gate; non-unix: rely on parent dir permissions |
+| `rosec-prompt/src/main.rs` | 310, 374-377 | Ungated `PlatformSpecific { application_id, override_redirect }` (Wayland/X11) | `#[cfg(target_os = "linux")]` gate; other platforms: omit or use platform equivalent |
+| `rosecd/src/bootstrap.rs` | 31-41 | `prctl` gated `#[cfg(unix)]` but `prctl` is Linux-only | Change to `#[cfg(target_os = "linux")]` |
+| `rosec/src/main.rs` | 625 | `read_hidden()` is `#[cfg(unix)]` with no `#[cfg(not(unix))]` fallback | Add Windows fallback using `windows-sys` console mode APIs |
+| `rosec-secret-service/src/daemon/management.rs` | 715-726 | `libc::pipe2` — Linux/Unix-specific, no cfg gate | Gate behind `#[cfg(unix)]`; alternative: `std::os::unix::net::UnixStream::pair()` |
+| `rosec-secret-service/src/daemon/management.rs` | 390-400 | `/proc/<pid>/exe` readlink — Linux-only | `#[cfg(target_os = "linux")]`; macOS: `proc_pidpath`; others: skip |
+| `rosecd/src/main.rs` | 374-405 | `/proc/<pid>/comm` read — Linux-only | `#[cfg(target_os = "linux")]` |
+| `rosec-ssh-agent/src/session.rs` | 4, 32, 35 | Ungated `UnixListener`, `PermissionsExt`, `from_mode(0o600)` | `#[cfg(unix)]` + `#[cfg(windows)]` named pipe alternative |
+
+### D-Bus connection sites
+
+All current D-Bus connections use `Connection::session()` or
+`Connection::system()`.  These are the sites that would need abstraction for
+any non-D-Bus transport:
+
+| File | Line | Bus | Purpose |
+|------|------|-----|---------|
+| `rosecd/src/main.rs` | 88 | session | Main daemon connection |
+| `rosecd/src/main.rs` | 458 | system | logind sleep/lock watcher |
+| `rosec-secret-service/src/state.rs` | 2211, 2344 | session | ServiceState operations |
+| `rosec-secret-service/src/item.rs` | 304 | session | SecretItem registration |
+| `rosec/src/main.rs` | 313 | session | CLI client |
+| `rosec-pam/src/main.rs` | 135 | session | PAM unlock module |
+
+### Platform abstractions needed
+
+#### Directory and path handling
+
+Use the [`directories`](https://crates.io/crates/directories) crate (or
+`dirs`) for cross-platform config/data/runtime paths:
+
+| Purpose | Linux | macOS | Windows |
+|---------|-------|-------|---------|
+| Config | `~/.config/rosec` | `~/Library/Application Support/rosec` | `%APPDATA%\rosec` |
+| Data | `~/.local/share/rosec` | `~/Library/Application Support/rosec` | `%LOCALAPPDATA%\rosec` |
+| Runtime | `$XDG_RUNTIME_DIR/rosec` | `$TMPDIR/rosec-<uid>` | Named pipes / temp |
+
+#### Process introspection (`/proc` abstraction)
+
+Two call sites read from `/proc`: peer exe path (`/proc/<pid>/exe`) for
+D-Bus caller verification, and peer comm (`/proc/<pid>/comm`) for logging.
+These are Linux-specific:
+
+- **macOS:** `proc_pidpath()` from `libproc` for exe path.
+- **Windows/other:** Skip caller verification or use platform-specific
+  alternatives.
+- Wrap in a `rosec_core::platform::peer_exe_path(pid) -> Option<PathBuf>`
+  abstraction.
+
+#### File permissions
+
+`OpenOptionsExt::mode(0o600)` and `PermissionsExt::from_mode(0o600)` are
+Unix-only.  On non-Unix platforms:
+
+- Rely on the parent directory's permissions (user-only access).
+- On Windows, use ACLs via `windows-sys` or accept default user-only
+  permissions on `%LOCALAPPDATA%` paths.
+
+### SSH agent cross-platform support
+
+#### Current state
+
+`rosec-ssh-agent` uses `ssh-agent-lib` v0.5.1 which has first-class Windows
+named pipe support via `NamedPipeListener`.
+
+#### Linux (current)
+
+```rust
+listen(UnixListener::bind(socket_path)?, agent).await?;
+```
+
+Plus optional FUSE mount for per-key `.pub` files in `~/.ssh/rosec/`.
+
+#### Windows / WSL2
+
+```rust
+listen(NamedPipeListener::bind(r"\\.\pipe\rosec-agent")?, agent).await?;
+```
+
+Windows OpenSSH reads `SSH_AUTH_SOCK` but also supports named pipes natively.
+WSL2 can bridge to Windows named pipes via `socat` or `npiperelay`.
+
+#### Cross-platform SSH key export
+
+`rosec ssh export <dir>` writes `.pub` files to a directory on disk.  This
+works on all platforms and is the primary non-agent path for making SSH
+public keys available.  FUSE remains a Linux-only convenience feature, gated
+behind `#[cfg(target_os = "linux")]` (or a cargo feature).
+
+### Lock / sleep event sources
+
+| Platform | Events | Mechanism |
+|----------|--------|-----------|
+| Linux | Sleep, screen lock, session end | logind D-Bus: `PrepareForSleep`, `Lock`, `SessionRemoved` (implemented) |
+| macOS | Sleep, screen lock | `NSWorkspace.willSleepNotification`, `com.apple.screenIsLocked` via `objc2` |
+| Windows (native) | Sleep, session lock | `WM_POWERBROADCAST`, `WTS_SESSION_LOCK` via `windows-sys` |
+| WSL2 | None | VM freezes silently; no events available. Rely on idle timeouts. |
+
+For macOS, the event watcher would use Objective-C bridge crates (`objc2`,
+`block2`) to subscribe to `NSDistributedNotificationCenter`.  This is a
+separate `rosec-events-macos` crate or a `#[cfg(target_os = "macos")]` module
+within `rosecd`.
+
+### Phased implementation roadmap
+
+#### Phase 1: Compilation fixes (no new features)
+
+Fix all `cfg` gate issues from the compilation blockers table above.  Goal:
+`cargo check --target x86_64-apple-darwin` and
+`cargo check --target x86_64-pc-windows-msvc` pass for the core crates
+(`rosec-core`, `rosec-vault`, `rosec-wasm`, WASM guests).
+
+Estimated scope: ~8 targeted `cfg` additions, no architectural changes.
+
+#### Phase 2: Platform abstraction layer
+
+- Introduce `rosec-core::platform` module with cross-platform helpers:
+  `config_dir()`, `data_dir()`, `runtime_dir()`, `peer_exe_path(pid)`,
+  `set_file_permissions(path, user_only: bool)`.
+- Migrate existing hardcoded paths to use these helpers.
+- Add `directories` crate dependency.
+
+#### Phase 3: Private socket mode (embedded busd)
+
+See "Headless / container mode" section above.  This is a Linux feature but
+the architecture (embedded bus broker) could theoretically work on macOS too,
+since busd and zbus are cross-platform.
+
+#### Phase 4: SSH agent cross-platform
+
+- Gate `UnixListener` path behind `#[cfg(unix)]`.
+- Add `#[cfg(windows)]` path using `NamedPipeListener`.
+- Gate FUSE behind `#[cfg(target_os = "linux")]` cargo feature.
+- `rosec ssh export` works everywhere already (writes files to disk).
+
+#### Phase 5: macOS polish
+
+- macOS sleep/lock event watcher (Objective-C bridge).
+- macOS keychain integration as a potential provider (read-only bridge to
+  Keychain items).
+- macOS-specific prompt backend (if `rosec-prompt`'s current approach
+  doesn't work with macOS window management).
+- Code signing / notarization for distribution.
+
+### Status
+
+- Compilation audit: **done** (blockers identified above)
+- D-Bus dependency map: **done**
+- Platform abstraction design: **done** (documented above)
+- Phase 1 implementation: **not started**
+- Phase 2 implementation: **not started**
+- Phase 3 implementation: **not started** (depends on busd evaluation)
+- Phase 4 implementation: **not started**
+- Phase 5 implementation: **not started**
