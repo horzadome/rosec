@@ -78,7 +78,11 @@ impl SshManager {
         let fuse_handle = match rosec_fuse::mount(&ssh_dir, agent_sock.clone()) {
             Ok(h) => h,
             Err(e) => {
-                warn!("SSH FUSE mount failed (SSH agent disabled): {e:#}");
+                // FUSE mount fails under NoNewPrivileges=yes (systemd hardened unit)
+                // because fusermount3's setuid bit is suppressed.  This is expected
+                // when running as a systemd user service.  The SSH agent is disabled
+                // but the daemon continues normally.
+                debug!("SSH FUSE mount failed (SSH agent disabled): {e:#}");
                 return None;
             }
         };
