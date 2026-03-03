@@ -432,6 +432,71 @@ async fn shutdown_signal() {
     }
 }
 
+// ---------------------------------------------------------------------------
+
+/// Ask logind for the session that owns our PID via `GetSessionByPID`.
+///
+/// Returns the session ID string (e.g. "3") on success, or `None` if logind
+/// is unavailable or our process has no associated session (e.g. running in a
+/// pure TTY without PAM, or inside a container).
+async fn resolve_session_id_from_logind(system_bus: &zbus::Connection) -> Option<String> {
+    let pid = std::process::id();
+    let proxy = zbus::Proxy::new(
+        system_bus,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await
+    .ok()?;
+
+    // GetSessionByPID returns the object path of the session, e.g.
+    // /org/freedesktop/login1/session/_33  (where _33 is the encoded session ID)
+    let session_path: zbus::zvariant::OwnedObjectPath =
+        proxy.call("GetSessionByPID", &(pid,)).await.ok()?;
+
+    // The session ID is the last path component, with systemd D-Bus encoding
+    // reversed (_XX → char).  For the common numeric case this is a no-op.
+    let id_encoded = session_path.as_str().rsplit('/').next()?;
+    let id = decode_dbus_path_component(id_encoded);
+    tracing::debug!(pid, session_id = %id, "resolved session ID from logind");
+    Some(id)
+}
+
+/// Reverse systemd's D-Bus object-path encoding: `_XX` → the character with
+/// hex code `XX`.  Alphanumeric characters and `_` that are not followed by
+/// two hex digits are passed through unchanged.
+fn decode_dbus_path_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '_' {
+            // Try to consume exactly two hex digits.
+            let h1 = chars.next();
+            let h2 = chars.next();
+            match (h1, h2) {
+                (Some(a), Some(b)) if a.is_ascii_hexdigit() && b.is_ascii_hexdigit() => {
+                    let byte = u8::from_str_radix(&format!("{a}{b}"), 16).unwrap_or(b'_');
+                    out.push(byte as char);
+                }
+                (Some(a), Some(b)) => {
+                    out.push('_');
+                    out.push(a);
+                    out.push(b);
+                }
+                (Some(a), None) => {
+                    out.push('_');
+                    out.push(a);
+                }
+                (None, _) => out.push('_'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Subscribe to logind D-Bus signals and enforce on_session_lock / on_logout policies.
 ///
 /// Connects to the **system** bus where `org.freedesktop.login1` lives.
@@ -457,10 +522,14 @@ async fn logind_watcher(
 
     let system_bus = Connection::system().await?;
 
-    // Determine our own session ID from the environment so we can watch the right
-    // Session object.  If XDG_SESSION_ID is not set we skip the per-session lock signal
-    // but still watch manager-level signals.
-    let session_id = std::env::var("XDG_SESSION_ID").ok();
+    // Determine our own session ID.  Prefer XDG_SESSION_ID from the environment
+    // (set by PAM / login shells), but fall back to asking logind for the session
+    // that owns our PID.  This handles the case where rosecd is started as a
+    // systemd user service and XDG_SESSION_ID is not propagated into the unit.
+    let session_id = match std::env::var("XDG_SESSION_ID").ok() {
+        Some(id) => Some(id),
+        None => resolve_session_id_from_logind(&system_bus).await,
+    };
 
     // Identify our session path for the per-session Lock signal.
     // logind session paths are /org/freedesktop/login1/session/<id>.
