@@ -90,8 +90,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: wasm-plugins
-          workspaces: rosec-bitwarden-pm
+          workspaces: |
+            rosec-bitwarden-pm
+            rosec-bitwarden-sm
 
       - name: Build bitwarden-pm plugin
         working-directory: rosec-bitwarden-pm
+        run: cargo build --target wasm32-wasip1 --release
+
+      - name: Build bitwarden-sm plugin
+        working-directory: rosec-bitwarden-sm
         run: cargo build --target wasm32-wasip1 --release
