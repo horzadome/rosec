@@ -22,6 +22,25 @@ use wildmatch::WildMatch;
 use crate::item::{ItemState, SecretItem};
 use crate::session::SessionManager;
 
+// Thread-local storage for passing 2FA method metadata through `FdoError`
+// (which can only carry a string).  Set in `map_provider_error` when the
+// error is `TwoFactorRequired`, consumed in `unlock.rs` when the sentinel
+// `"two_factor_required"` is detected.
+//
+// Uses `std::cell::RefCell` since we are always on the same OS thread within
+// a tokio task (the TTY auth flow is not `Send` across threads due to fd
+// ownership).
+std::thread_local! {
+    pub(crate) static TWO_FACTOR_METHODS: std::cell::RefCell<Vec<rosec_core::TwoFactorMethod>>
+        = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take the stored 2FA methods (if any) from the thread-local cell,
+/// leaving an empty vec behind.
+pub(crate) fn take_two_factor_methods() -> Vec<rosec_core::TwoFactorMethod> {
+    TWO_FACTOR_METHODS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
 /// Default ordered list of attribute name patterns tried when `return_attr` is
 /// not configured for a provider.
 ///
@@ -1173,13 +1192,30 @@ impl ServiceState {
 
         let password = password_value.clone();
 
+        // Check for 2FA auth fields (injected by the TTY unlock flow after a
+        // TwoFactorRequired challenge).  These are ephemeral per-unlock and go
+        // into UnlockInput::WithAuth, NOT into registration_fields.
+        let has_2fa = fields.contains_key("__2fa_method_id")
+            && fields.get("__2fa_token").is_some_and(|v| !v.is_empty());
+
+        let two_fa_fields: HashMap<String, Zeroizing<String>> = if has_2fa {
+            fields
+                .iter()
+                .filter(|(k, _)| k.starts_with("__2fa_"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
         // Collect any non-empty registration/auth fields supplied alongside the password.
         // Sources: registration_info fields (first-time setup) and auth_fields (e.g. token
         // rotation). Empty values are excluded so optional fields left blank don't trigger
         // WithRegistration unnecessarily.
         //
-        // The password field is explicitly excluded — it is always passed via
-        // UnlockInput::Password / WithRegistration::password, never as an extra field.
+        // The password field and 2FA fields are explicitly excluded — the password
+        // is always passed via UnlockInput::password, and 2FA fields go into
+        // UnlockInput::WithAuth::auth_fields.
         let reg_field_ids: std::collections::HashSet<&str> = provider
             .registration_info()
             .map(|ri| ri.fields.iter().map(|f| f.id).collect())
@@ -1192,11 +1228,18 @@ impl ServiceState {
 
         let registration_fields: HashMap<String, Zeroizing<String>> = fields
             .iter()
-            .filter(|(k, v)| all_extra_ids.contains(k.as_str()) && !v.is_empty())
+            .filter(|(k, v)| {
+                all_extra_ids.contains(k.as_str()) && !v.is_empty() && !k.starts_with("__2fa_")
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        let input = if registration_fields.is_empty() {
+        let input = if has_2fa {
+            UnlockInput::WithAuth {
+                password,
+                auth_fields: two_fa_fields,
+            }
+        } else if registration_fields.is_empty() {
             UnlockInput::Password(password)
         } else {
             UnlockInput::WithRegistration {
@@ -1931,6 +1974,16 @@ pub(crate) fn map_provider_error(err: ProviderError) -> FdoError {
         // the provided password produced a wrong decryption key.  The unlock
         // sweep should re-prompt individually rather than entering registration.
         ProviderError::AuthFailed => FdoError::Failed("auth_failed".to_string()),
+        // Two-factor authentication required — sentinel string detected by
+        // the TTY unlock flow to trigger 2FA collection.  The methods list is
+        // serialised as JSON and stored in a thread-local so unlock.rs can
+        // retrieve it (FdoError can only carry a string).
+        ProviderError::TwoFactorRequired { methods } => {
+            TWO_FACTOR_METHODS.with(|cell| {
+                *cell.borrow_mut() = methods;
+            });
+            FdoError::Failed("two_factor_required".to_string())
+        }
         // Item already exists (for create with replace=false).
         ProviderError::AlreadyExists => FdoError::Failed("already exists".to_string()),
         // Invalid input (validation failed).

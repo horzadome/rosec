@@ -154,6 +154,7 @@ fn simple_err(e: &SmError) -> SimpleResponse {
         ok: false,
         error: Some(e.to_string()),
         error_kind: Some(e.to_error_kind()),
+        two_factor_methods: None,
     }
 }
 
@@ -162,6 +163,7 @@ fn simple_ok() -> SimpleResponse {
         ok: true,
         error: None,
         error_kind: None,
+        two_factor_methods: None,
     }
 }
 
@@ -302,6 +304,7 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
             ok: false,
             error: Some("plugin not initialised".to_string()),
             error_kind: Some(ErrorKind::Unavailable),
+            two_factor_methods: None,
         }));
     };
 
@@ -319,6 +322,7 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
             ok: false,
             error: Some("access token required".to_string()),
             error_kind: Some(ErrorKind::RegistrationRequired),
+            two_factor_methods: None,
         }));
     }
 
@@ -330,6 +334,7 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
                 ok: false,
                 error: Some(format!("invalid access token: {e}")),
                 error_kind: Some(ErrorKind::AuthFailed),
+                two_factor_methods: None,
             }));
         }
     };
@@ -385,6 +390,7 @@ pub fn sync(_input: ()) -> FnResult<Json<SimpleResponse>> {
             ok: false,
             error: Some("plugin not initialised".to_string()),
             error_kind: Some(ErrorKind::Unavailable),
+            two_factor_methods: None,
         }));
     };
 
@@ -393,6 +399,7 @@ pub fn sync(_input: ()) -> FnResult<Json<SimpleResponse>> {
             ok: false,
             error: Some("provider is locked".to_string()),
             error_kind: Some(ErrorKind::Locked),
+            two_factor_methods: None,
         }));
     };
 
@@ -405,6 +412,7 @@ pub fn sync(_input: ()) -> FnResult<Json<SimpleResponse>> {
                 ok: false,
                 error: Some(format!("access token parse: {e}")),
                 error_kind: Some(ErrorKind::AuthFailed),
+                two_factor_methods: None,
             }));
         }
     };
@@ -572,9 +580,7 @@ pub fn get_item_attributes(
 
 /// Return the secret bytes for a named attribute of a secret.
 #[plugin_fn]
-pub fn get_secret_attr(
-    Json(req): Json<SecretAttrRequest>,
-) -> FnResult<Json<SecretAttrResponse>> {
+pub fn get_secret_attr(Json(req): Json<SecretAttrRequest>) -> FnResult<Json<SecretAttrResponse>> {
     let guard = STATE
         .lock()
         .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;

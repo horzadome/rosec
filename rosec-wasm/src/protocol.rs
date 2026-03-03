@@ -42,8 +42,8 @@ pub struct StatusResponse {
 
 /// Sent to `unlock`.
 ///
-/// `Debug` is manually implemented to redact `password` and
-/// `registration_fields` (which may contain secrets).
+/// `Debug` is manually implemented to redact `password`,
+/// `registration_fields`, and `auth_fields` (which may contain secrets).
 #[derive(Serialize, Deserialize)]
 pub struct UnlockRequest {
     /// The user's master password.
@@ -51,6 +51,12 @@ pub struct UnlockRequest {
     /// Additional registration fields (for first-time setup).
     #[serde(default)]
     pub registration_fields: Option<HashMap<String, String>>,
+    /// Additional auth fields for the current unlock attempt (e.g. a 2FA
+    /// token).  These are distinct from `registration_fields` which are
+    /// persisted across sessions — `auth_fields` are ephemeral per-unlock
+    /// credentials.
+    #[serde(default)]
+    pub auth_fields: Option<HashMap<String, String>>,
 }
 
 impl fmt::Debug for UnlockRequest {
@@ -60,6 +66,14 @@ impl fmt::Debug for UnlockRequest {
             .field(
                 "registration_fields",
                 &self.registration_fields.as_ref().map(|m| {
+                    m.keys()
+                        .map(|k| (k.as_str(), "[REDACTED]"))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .field(
+                "auth_fields",
+                &self.auth_fields.as_ref().map(|m| {
                     m.keys()
                         .map(|k| (k.as_str(), "[REDACTED]"))
                         .collect::<Vec<_>>()
@@ -78,6 +92,38 @@ pub struct SimpleResponse {
     /// Discriminates error kind for the host to map to ProviderError.
     #[serde(default)]
     pub error_kind: Option<ErrorKind>,
+    /// When `error_kind` is `TwoFactorRequired`, the available 2FA methods
+    /// the user may choose from.  Each method describes a prompt kind so the
+    /// host can collect the right credential (text code, hardware key, etc.).
+    #[serde(default)]
+    pub two_factor_methods: Option<Vec<TwoFactorMethod>>,
+}
+
+/// Describes a single two-factor authentication method available for the
+/// current provider.
+///
+/// The host uses `prompt_kind` to decide how to collect the credential:
+/// - `"text"` — prompt for a text string (TOTP code, email code, YubiKey OTP,
+///   Duo passcode).
+/// - `"fido2"` — perform a FIDO2/WebAuthn ceremony on the host (requires
+///   hardware key access; deferred — not yet implemented).
+/// - `"browser_redirect"` — open a URL and wait for a callback (deferred —
+///   not yet implemented).
+///
+/// The `id` is opaque to the host — only the guest knows how to map it back
+/// to a provider-specific code (e.g. Bitwarden provider=0 for TOTP).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwoFactorMethod {
+    /// Opaque method identifier sent back to the guest in `auth_fields`.
+    pub id: String,
+    /// Human-readable label shown to the user (e.g. "Authenticator app (TOTP)").
+    pub label: String,
+    /// How the host should collect the credential.
+    pub prompt_kind: String,
+    /// Optional challenge data for host-mediated methods (e.g. WebAuthn
+    /// challenge JSON).  Unused for text-prompt methods.
+    #[serde(default)]
+    pub challenge: Option<String>,
 }
 
 // ── Items ────────────────────────────────────────────────────────
@@ -364,5 +410,9 @@ pub enum ErrorKind {
     InvalidInput,
     RegistrationRequired,
     AuthFailed,
+    /// The provider requires two-factor authentication to proceed.
+    /// The `SimpleResponse::two_factor_methods` field describes the available
+    /// methods the host can offer to the user.
+    TwoFactorRequired,
     Other,
 }

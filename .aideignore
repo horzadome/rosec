@@ -1,0 +1,26 @@
+# Build artifacts
+**/target/
+
+# WASM build outputs
+**/*.wasm
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Syncthing
+.syncthing.*
+
+# Cargo lock files for workspace-excluded WASM guest crates
+rosec-bitwarden-pm/Cargo.lock
+rosec-bitwarden-sm/Cargo.lock

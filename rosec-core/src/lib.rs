@@ -317,6 +317,29 @@ pub struct RegistrationInfo {
     pub fields: &'static [AuthField],
 }
 
+/// Describes a single two-factor authentication method available for a
+/// provider.
+///
+/// This is a core type used by the service layer to prompt users and relay
+/// 2FA credentials back to providers.  Providers return these as part of
+/// `ProviderError::TwoFactorRequired`.
+#[derive(Debug, Clone)]
+pub struct TwoFactorMethod {
+    /// Opaque method identifier — sent back to the provider in `auth_fields`
+    /// so it can map back to its internal 2FA provider code.
+    pub id: String,
+    /// Human-readable label shown to the user (e.g. "Authenticator app (TOTP)").
+    pub label: String,
+    /// How the host should collect the credential:
+    /// - `"text"` — prompt for a text string (TOTP, email code, YubiKey OTP, passcode).
+    /// - `"fido2"` — perform a FIDO2/WebAuthn ceremony (deferred — not yet implemented).
+    /// - `"browser_redirect"` — open a URL and wait for callback (deferred).
+    pub prompt_kind: String,
+    /// Optional challenge data for host-mediated methods (e.g. WebAuthn
+    /// challenge JSON).  Unused for text-prompt methods.
+    pub challenge: Option<String>,
+}
+
 /// Credentials passed to [`Provider::unlock`].
 ///
 /// This enum intentionally does NOT derive `Serialize` or `Deserialize`.
@@ -339,6 +362,17 @@ pub enum UnlockInput {
         /// `RegistrationInfo::fields`.
         registration_fields: HashMap<String, Zeroizing<String>>,
     },
+    /// Password + ephemeral auth fields (e.g. a 2FA token), supplied when the
+    /// provider previously returned `ProviderError::TwoFactorRequired`.
+    ///
+    /// Unlike registration fields, auth fields are not persisted — they are
+    /// valid only for the current unlock attempt.
+    WithAuth {
+        password: Zeroizing<String>,
+        /// Ephemeral credential fields keyed by provider-defined identifiers
+        /// (e.g. `"__2fa_method_id"` and `"__2fa_token"`).
+        auth_fields: HashMap<String, Zeroizing<String>>,
+    },
 }
 
 impl std::fmt::Debug for UnlockInput {
@@ -349,6 +383,11 @@ impl std::fmt::Debug for UnlockInput {
                 .debug_struct("WithRegistration")
                 .field("password", &"[redacted]")
                 .field("registration_fields", &"[redacted]")
+                .finish(),
+            Self::WithAuth { .. } => f
+                .debug_struct("WithAuth")
+                .field("password", &"[redacted]")
+                .field("auth_fields", &"[redacted]")
                 .finish(),
         }
     }
@@ -385,6 +424,16 @@ pub enum ProviderError {
     /// user to re-register.
     #[error("authentication failed")]
     AuthFailed,
+    /// The provider requires two-factor authentication to proceed.
+    ///
+    /// The `methods` list describes the available 2FA methods the user may
+    /// choose from.  The auth flow should present these to the user, collect
+    /// the credential, and retry with `UnlockInput::WithAuth`.
+    #[error("two-factor authentication required")]
+    TwoFactorRequired {
+        /// Available 2FA methods the provider supports for this account.
+        methods: Vec<TwoFactorMethod>,
+    },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

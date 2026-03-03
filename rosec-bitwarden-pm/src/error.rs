@@ -9,6 +9,7 @@ pub enum BitwardenError {
     Auth(String),
     TwoFactorRequired {
         providers: Vec<u8>,
+        email_hint: Option<String>,
     },
     /// Server rejected login because this device UUID is not yet registered.
     DeviceVerificationRequired,
@@ -46,7 +47,7 @@ impl BitwardenError {
         match self {
             Self::Locked => ErrorKind::Locked,
             Self::NotFound(_) => ErrorKind::NotFound,
-            Self::TwoFactorRequired { .. } => ErrorKind::Unavailable,
+            Self::TwoFactorRequired { .. } => ErrorKind::TwoFactorRequired,
             Self::DeviceVerificationRequired => ErrorKind::RegistrationRequired,
             Self::Auth(_) => ErrorKind::AuthFailed,
             Self::Api(_) | Self::Crypto(_) | Self::CipherParse(_) | Self::Http(_) => {

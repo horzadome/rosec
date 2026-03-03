@@ -397,6 +397,7 @@ async fn auth_provider_with_tty_inner(
 
     // Try to authenticate.  If the provider requires registration (SM token
     // setup, Bitwarden device registration), collect the extra fields and retry.
+    // If the provider requires 2FA, collect the token and retry.
     let auth_result = if force {
         None // skip straight to registration
     } else {
@@ -413,7 +414,74 @@ async fn auth_provider_with_tty_inner(
         _ => false,
     };
 
-    if needs_registration {
+    let needs_2fa =
+        matches!(&auth_result, Some(Err(FdoError::Failed(msg))) if msg == "two_factor_required");
+
+    if needs_2fa {
+        // Retrieve the available 2FA methods from the thread-local side channel
+        // (set by map_provider_error when TwoFactorRequired was mapped).
+        let methods = crate::state::take_two_factor_methods();
+
+        // Filter to methods with prompt_kind == "text" (the only kind we
+        // currently support).  FIDO2 / browser_redirect are deferred.
+        let text_methods: Vec<_> = methods.iter().filter(|m| m.prompt_kind == "text").collect();
+
+        if text_methods.is_empty() {
+            return Err(anyhow!(
+                "provider requires 2FA but no supported methods available \
+                 (FIDO2/WebAuthn is not yet supported)"
+            ));
+        }
+
+        // If multiple text methods, let the user choose; if only one, use it.
+        let chosen = if text_methods.len() == 1 {
+            text_methods[0]
+        } else {
+            print_on_fd(tty_fd, "\nTwo-factor authentication required.\n");
+            print_on_fd(tty_fd, "Available methods:\n");
+            for (i, m) in text_methods.iter().enumerate() {
+                print_on_fd(tty_fd, &format!("  [{}] {}\n", i + 1, m.label));
+            }
+            let choice_field = vec![TtyField {
+                id: "__2fa_choice".to_string(),
+                label: "Choose method".to_string(),
+                kind: "text".to_string(),
+                placeholder: "1".to_string(),
+            }];
+            let choice_map = collect_tty_on_fd(tty_fd, &choice_field, cancel_fd).await?;
+            let choice_str = choice_map
+                .get("__2fa_choice")
+                .map(|v| v.as_str())
+                .unwrap_or("1");
+            let idx: usize = choice_str.parse::<usize>().unwrap_or(1).saturating_sub(1);
+            text_methods.get(idx).copied().unwrap_or(text_methods[0])
+        };
+
+        print_on_fd(tty_fd, &format!("\n{}\n", chosen.label));
+
+        // Collect the 2FA token from the user.
+        let token_field = vec![TtyField {
+            id: "__2fa_token".to_string(),
+            label: chosen.label.clone(),
+            kind: "text".to_string(),
+            placeholder: String::new(),
+        }];
+        let token_map = collect_tty_on_fd(tty_fd, &token_field, cancel_fd).await?;
+
+        // Add the 2FA fields to cred_map and retry.
+        cred_map.insert(
+            "__2fa_method_id".to_string(),
+            Zeroizing::new(chosen.id.clone()),
+        );
+        if let Some(token_val) = token_map.get("__2fa_token") {
+            cred_map.insert("__2fa_token".to_string(), token_val.clone());
+        }
+
+        state
+            .auth_provider_inner(provider_id, cred_map.clone())
+            .await
+            .map_err(|e| anyhow!("2FA authentication failed for '{provider_id}': {e}"))?;
+    } else if needs_registration {
         let b = state
             .provider_by_id(provider_id)
             .ok_or_else(|| anyhow!("provider '{provider_id}' not found"))?;

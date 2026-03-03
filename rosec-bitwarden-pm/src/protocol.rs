@@ -48,6 +48,10 @@ pub struct UnlockRequest {
     /// Additional registration fields (for first-time setup).
     #[serde(default)]
     pub registration_fields: Option<HashMap<String, String>>,
+    /// Additional auth fields for the current unlock attempt (e.g. a 2FA
+    /// token).  Ephemeral per-unlock — not persisted across sessions.
+    #[serde(default)]
+    pub auth_fields: Option<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for UnlockRequest {
@@ -56,7 +60,14 @@ impl std::fmt::Debug for UnlockRequest {
             .field("password", &"[redacted]")
             .field(
                 "registration_fields",
-                &self.registration_fields.as_ref().map(|f| f.len()),
+                &self.registration_fields.as_ref().map(|m| m.len()),
+            )
+            .field(
+                "auth_fields",
+                &self
+                    .auth_fields
+                    .as_ref()
+                    .map(|m| m.keys().collect::<Vec<_>>()),
             )
             .finish()
     }
@@ -71,6 +82,25 @@ pub struct SimpleResponse {
     /// Discriminates error kind for the host to map to ProviderError.
     #[serde(default)]
     pub error_kind: Option<ErrorKind>,
+    /// When `error_kind` is `TwoFactorRequired`, the available 2FA methods.
+    #[serde(default)]
+    pub two_factor_methods: Option<Vec<TwoFactorMethod>>,
+}
+
+/// Describes a single two-factor authentication method available for the
+/// current provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwoFactorMethod {
+    /// Opaque method identifier sent back to the guest in `auth_fields`.
+    pub id: String,
+    /// Human-readable label shown to the user.
+    pub label: String,
+    /// How the host should collect the credential: `"text"`, `"fido2"`,
+    /// `"browser_redirect"`.
+    pub prompt_kind: String,
+    /// Optional challenge data for host-mediated methods.
+    #[serde(default)]
+    pub challenge: Option<String>,
 }
 
 // ── Items ────────────────────────────────────────────────────────
@@ -333,5 +363,6 @@ pub enum ErrorKind {
     InvalidInput,
     RegistrationRequired,
     AuthFailed,
+    TwoFactorRequired,
     Other,
 }

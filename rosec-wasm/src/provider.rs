@@ -246,13 +246,15 @@ impl Provider for WasmProvider {
         // Extract the password (needed for credential persistence key derivation).
         let password_ref: &Zeroizing<String> = match &input {
             UnlockInput::Password(pw) => pw,
-            UnlockInput::WithRegistration { password, .. } => password,
+            UnlockInput::WithRegistration { password, .. }
+            | UnlockInput::WithAuth { password, .. } => password,
         };
 
         let mut req = match &input {
             UnlockInput::Password(pw) => UnlockRequest {
                 password: pw.as_str().to_owned(),
                 registration_fields: None,
+                auth_fields: None,
             },
             UnlockInput::WithRegistration {
                 password,
@@ -261,6 +263,20 @@ impl Provider for WasmProvider {
                 password: password.as_str().to_owned(),
                 registration_fields: Some(
                     registration_fields
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
+                        .collect(),
+                ),
+                auth_fields: None,
+            },
+            UnlockInput::WithAuth {
+                password,
+                auth_fields,
+            } => UnlockRequest {
+                password: password.as_str().to_owned(),
+                registration_fields: None,
+                auth_fields: Some(
+                    auth_fields
                         .iter()
                         .map(|(k, v)| (k.clone(), v.as_str().to_owned()))
                         .collect(),
@@ -300,6 +316,7 @@ impl Provider for WasmProvider {
                             let mut retry_req = UnlockRequest {
                                 password: password_ref.as_str().to_owned(),
                                 registration_fields: Some(reg_fields_plain),
+                                auth_fields: None,
                             };
 
                             let retry_result: Result<SimpleResponse, ProviderError> =
@@ -335,6 +352,7 @@ impl Provider for WasmProvider {
                                 ok: false,
                                 error: Some("wrong password".to_string()),
                                 error_kind: Some(ErrorKind::AuthFailed),
+                                two_factor_methods: None,
                             })
                         }
                     }
@@ -395,6 +413,12 @@ impl Provider for WasmProvider {
                 cb();
             }
             Ok(())
+        } else if resp
+            .error_kind
+            .as_ref()
+            .is_some_and(|k| matches!(k, ErrorKind::TwoFactorRequired))
+        {
+            Err(map_guest_2fa_error(resp.error, resp.two_factor_methods))
         } else {
             Err(map_guest_error(resp.error, resp.error_kind))
         }
@@ -768,6 +792,10 @@ fn call_guest_json_no_input<O: DeserializeOwned>(
 }
 
 /// Map a guest error response to a `ProviderError`.
+///
+/// For `TwoFactorRequired`, the caller must pass the methods separately
+/// via [`map_guest_error_2fa`] since `SimpleResponse` carries them in a
+/// dedicated field.
 fn map_guest_error(message: Option<String>, kind: Option<ErrorKind>) -> ProviderError {
     let msg = message.unwrap_or_else(|| "unknown plugin error".into());
     match kind {
@@ -779,7 +807,40 @@ fn map_guest_error(message: Option<String>, kind: Option<ErrorKind>) -> Provider
         Some(ErrorKind::InvalidInput) => ProviderError::InvalidInput(msg.into()),
         Some(ErrorKind::RegistrationRequired) => ProviderError::RegistrationRequired,
         Some(ErrorKind::AuthFailed) => ProviderError::AuthFailed,
+        Some(ErrorKind::TwoFactorRequired) => {
+            // Caller should use map_guest_2fa_error() for TwoFactorRequired
+            // with the methods from SimpleResponse.  This fallback creates an
+            // empty methods list.
+            ProviderError::TwoFactorRequired { methods: vec![] }
+        }
         Some(ErrorKind::Other) | None => ProviderError::Other(anyhow::anyhow!("{msg}")),
+    }
+}
+
+/// Map a guest `TwoFactorRequired` response to a `ProviderError`, converting
+/// the protocol `TwoFactorMethod` types to core types.
+fn map_guest_2fa_error(
+    message: Option<String>,
+    methods: Option<Vec<crate::protocol::TwoFactorMethod>>,
+) -> ProviderError {
+    let core_methods: Vec<rosec_core::TwoFactorMethod> = methods
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| rosec_core::TwoFactorMethod {
+            id: m.id,
+            label: m.label,
+            prompt_kind: m.prompt_kind,
+            challenge: m.challenge,
+        })
+        .collect();
+
+    if core_methods.is_empty() {
+        warn!("guest returned TwoFactorRequired but no methods");
+    }
+
+    let _msg = message.unwrap_or_else(|| "two-factor authentication required".into());
+    ProviderError::TwoFactorRequired {
+        methods: core_methods,
     }
 }
 

@@ -304,10 +304,7 @@ pub fn list_secrets(
     let list: SecretIdentifiersResponse = serde_json::from_slice(&resp.body())
         .map_err(|e| SmError::Api(format!("SM list secrets response parse: {e}")))?;
 
-    extism_pdk::debug!(
-        "SM secret identifiers fetched count={}",
-        list.secrets.len()
-    );
+    extism_pdk::debug!("SM secret identifiers fetched count={}", list.secrets.len());
     Ok(list.secrets)
 }
 
@@ -485,10 +482,7 @@ pub fn fetch_secrets(
 
     // Step 5: list secret identifiers
     let identifiers = list_secrets(urls, &bearer, org_id)?;
-    extism_pdk::debug!(
-        "SM secret identifiers fetched count={}",
-        identifiers.len()
-    );
+    extism_pdk::debug!("SM secret identifiers fetched count={}", identifiers.len());
 
     if identifiers.is_empty() {
         return Ok((bearer, Vec::new()));
@@ -527,10 +521,7 @@ pub fn fetch_secrets(
         });
     }
 
-    extism_pdk::debug!(
-        "SM secrets loaded and decrypted count={}",
-        secrets.len()
-    );
+    extism_pdk::debug!("SM secrets loaded and decrypted count={}", secrets.len());
     Ok((bearer, secrets))
 }
 
@@ -557,19 +548,19 @@ mod tests {
 
     #[test]
     fn parse_access_token_wrong_version() {
-        assert!(AccessToken::parse(
-            "1.ec2c1d46-6a4b-4751-a310-af9601317f2d.secret:X8vbvA0bduihIDe/qrzIQQ=="
-        )
-        .is_err());
+        assert!(
+            AccessToken::parse(
+                "1.ec2c1d46-6a4b-4751-a310-af9601317f2d.secret:X8vbvA0bduihIDe/qrzIQQ=="
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn parse_access_token_bad_key() {
         assert!(
-            AccessToken::parse(
-                "0.ec2c1d46-6a4b-4751-a310-af9601317f2d.secret:not-valid-b64!"
-            )
-            .is_err()
+            AccessToken::parse("0.ec2c1d46-6a4b-4751-a310-af9601317f2d.secret:not-valid-b64!")
+                .is_err()
         );
     }
 

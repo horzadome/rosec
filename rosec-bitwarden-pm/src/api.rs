@@ -7,6 +7,8 @@
 //! - `notifications_url()` removed (host handles real-time sync)
 //! - tracing → extism_pdk logging macros
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -149,6 +151,7 @@ impl ApiClient {
         if let Some(tf) = two_factor {
             params.push(("twoFactorToken", tf.token));
             params.push(("twoFactorProvider", tf.provider.to_string()));
+            params.push(("twoFactorRemember", "0".to_string()));
         }
 
         let mut form_body = url_encode_form(&params);
@@ -187,7 +190,20 @@ impl ApiClient {
                     .is_some_and(|d| d.contains("Two factor required"))
                 {
                     let providers = err_resp.two_factor_providers.unwrap_or_default();
-                    return Err(BitwardenError::TwoFactorRequired { providers });
+
+                    // Extract the email hint from TwoFactorProviders2 provider "1".
+                    let email_hint = err_resp
+                        .two_factor_providers2
+                        .as_ref()
+                        .and_then(|p2| p2.get("1"))
+                        .and_then(|v| v.get("Email"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+
+                    return Err(BitwardenError::TwoFactorRequired {
+                        providers,
+                        email_hint,
+                    });
                 }
             }
             return Err(BitwardenError::Auth(format!(
@@ -470,6 +486,10 @@ struct LoginErrorResponse {
     error_description: Option<String>,
     #[serde(alias = "TwoFactorProviders")]
     two_factor_providers: Option<Vec<u8>>,
+    /// Per-provider metadata.  Keyed by provider code (as a string).
+    /// Provider 1 (email) has `{ "Email": "j***@example.com" }`.
+    #[serde(alias = "TwoFactorProviders2", default)]
+    two_factor_providers2: Option<HashMap<String, serde_json::Value>>,
 }
 
 /// Refresh response — tokens are sensitive.

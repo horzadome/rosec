@@ -782,7 +782,60 @@ fn simple_err(e: &BitwardenError) -> SimpleResponse {
         ok: false,
         error: Some(e.to_string()),
         error_kind: Some(e.to_error_kind()),
+        two_factor_methods: None,
     }
+}
+
+/// Build a `TwoFactorRequired` error response with the available methods.
+fn simple_err_2fa(providers: &[u8], email_hint: Option<&str>) -> SimpleResponse {
+    SimpleResponse {
+        ok: false,
+        error: Some("two-factor authentication required".to_string()),
+        error_kind: Some(ErrorKind::TwoFactorRequired),
+        two_factor_methods: Some(bitwarden_2fa_methods(providers, email_hint)),
+    }
+}
+
+/// Map Bitwarden 2FA provider codes to protocol `TwoFactorMethod` descriptors.
+///
+/// If `email_hint` is provided (e.g. `"j***@example.com"`) and provider 1
+/// (email) is in the list, the label is enhanced to show the masked address.
+fn bitwarden_2fa_methods(providers: &[u8], email_hint: Option<&str>) -> Vec<TwoFactorMethod> {
+    providers
+        .iter()
+        .filter_map(|&code| {
+            let (id, label, prompt_kind) = match code {
+                0 => ("0", "Authenticator app (TOTP)", "text"),
+                1 => {
+                    // Enhance label with email hint when available.
+                    let label = match email_hint {
+                        Some(hint) => {
+                            return Some(TwoFactorMethod {
+                                id: "1".to_string(),
+                                label: format!("Email code ({hint})"),
+                                prompt_kind: "text".to_string(),
+                                challenge: None,
+                            });
+                        }
+                        None => "Email code",
+                    };
+                    ("1", label, "text")
+                }
+                2 => ("2", "Duo (passcode)", "text"),
+                3 => ("3", "YubiKey OTP (touch your key)", "text"),
+                4 => ("4", "FIDO2 / WebAuthn security key", "fido2"),
+                6 => ("6", "Organization Duo (passcode)", "text"),
+                // Provider 5 = "remember" token, not user-facing
+                _ => return None,
+            };
+            Some(TwoFactorMethod {
+                id: id.to_string(),
+                label: label.to_string(),
+                prompt_kind: prompt_kind.to_string(),
+                challenge: None,
+            })
+        })
+        .collect()
 }
 
 /// Build an ok `SimpleResponse`.
@@ -791,6 +844,7 @@ fn simple_ok() -> SimpleResponse {
         ok: true,
         error: None,
         error_kind: None,
+        two_factor_methods: None,
     }
 }
 
@@ -959,7 +1013,7 @@ pub fn status(_input: ()) -> FnResult<Json<StatusResponse>> {
     }
 }
 
-/// Unlock the vault with a master password (and optional registration fields).
+/// Unlock the vault with a master password (and optional registration/auth fields).
 #[plugin_fn]
 pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> {
     let mut guard = STATE
@@ -971,6 +1025,7 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
             ok: false,
             error: Some("plugin not initialised".to_string()),
             error_kind: Some(ErrorKind::Unavailable),
+            two_factor_methods: None,
         }));
     };
 
@@ -990,6 +1045,7 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
                 ok: false,
                 error: Some("registration requires client_id and client_secret".to_string()),
                 error_kind: Some(ErrorKind::InvalidInput),
+                two_factor_methods: None,
             }));
         }
 
@@ -1003,12 +1059,63 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
         );
     }
 
-    match authenticate(&state.config, &req.password, None) {
+    // Build the TwoFactorSubmission from auth_fields if a 2FA token was
+    // provided by the host (after a previous TwoFactorRequired challenge).
+    let two_factor = match req.auth_fields.as_ref() {
+        Some(af) if af.contains_key("__2fa_method_id") || af.contains_key("__2fa_token") => {
+            let Some(method_id) = af.get("__2fa_method_id") else {
+                return Ok(Json(SimpleResponse {
+                    ok: false,
+                    error: Some("missing __2fa_method_id in auth_fields".to_string()),
+                    error_kind: Some(ErrorKind::InvalidInput),
+                    two_factor_methods: None,
+                }));
+            };
+            let Some(token) = af.get("__2fa_token") else {
+                return Ok(Json(SimpleResponse {
+                    ok: false,
+                    error: Some("missing __2fa_token in auth_fields".to_string()),
+                    error_kind: Some(ErrorKind::InvalidInput),
+                    two_factor_methods: None,
+                }));
+            };
+            if token.is_empty() {
+                return Ok(Json(SimpleResponse {
+                    ok: false,
+                    error: Some("__2fa_token is empty".to_string()),
+                    error_kind: Some(ErrorKind::InvalidInput),
+                    two_factor_methods: None,
+                }));
+            }
+            let Ok(provider) = method_id.parse::<u8>() else {
+                return Ok(Json(SimpleResponse {
+                    ok: false,
+                    error: Some(format!("invalid __2fa_method_id: {method_id}")),
+                    error_kind: Some(ErrorKind::InvalidInput),
+                    two_factor_methods: None,
+                }));
+            };
+            Some(TwoFactorSubmission {
+                token: token.clone(),
+                provider,
+            })
+        }
+        _ => None,
+    };
+
+    match authenticate(&state.config, &req.password, two_factor) {
         Ok(auth) => {
             let ciphers = auth.vault.ciphers().len();
             state.auth = Some(auth);
             extism_pdk::info!("vault unlocked: ciphers={ciphers}");
             Ok(Json(simple_ok()))
+        }
+        Err(BitwardenError::TwoFactorRequired {
+            providers,
+            email_hint,
+        }) => {
+            extism_pdk::warn!("unlock requires 2FA, providers: {providers:?}");
+            Ok(Json(simple_err_2fa(&providers, email_hint.as_deref())))
         }
         Err(e) => {
             extism_pdk::warn!("unlock failed: {e}");
@@ -1044,6 +1151,7 @@ pub fn sync(_input: ()) -> FnResult<Json<SimpleResponse>> {
             ok: false,
             error: Some("plugin not initialised".to_string()),
             error_kind: Some(ErrorKind::Unavailable),
+            two_factor_methods: None,
         }));
     };
 
@@ -1052,6 +1160,7 @@ pub fn sync(_input: ()) -> FnResult<Json<SimpleResponse>> {
             ok: false,
             error: Some("vault is locked".to_string()),
             error_kind: Some(ErrorKind::Locked),
+            two_factor_methods: None,
         }));
     };
 

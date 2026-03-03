@@ -876,3 +876,102 @@ rosec search name=github
 - A private D-Bus socket is strictly superior: same protocol, zero extra code
   beyond `ConnectionBuilder::unix_listener`, and fully interoperable with any
   conforming Secret Service client.
+
+---
+
+## WebAuthn / FIDO2 / Passkey Two-Factor Authentication
+
+### Background
+
+rosec supports text-prompt 2FA methods (TOTP, email, YubiKey OTP, Duo
+passcode) via the generic `TwoFactorMethod` protocol.  Each text-prompt
+method works identically from the host's perspective: prompt a string on the
+TTY, send it to the guest.
+
+WebAuthn / FIDO2 (Bitwarden provider code 4) is fundamentally different.  It
+requires a **host-mediated ceremony** where:
+
+1. The guest returns a JSON challenge (from `TwoFactorProviders2`) containing
+   `rpId`, `challenge`, `allowCredentials`, `userVerification`, etc.
+2. The **host** communicates with a hardware authenticator (USB HID / NFC /
+   BLE) to perform a `navigator.credentials.get()` equivalent.
+3. The host sends the signed assertion response back to the guest.
+4. The guest includes the assertion in the Bitwarden login request.
+
+This cannot happen inside the WASM sandbox — the guest has no hardware access.
+
+### Protocol support (already in place)
+
+The `TwoFactorMethod` protocol type includes:
+
+- `prompt_kind: "fido2"` — signals to the host that this is a host-mediated
+  method, not a text prompt.
+- `challenge: Option<String>` — carries the JSON challenge data from the
+  server (currently `None` because the PM guest doesn't yet extract
+  `TwoFactorProviders2` challenge data for WebAuthn).
+
+The host (`unlock.rs`) currently filters to `prompt_kind == "text"` methods
+only.  If only `fido2` methods are available, it returns an error:
+"provider requires 2FA but no supported methods available".
+
+### Implementation plan
+
+#### Phase 1: Guest extracts WebAuthn challenge
+
+- Deserialize `TwoFactorProviders2` in `rosec-bitwarden-pm/src/api.rs`
+  (currently only `TwoFactorProviders` — the flat `Vec<u8>` — is parsed).
+- For provider code 4, extract the `Challenges` array and serialize it as
+  JSON into `TwoFactorMethod { challenge: Some(json_str), .. }`.
+- The guest must also accept the assertion response back via `auth_fields`
+  and format it into the `twoFactorToken` form parameter expected by the
+  Bitwarden identity endpoint.
+
+#### Phase 2: Host FIDO2 client
+
+- Add a new crate `rosec-fido2` (or a module in `rosec-secret-service`)
+  that wraps `libfido2` or the `ctap-hid-fido2` Rust crate.
+- The host detects `prompt_kind == "fido2"`, parses the challenge JSON,
+  performs the authenticator assertion, and puts the response into
+  `auth_fields` (e.g. `__2fa_fido2_response`).
+- Requires access to `/dev/hidraw*` — user must be in the `fido` group
+  or have appropriate udev rules.
+
+#### Phase 3: Passkey / discoverable credentials
+
+- Some Bitwarden accounts may use passkeys (resident/discoverable
+  credentials) for passwordless login.  This is a separate Bitwarden API
+  flow (`grant_type: "webauthn"` rather than `"password"`).
+- This would require a new `UnlockInput` variant or a separate
+  `Provider::unlock_passkey()` method.
+- Deferred until WebAuthn 2FA works, since the FIDO2 infrastructure is a
+  prerequisite.
+
+#### Platform considerations
+
+| Platform | FIDO2 access | Notes |
+|----------|-------------|-------|
+| Linux | `libfido2` / `ctap-hid-fido2` via `/dev/hidraw*` | Needs udev rules or `fido` group |
+| macOS | `libfido2` or Security.framework | Different transport |
+| Windows | Windows Hello / WebAuthn API | Completely different surface |
+
+For the initial implementation, Linux-only via `libfido2` is sufficient.
+
+### Duo push / browser redirect
+
+Full Duo push (provider 2/6) faces a similar problem: the Duo handshake
+requires a browser redirect and callback.  The approach would be:
+
+1. Guest extracts `Host`, `Signature`, `AuthUrl` from `TwoFactorProviders2`.
+2. Host opens the URL via `xdg-open` (or equivalent).
+3. Host polls or listens for the Duo callback to complete.
+4. Host extracts the Duo auth token and sends it back to the guest.
+
+This shares infrastructure with the "browser_redirect" `prompt_kind`.
+Currently, only Duo passcode (plain text) is supported.
+
+### Status
+
+- Protocol types: **done** (`TwoFactorMethod.prompt_kind`, `.challenge`)
+- Guest challenge extraction: **not started**
+- Host FIDO2 client: **not started**
+- Duo browser redirect: **not started**

@@ -99,7 +99,41 @@ SSH keys stored as Bitwarden items (type: SSH key, or login items with SSH key f
 
 ## Two-factor authentication
 
-rosec supports Bitwarden's standard 2FA methods (email OTP, TOTP authenticator apps). When 2FA is required, you will be prompted during `rosec provider auth`.
+When your Bitwarden account has two-factor authentication enabled, rosec will
+detect the 2FA challenge during unlock and prompt you on the terminal.
+
+### Supported methods
+
+| Method | Bitwarden code | How it works in rosec |
+|--------|:--------------:|------|
+| **Authenticator app (TOTP)** | 0 | Prompts for a 6-digit code from your authenticator app |
+| **Email** | 1 | Prompts for the code sent to your account email |
+| **YubiKey OTP** | 3 | Touch your YubiKey; the OTP is typed directly into the terminal |
+| **Duo (passcode)** | 2, 6 | Prompts for a Duo bypass code or passcode |
+
+If multiple methods are available, rosec shows a numbered list and lets you choose.
+
+### Not yet supported
+
+| Method | Notes |
+|--------|-------|
+| **FIDO2 / WebAuthn** | Requires host-side hardware key access; deferred (see FUTURE.md) |
+| **Duo push / call** | Requires browser redirect; only passcode mode is supported |
+| **Remember token** | 30-day remember-me token caching is planned |
+
+### Example
+
+```
+Master Password: ********
+Two-factor authentication required.
+Available methods:
+  [1] Authenticator app (TOTP)
+  [2] Email code
+Choose method: 1
+
+Authenticator app (TOTP): 123456
+vault unlocked: ciphers=42
+```
 
 ## Multiple accounts
 

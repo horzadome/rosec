@@ -299,7 +299,8 @@ impl Provider for LocalVault {
     async fn unlock(&self, input: UnlockInput) -> Result<(), ProviderError> {
         let password = match input {
             UnlockInput::Password(pw) => pw,
-            UnlockInput::WithRegistration { password, .. } => password,
+            UnlockInput::WithRegistration { password, .. }
+            | UnlockInput::WithAuth { password, .. } => password,
         };
 
         if password.is_empty() {
