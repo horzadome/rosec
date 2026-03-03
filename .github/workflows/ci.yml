@@ -75,7 +75,7 @@ jobs:
         run: cargo fmt --all -- --check
 
   wasm:
-    name: WASM Plugins
+    name: WASM Providers
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -89,15 +89,15 @@ jobs:
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          key: wasm-plugins
+          key: wasm-providers
           workspaces: |
             rosec-bitwarden-pm
             rosec-bitwarden-sm
 
-      - name: Build bitwarden-pm plugin
+      - name: Build bitwarden-pm provider
         working-directory: rosec-bitwarden-pm
         run: cargo build --target wasm32-wasip1 --release
 
-      - name: Build bitwarden-sm plugin
+      - name: Build bitwarden-sm provider
         working-directory: rosec-bitwarden-sm
         run: cargo build --target wasm32-wasip1 --release
