@@ -3527,7 +3527,7 @@ fn gen_systemd_service(rosecd: &std::path::Path) -> String {
     format!(
         "\
 [Unit]
-Description=rosec - read-only Secret Service daemon
+Description=rosec - multi-provider Secret Service daemon
 Documentation=https://github.com/jmylchreest/rosec
 After=dbus.service
 Requires=dbus.service

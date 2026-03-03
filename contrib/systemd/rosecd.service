@@ -1,5 +1,5 @@
 [Unit]
-Description=rosec - read-only Secret Service daemon
+Description=rosec - multi-provider Secret Service daemon
 Documentation=https://github.com/jmylchreest/rosec
 # Require the D-Bus session bus.
 After=dbus.service
