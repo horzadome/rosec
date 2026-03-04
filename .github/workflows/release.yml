@@ -269,6 +269,7 @@ jobs:
           workspaces: |
             rosec-bitwarden-pm
             rosec-bitwarden-sm
+            rosec-gnome-keyring
 
       - name: Build bitwarden-pm provider
         working-directory: rosec-bitwarden-pm
@@ -278,25 +279,58 @@ jobs:
         working-directory: rosec-bitwarden-sm
         run: cargo build --target wasm32-wasip1 --release
 
-      - name: Package WASM providers
+      - name: Build gnome-keyring provider
+        working-directory: rosec-gnome-keyring
+        run: cargo build --target wasm32-wasip1 --release
+
+      - name: Copy WASM providers
         run: |
-          VERSION=${{ needs.prepare.outputs.version }}
           mkdir -p dist/providers
 
           # bitwarden-pm
           cp rosec-bitwarden-pm/target/wasm32-wasip1/release/rosec_bitwarden_pm.wasm \
              dist/providers/rosec_bitwarden_pm.wasm
 
-          ARCHIVE="rosec-provider-bitwarden-pm-${VERSION}.wasm.tar.gz"
-          tar -czf "${ARCHIVE}" -C dist/providers rosec_bitwarden_pm.wasm
-          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
-
           # bitwarden-sm
           cp rosec-bitwarden-sm/target/wasm32-wasip1/release/rosec_bitwarden_sm.wasm \
              dist/providers/rosec_bitwarden_sm.wasm
 
+          # gnome-keyring
+          cp rosec-gnome-keyring/target/wasm32-wasip1/release/rosec_gnome_keyring.wasm \
+             dist/providers/rosec_gnome_keyring.wasm
+
+      - name: Sign WASM providers
+        env:
+          WASM_SIGNING_KEY: ${{ secrets.WASM_SIGNING_KEY }}
+        run: |
+          cargo install rsign2 --quiet 2>/dev/null || true
+          # Write the private key from secret to a temp file
+          KEYFILE=$(mktemp)
+          echo "${WASM_SIGNING_KEY}" > "${KEYFILE}"
+          trap 'rm -f "${KEYFILE}"' EXIT
+
+          for wasm in dist/providers/*.wasm; do
+            rsign sign -s "${KEYFILE}" -W "${wasm}"
+            echo "Signed: ${wasm}"
+          done
+
+      - name: Package signed WASM providers
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+
+          # bitwarden-pm
+          ARCHIVE="rosec-provider-bitwarden-pm-${VERSION}.wasm.tar.gz"
+          tar -czf "${ARCHIVE}" -C dist/providers rosec_bitwarden_pm.wasm rosec_bitwarden_pm.wasm.minisig
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+          # bitwarden-sm
           ARCHIVE="rosec-provider-bitwarden-sm-${VERSION}.wasm.tar.gz"
-          tar -czf "${ARCHIVE}" -C dist/providers rosec_bitwarden_sm.wasm
+          tar -czf "${ARCHIVE}" -C dist/providers rosec_bitwarden_sm.wasm rosec_bitwarden_sm.wasm.minisig
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+          # gnome-keyring
+          ARCHIVE="rosec-provider-gnome-keyring-${VERSION}.wasm.tar.gz"
+          tar -czf "${ARCHIVE}" -C dist/providers rosec_gnome_keyring.wasm rosec_gnome_keyring.wasm.minisig
           sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
 
       - name: Upload artifact
@@ -309,12 +343,52 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # SBOM — CycloneDX JSON, generated once (architecture-independent)
+  # ---------------------------------------------------------------------------
+  build-sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    needs: [prepare, ci]
+    if: needs.prepare.outputs.should_skip != 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libdbus-1-dev \
+            pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx
+
+      - name: Generate SBOM
+        run: |
+          VERSION=${{ needs.prepare.outputs.version }}
+          # --all generates one .cdx.json per workspace crate; pick the top-level
+          # CLI crate (rosec) which transitively covers all dependencies
+          cargo cyclonedx --format json --all
+          mv rosec/rosec.cdx.json "rosec-${VERSION}.sbom.cdx.json"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosec-sbom
+          path: rosec-*.sbom.cdx.json
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # Rolling snapshot release — updated on every push to main
   # ---------------------------------------------------------------------------
   snapshot:
     name: Snapshot Release
     runs-on: ubuntu-latest
-    needs: [prepare, build, build-wasm]
+    needs: [prepare, build, build-wasm, build-sbom]
     if: |
       needs.prepare.outputs.should_skip != 'true' &&
       needs.prepare.outputs.is_release == 'false' &&
@@ -371,7 +445,7 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [prepare, build, build-wasm]
+    needs: [prepare, build, build-wasm, build-sbom]
     if: |
       needs.prepare.outputs.is_release == 'true' ||
       needs.prepare.outputs.is_prerelease == 'true'
@@ -442,10 +516,10 @@ jobs:
             contrib/aur/PKGBUILD-bin > "$GITHUB_WORKSPACE/PKGBUILD-rendered"
 
       - name: Publish to AUR
-        uses: KSXGitHub/github-actions-deploy-aur@v3
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
         with:
           pkgname: rosec-bin
-          pkgbuild: ./PKGBUILD-rendered
+          pkgbuild: ${{ github.workspace }}/PKGBUILD-rendered
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
