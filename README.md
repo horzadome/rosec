@@ -112,10 +112,11 @@ rosec provider add-password local --label pam
 # Enter your login (PAM) password — NOT your vault master password
 ```
 
-Then add one line to your PAM config (e.g. `/etc/pam.d/system-login`), after `pam_unix.so`:
+Then add rosec to your local login PAM config (`/etc/pam.d/system-local-login`):
 
 ```
-auth  optional  pam_exec.so  expose_authtok quiet /usr/lib/rosec/rosec-pam-unlock
+auth     include   rosec
+session  include   rosec
 ```
 
 From your next login, the vault unlocks automatically. See [PAM auto-unlock](#pam-auto-unlock) for display manager setup and troubleshooting.
@@ -232,12 +233,17 @@ password, skip this step.
 **For login + screen lock (recommended — covers both):**
 
 ```
-# /etc/pam.d/system-login — add at the end:
+# /etc/pam.d/system-local-login — add at the end:
 auth     include   rosec
 session  include   rosec
 ```
 
-**For screen lockers only:**
+This covers GDM, SDDM, console login, and screen lockers that include the
+`login` chain (hyprlock, swaylock, etc.).  Do **not** add rosec to
+`/etc/pam.d/system-login` — that file is also used by SSH and other remote
+services where there is no D-Bus session bus.
+
+**For a specific screen locker only** (if you don't want rosec on initial login):
 
 ```
 # /etc/pam.d/hyprlock — add after the existing auth line:
@@ -252,14 +258,6 @@ session  include   rosec
 | i3lock | `/etc/pam.d/i3lock` |
 | GDM | `/etc/pam.d/gdm-password` |
 | SDDM | `/etc/pam.d/sddm` |
-
-**4.** If you install to a non-standard path, configure the allowed helper paths:
-
-```toml
-# ~/.config/rosec/config.toml
-[service]
-pam_helper_paths = ["/home/you/rosec/target/debug/rosec-pam-unlock"]
-```
 
 ### Fallback: pam_exec (no native module)
 
@@ -283,8 +281,8 @@ auth  optional  pam_exec.so  expose_authtok quiet /usr/lib/rosec/rosec-pam-unloc
 - **Password sent via pipe:** Never appears as a D-Bus message, argv
   argument, or environment variable.  `rosec-pam-unlock` reads from stdin,
   passes to `rosecd` via pipe fd (SCM_RIGHTS).
-- **Helper timeout:** If `rosec-pam-unlock` hangs, it is killed after 10
-  seconds.  Login continues normally.
+- **Fire-and-forget:** The helper runs in the background (double-forked).
+  Login and screen unlock are never delayed.
 - **Minimal attack surface:** The `.so` is 17 KB of C with no runtime
   dependencies beyond libc and libpam.  All crypto and D-Bus logic lives
   in the separate `rosec-pam-unlock` binary.

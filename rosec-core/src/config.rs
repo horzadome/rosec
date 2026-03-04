@@ -30,17 +30,7 @@ pub struct ServiceConfig {
     /// If not set, defaults to the first provider that supports writes.
     #[serde(default)]
     pub write_provider: Option<String>,
-    /// Allowed executable paths for `AuthProviderFromPipe` callers.
-    ///
-    /// The daemon resolves the caller's PID via D-Bus `GetConnectionCredentials`
-    /// and checks `/proc/<pid>/exe` against this list.  If the caller's binary
-    /// does not match any entry, the request is rejected.
-    ///
-    /// Defaults to standard FHS install locations for the `rosec-pam-unlock`
-    /// helper.  Set to an empty list to reject all pipe-based auth, or add
-    /// custom paths for development / non-standard installs.
-    #[serde(default = "default_pam_helper_paths")]
-    pub pam_helper_paths: Vec<String>,
+
     /// When the same WASM provider kind is found in both the system
     /// (`/usr/lib/rosec/providers/`) and user (`$XDG_DATA_HOME/rosec/providers/`)
     /// directories, controls which copy is preferred.
@@ -68,7 +58,7 @@ impl Default for ServiceConfig {
             dedup_time_fallback: default_dedup_time_fallback(),
             refresh_interval_secs: None,
             write_provider: None,
-            pam_helper_paths: default_pam_helper_paths(),
+
             wasm_prefer: WasmPreference::default(),
             wasm_verify: WasmVerify::default(),
         }
@@ -304,18 +294,6 @@ fn default_prompt_backend() -> String {
     "builtin".to_string()
 }
 
-/// Default allowed paths for the PAM unlock helper binary.
-///
-/// Follows the Filesystem Hierarchy Standard (FHS):
-/// - `/usr/lib/rosec/` — Arch Linux, most distros (PKGBUILD)
-/// - `/usr/libexec/` — Fedora, RHEL, SUSE
-fn default_pam_helper_paths() -> Vec<String> {
-    vec![
-        "/usr/lib/rosec/rosec-pam-unlock".to_string(),
-        "/usr/libexec/rosec-pam-unlock".to_string(),
-    ]
-}
-
 fn default_color_background() -> String {
     "#1e1e2eff".to_string()
 }
@@ -389,8 +367,6 @@ mod tests {
         assert!(!cfg.autolock.on_session_lock);
         assert!(cfg.autolock.idle_timeout_minutes.is_none());
         assert!(cfg.autolock.max_unlocked_minutes.is_none());
-        assert_eq!(cfg.service.pam_helper_paths.len(), 2);
-        assert!(cfg.service.pam_helper_paths[0].contains("rosec-pam-unlock"));
     }
 
     #[test]

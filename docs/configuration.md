@@ -13,7 +13,6 @@ Controls vault caching and deduplication behaviour.
 | `dedup_strategy` | string | `"newest"` | How to resolve duplicate items across backends. See [Deduplication](#deduplication). |
 | `dedup_time_fallback` | string | `"created"` | Timestamp field used when `dedup_strategy = "newest"`. `"created"` or `"none"`. |
 | `refresh_interval_secs` | integer | `60` | How often (seconds) to re-sync each backend. Set to `0` to disable periodic refresh. |
-| `pam_helper_paths` | array of strings | `["/usr/lib/rosec/rosec-pam-unlock", "/usr/libexec/rosec-pam-unlock"]` | Allowed executable paths for `AuthBackendFromPipe` callers. The daemon verifies the caller's `/proc/<pid>/exe` against this list. Set to a custom path for non-standard installs or development. |
 
 ### Deduplication
 
@@ -217,7 +216,7 @@ Same fields as `[backend.autolock]`:
 dedup_strategy        = "newest"
 dedup_time_fallback   = "created"
 refresh_interval_secs = 60
-# pam_helper_paths    = ["/usr/lib/rosec/rosec-pam-unlock", "/usr/libexec/rosec-pam-unlock"]
+
 
 # Global defaults — backends stay unlocked for the session, lock on logout.
 [autolock]

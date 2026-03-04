@@ -54,19 +54,62 @@ use zeroize::Zeroize as _;
 const PAM_SUCCESS: i32 = 0;
 const PAM_IGNORE: i32 = 25;
 
+/// Log a debug message to syslog. TEMPORARY — remove before release.
+fn debug_log(msg: &str) {
+    // Use libc syslog directly to avoid pulling in a logging framework.
+    // SAFETY: We pass a valid format string and C string.
+    unsafe {
+        libc::openlog(
+            c"rosec-pam-unlock".as_ptr(),
+            libc::LOG_PID | libc::LOG_NDELAY,
+            libc::LOG_AUTH,
+        );
+        // Build a CString for the message.
+        if let Ok(cmsg) = std::ffi::CString::new(msg) {
+            libc::syslog(libc::LOG_DEBUG, c"%s".as_ptr(), cmsg.as_ptr());
+        }
+    }
+}
+
 fn main() -> ! {
+    debug_log("helper started");
     let code = match run() {
-        Ok(()) => PAM_SUCCESS,
-        Err(()) => PAM_IGNORE,
+        Ok(()) => {
+            debug_log("helper exiting PAM_SUCCESS");
+            PAM_SUCCESS
+        }
+        Err(()) => {
+            debug_log("helper exiting PAM_IGNORE");
+            PAM_IGNORE
+        }
     };
     std::process::exit(code);
 }
 
 fn run() -> Result<(), ()> {
-    let mut password = read_password_from_stdin().map_err(|_| ())?;
+    // Log environment for debugging D-Bus connectivity.
+    // TEMPORARY — remove before release.
+    let dbus_addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_default();
+    let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+    debug_log(&format!(
+        "env: DBUS_SESSION_BUS_ADDRESS={dbus_addr:?} XDG_RUNTIME_DIR={xdg_runtime:?}"
+    ));
+
+    // If DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR are both unset,
+    // try to determine them from the target user.  GDM's session worker
+    // runs as root and may not have these in its environment, but we
+    // need them to reach the user's session bus.
+    ensure_session_bus_env();
+
+    let mut password = read_password_from_stdin().map_err(|e| {
+        debug_log(&format!("failed to read password from stdin: {e:?}"));
+    })?;
     if password.is_empty() {
+        debug_log("password is empty");
         return Err(());
     }
+
+    debug_log(&format!("read {} bytes from stdin", password.len()));
 
     let result = unlock_vaults(&password);
 
@@ -74,6 +117,91 @@ fn run() -> Result<(), ()> {
     password.zeroize();
 
     result
+}
+
+/// Ensure `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` are set.
+///
+/// During a GDM login/unlock, the PAM session worker runs as root and
+/// may not have these variables.  We derive them from the target user's
+/// UID (via `PAM_USER` → getpwnam, or from the real UID of the process).
+///
+/// The well-known user bus path on systemd systems is:
+///   `unix:path=/run/user/<UID>/bus`
+fn ensure_session_bus_env() {
+    let has_dbus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
+    let has_xdg = std::env::var_os("XDG_RUNTIME_DIR").is_some();
+
+    if has_dbus && has_xdg {
+        return;
+    }
+
+    // Determine the target UID.  PAM sets PAM_USER but it's not always
+    // in our environment.  Fall back to the real UID, then the effective UID.
+    let uid = get_target_uid();
+    debug_log(&format!("target uid={uid}"));
+
+    let runtime_dir = format!("/run/user/{uid}");
+
+    if !has_xdg {
+        debug_log(&format!("setting XDG_RUNTIME_DIR={runtime_dir}"));
+        // SAFETY: This binary is single-threaded at this point (called
+        // before the tokio runtime is built).
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir) };
+    }
+
+    if !has_dbus {
+        let bus_path = format!("unix:path={runtime_dir}/bus");
+        // Only set if the socket actually exists.
+        let socket_path = format!("{runtime_dir}/bus");
+        if std::path::Path::new(&socket_path).exists() {
+            debug_log(&format!("setting DBUS_SESSION_BUS_ADDRESS={bus_path}"));
+            // SAFETY: This binary is single-threaded at this point.
+            unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &bus_path) };
+        } else {
+            debug_log(&format!("bus socket {socket_path} does not exist"));
+        }
+    }
+}
+
+/// Get the UID of the user we're trying to unlock for.
+///
+/// Strategy:
+/// 1. `PAM_USER` env var → getpwnam → uid (most reliable in PAM context)
+/// 2. Real UID of the process (works when GDM runs the session worker
+///    with the user's real UID)
+/// 3. Effective UID as last resort
+fn get_target_uid() -> u32 {
+    // Try PAM_USER first.
+    if let Ok(user) = std::env::var("PAM_USER")
+        && let Some(uid) = username_to_uid(&user)
+    {
+        return uid;
+    }
+
+    // Real UID.
+    // SAFETY: getuid() is always safe — no pointers, no side effects.
+    let ruid = unsafe { libc::getuid() };
+    if ruid != 0 {
+        return ruid;
+    }
+
+    // Effective UID as last resort (may be root in GDM context).
+    // SAFETY: geteuid() is always safe — no pointers, no side effects.
+    unsafe { libc::geteuid() }
+}
+
+/// Look up a username and return its UID, or `None` if not found.
+fn username_to_uid(name: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    // SAFETY: getpwnam returns a pointer to a static struct or null.
+    // We only read the uid field and do not store the pointer.
+    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
+    if pw.is_null() {
+        None
+    } else {
+        // SAFETY: pw is non-null, pw_uid is a plain integer field.
+        Some(unsafe { (*pw).pw_uid })
+    }
 }
 
 /// Read the password from stdin as provided by `pam_exec` with `expose_authtok`.
@@ -149,7 +277,11 @@ fn unlock_vaults(password: &[u8]) -> Result<(), ()> {
 }
 
 async fn unlock_vaults_async(password: &[u8]) -> Result<(), ()> {
-    let conn = zbus::Connection::session().await.map_err(|_| ())?;
+    debug_log("connecting to session bus");
+    let conn = zbus::Connection::session().await.map_err(|e| {
+        debug_log(&format!("D-Bus session connect failed: {e}"));
+    })?;
+    debug_log("connected to session bus");
 
     let proxy = zbus::Proxy::new(
         &conn,
@@ -158,31 +290,77 @@ async fn unlock_vaults_async(password: &[u8]) -> Result<(), ()> {
         "org.rosec.Daemon",
     )
     .await
-    .map_err(|_| ())?;
+    .map_err(|e| {
+        debug_log(&format!("proxy creation failed: {e}"));
+    })?;
 
     // ProviderList returns Vec<(id, name, kind, locked)>.
+    debug_log("calling ProviderList");
     let providers: Vec<(String, String, String, bool)> =
-        proxy.call("ProviderList", &()).await.map_err(|_| ())?;
+        proxy.call("ProviderList", &()).await.map_err(|e| {
+            debug_log(&format!("ProviderList call failed: {e}"));
+        })?;
 
+    debug_log(&format!("found {} providers", providers.len()));
+
+    let locked: Vec<_> = providers
+        .iter()
+        .filter(|(_, _, _, is_locked)| *is_locked)
+        .collect();
+
+    if locked.is_empty() {
+        debug_log("no locked providers found");
+        return Ok(());
+    }
+
+    debug_log(&format!("unlocking {} providers in parallel", locked.len()));
+
+    // Spawn all unlock attempts concurrently.  Each gets its own pipe
+    // and D-Bus call — the daemon handles them in parallel.
+    let mut handles = Vec::with_capacity(locked.len());
+    for (id, name, _kind, _) in &locked {
+        let pipe_fd = make_password_pipe(password).map_err(|_| {
+            debug_log("failed to create password pipe");
+        })?;
+
+        let proxy = proxy.clone();
+        let id = id.clone();
+        let name = name.clone();
+        handles.push(tokio::spawn(async move {
+            debug_log(&format!("attempting to unlock provider {name} ({id})"));
+            let result: Result<bool, zbus::Error> = proxy
+                .call("AuthProviderFromPipe", &(id.as_str(), pipe_fd))
+                .await;
+            match &result {
+                Ok(true) => {
+                    debug_log(&format!("provider {name} ({id}) unlocked successfully"));
+                    true
+                }
+                Ok(false) => {
+                    debug_log(&format!("provider {name} ({id}) auth returned false"));
+                    false
+                }
+                Err(e) => {
+                    debug_log(&format!("provider {name} ({id}) auth failed: {e}"));
+                    false
+                }
+            }
+        }));
+    }
+
+    // Wait for all unlock attempts to complete.
     let mut any_unlocked = false;
-    for (id, _name, _kind, locked) in &providers {
-        if !locked {
-            continue;
-        }
-
-        // Create a fresh pipe for each unlock attempt — each pipe is
-        // consumed (read + closed) by the daemon, so we cannot reuse them.
-        let pipe_fd = make_password_pipe(password).map_err(|_| ())?;
-
-        // AuthProviderFromPipe(provider_id, pipe_fd) — password travels via
-        // the pipe fd, never as a D-Bus message string.
-        let result: Result<bool, zbus::Error> = proxy
-            .call("AuthProviderFromPipe", &(id.as_str(), pipe_fd))
-            .await;
-        if result.is_ok() {
+    for handle in handles {
+        if let Ok(true) = handle.await {
             any_unlocked = true;
         }
     }
 
-    if any_unlocked { Ok(()) } else { Err(()) }
+    if any_unlocked {
+        debug_log("at least one provider unlocked");
+        Ok(())
+    } else {
+        debug_log("no providers were unlocked");
+        Err(())
+    }
 }

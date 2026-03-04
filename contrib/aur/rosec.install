@@ -19,7 +19,7 @@ post_install() {
     echo "  To automatically unlock rosec providers at login, include the"
     echo "  installed PAM config in your login and/or screen locker configs:"
     echo ""
-    echo "    # /etc/pam.d/system-login (or /etc/pam.d/hyprlock, etc.):"
+    echo "    # /etc/pam.d/system-local-login (covers login + screen lockers):"
     echo "    auth     include  rosec"
     echo "    session  include  rosec"
     echo ""

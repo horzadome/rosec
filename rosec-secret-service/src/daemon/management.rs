@@ -355,10 +355,11 @@ impl RosecManagement {
     /// callers that already have the password but want to avoid sending it as
     /// a plain D-Bus message payload (visible to `dbus-monitor`).
     ///
-    /// **Access restricted**: The daemon resolves the caller's PID via
-    /// `GetConnectionCredentials` and verifies that `/proc/<pid>/exe` matches
-    /// one of the paths in `[service] pam_helper_paths`.  If the caller is
-    /// not the PAM helper binary, the request is rejected.
+    /// **Security model**: The D-Bus session bus is per-user (kernel-enforced
+    /// UID check on socket connect), so only processes running as the same
+    /// user can call this method.  The password travels through a kernel pipe
+    /// (SCM_RIGHTS fd-passing), never as a D-Bus message string payload,
+    /// making it invisible to `dbus-monitor`.
     ///
     /// Returns `true` on success.  Returns a D-Bus error if the provider is not
     /// found, the password is wrong, or reading from the pipe fails.
@@ -369,42 +370,6 @@ impl RosecManagement {
         #[zbus(header)] header: Header<'_>,
     ) -> Result<bool, FdoError> {
         log_caller("AuthProviderFromPipe", &header);
-
-        // --- Caller verification ---
-        let allowed_paths = self.state.live_config().service.pam_helper_paths;
-        if !allowed_paths.is_empty() {
-            let sender = header.sender().ok_or_else(|| {
-                FdoError::AccessDenied("AuthProviderFromPipe: missing D-Bus sender".into())
-            })?;
-            let dbus_proxy = zbus::fdo::DBusProxy::new(&self.state.conn)
-                .await
-                .map_err(|e| FdoError::Failed(format!("DBusProxy: {e}")))?;
-            let pid = dbus_proxy
-                .get_connection_unix_process_id(zbus::names::BusName::from(sender.clone()))
-                .await
-                .map_err(|e| {
-                    FdoError::AccessDenied(format!(
-                        "AuthProviderFromPipe: cannot resolve caller PID: {e}"
-                    ))
-                })?;
-            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|e| {
-                FdoError::AccessDenied(format!(
-                    "AuthProviderFromPipe: cannot read /proc/{pid}/exe: {e}"
-                ))
-            })?;
-            if !allowed_paths.iter().any(|p| exe == std::path::Path::new(p)) {
-                return Err(FdoError::AccessDenied(format!(
-                    "AuthProviderFromPipe: caller exe '{}' not in pam_helper_paths",
-                    exe.display(),
-                )));
-            }
-            debug!(
-                pid,
-                exe = %exe.display(),
-                "AuthProviderFromPipe: caller verified"
-            );
-        }
-        // --- End caller verification ---
 
         use std::os::unix::io::AsRawFd as _;
         let raw: libc::c_int = unsafe { libc::dup(pipe_fd.as_raw_fd()) };

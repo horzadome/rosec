@@ -45,7 +45,7 @@
  * Install:
  *   install -m755 pam_rosec.so /usr/lib/security/
  *
- * PAM config (/etc/pam.d/system-login or screen locker):
+ * PAM config (/etc/pam.d/system-local-login or screen locker):
  *   auth     optional  pam_rosec.so
  *   session  optional  pam_rosec.so
  *
@@ -85,9 +85,9 @@
 /* Key for pam_set_data / pam_get_data stash */
 #define STASH_KEY "rosec_pam_authtok"
 
-/* Timeout for the helper process (seconds).  If exceeded, the helper
- * is killed and we return PAM_IGNORE. */
-#define HELPER_TIMEOUT_SECS 10
+/* Timeout for the helper process (seconds).  The helper self-exits
+ * after this long to avoid lingering if rosecd is unresponsive. */
+#define HELPER_TIMEOUT_SECS 30
 
 /* ── Password zeroization ─────────────────────────────────────────── */
 
@@ -173,38 +173,37 @@ write_password_to_pipe(int write_fd, const char *password)
     return (written == 1) ? 0 : -1;
 }
 
-/* ── Fork/exec the unlock helper ──────────────────────────────────── */
+/* ── Fork/exec the unlock helper (fire-and-forget) ────────────────── */
 
 /*
  * Fork rosec-pam-unlock, pass the password on its stdin via pipe,
- * wait for it to exit.  Returns 0 if the helper exited successfully,
- * -1 otherwise.  All failures are silent — this function NEVER causes
- * a login failure.
+ * and return immediately without waiting.  The helper runs in the
+ * background and unlocks providers asynchronously — the PAM caller
+ * is never blocked.
+ *
+ * The child is double-forked so the intermediate process exits
+ * immediately, allowing the PAM caller to reap it.  The grandchild
+ * (the actual helper) is reparented to init/systemd and will not
+ * become a zombie.
  */
-static int
-run_unlock_helper(const char *password)
+static void
+run_unlock_helper(const char *password, const char *username)
 {
     int pipe_fds[2] = { -1, -1 };
     pid_t pid;
-    int status;
-    struct sigaction sa_ign, sa_def, sa_old_pipe, sa_old_chld;
+    struct sigaction sa_ign, sa_old_pipe;
 
     if (pipe(pipe_fds) < 0)
-        return -1;
+        return;
 
     /*
      * Ignore SIGPIPE so writing to a broken pipe doesn't kill the
-     * login process.  Set SIGCHLD to SIG_DFL so waitpid works.
+     * login process.
      */
     memset(&sa_ign, 0, sizeof(sa_ign));
     sa_ign.sa_handler = SIG_IGN;
     sigemptyset(&sa_ign.sa_mask);
     sigaction(SIGPIPE, &sa_ign, &sa_old_pipe);
-
-    memset(&sa_def, 0, sizeof(sa_def));
-    sa_def.sa_handler = SIG_DFL;
-    sigemptyset(&sa_def.sa_mask);
-    sigaction(SIGCHLD, &sa_def, &sa_old_chld);
 
     pid = fork();
 
@@ -213,12 +212,27 @@ run_unlock_helper(const char *password)
         close_safe(pipe_fds[0]);
         close_safe(pipe_fds[1]);
         sigaction(SIGPIPE, &sa_old_pipe, NULL);
-        sigaction(SIGCHLD, &sa_old_chld, NULL);
-        return -1;
+        return;
     }
 
     if (pid == 0) {
-        /* ── Child process ──────────────────────────────────────── */
+        /* ── Intermediate child — double-fork and exit ──────────── */
+
+        pid_t grandchild = fork();
+        if (grandchild < 0)
+            _exit(1);
+
+        if (grandchild > 0) {
+            /* Intermediate exits immediately — grandchild is
+             * reparented to init, no zombie possible. */
+            _exit(0);
+        }
+
+        /* ── Grandchild — becomes the actual helper ─────────────── */
+
+        /* Start a new session so we're fully detached from the
+         * PAM caller's process group and terminal. */
+        setsid();
 
         /* Restore default signal handlers */
         signal(SIGPIPE, SIG_DFL);
@@ -245,9 +259,18 @@ run_unlock_helper(const char *password)
         }
 
         /*
+         * Set PAM_USER in the child's environment so the helper can
+         * derive the user's UID and locate the D-Bus session bus.
+         * GDM's session worker runs as root and may not have
+         * DBUS_SESSION_BUS_ADDRESS or XDG_RUNTIME_DIR set.
+         */
+        if (username)
+            setenv("PAM_USER", username, 1);
+
+        /*
          * Exec the helper.  argv[0] is the binary name, no other args.
-         * Environment is inherited from the PAM caller (contains
-         * DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR, etc.).
+         * Environment is inherited from the PAM caller, augmented with
+         * PAM_USER above.
          */
         execl(ROSEC_PAM_UNLOCK_PATH, "rosec-pam-unlock", (char *)NULL);
 
@@ -255,9 +278,9 @@ run_unlock_helper(const char *password)
         _exit(127);
     }
 
-    /* ── Parent process ─────────────────────────────────────────── */
+    /* ── Parent process (fire-and-forget) ───────────────────────── */
 
-    /* Close the read end — only the child reads from the pipe */
+    /* Close the read end — only the grandchild reads from the pipe */
     close_safe(pipe_fds[0]);
     pipe_fds[0] = -1;
 
@@ -265,43 +288,11 @@ run_unlock_helper(const char *password)
     write_password_to_pipe(pipe_fds[1], password);
     pipe_fds[1] = -1;  /* already closed by write_password_to_pipe */
 
-    /* Wait for the child with a timeout to prevent hanging login */
-    {
-        int elapsed = 0;
-        int waited = 0;
-
-        while (elapsed < HELPER_TIMEOUT_SECS) {
-            pid_t ret = waitpid(pid, &status, WNOHANG);
-            if (ret == pid) {
-                waited = 1;
-                break;
-            }
-            if (ret < 0 && errno != EINTR) {
-                waited = 0;
-                break;
-            }
-            /* Sleep 100ms between polls */
-            usleep(100000);
-            elapsed++;  /* ~100ms granularity, close enough */
-        }
-
-        if (!waited) {
-            /* Timeout or waitpid error — kill the child and reap */
-            kill(pid, SIGTERM);
-            usleep(50000);
-            kill(pid, SIGKILL);
-            waitpid(pid, &status, 0);
-        }
-    }
+    /* Reap the intermediate child (it exits immediately) */
+    waitpid(pid, NULL, 0);
 
     /* Restore original signal handlers */
     sigaction(SIGPIPE, &sa_old_pipe, NULL);
-    sigaction(SIGCHLD, &sa_old_chld, NULL);
-
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-        return 0;
-
-    return -1;
 }
 
 /* ── PAM entry points ─────────────────────────────────────────────── */
@@ -310,7 +301,12 @@ run_unlock_helper(const char *password)
  * pam_sm_authenticate — `auth` phase.
  *
  * Capture the password from PAM_AUTHTOK (set by pam_unix or prior
- * modules) and stash a zeroize-on-cleanup copy for the session phase.
+ * modules).  We attempt to unlock immediately (for screen lockers that
+ * never call pam_open_session), AND stash a copy for the session phase
+ * as a fallback (for display managers like GDM that do call session).
+ *
+ * The helper is designed to fail silently if D-Bus isn't available yet
+ * (e.g. during initial login), so trying here is always safe.
  *
  * ALWAYS returns PAM_SUCCESS or PAM_IGNORE — never blocks login.
  */
@@ -318,6 +314,7 @@ PAM_EXTERN int
 pam_sm_authenticate(pam_handle_t *ph, int flags, int argc, const char **argv)
 {
     const char *password = NULL;
+    const char *username = NULL;
     char *stash = NULL;
     int ret;
 
@@ -325,36 +322,44 @@ pam_sm_authenticate(pam_handle_t *ph, int flags, int argc, const char **argv)
     (void)argc;
     (void)argv;
 
-    syslog(LOG_DEBUG, "pam_rosec: auth phase entered");
-
     /* Get the password that was set by an earlier auth module
      * (typically pam_unix).  If no password is available, that's fine
      * — we just won't be able to unlock anything. */
     ret = pam_get_item(ph, PAM_AUTHTOK, (const void **)&password);
-    if (ret != PAM_SUCCESS || password == NULL || password[0] == '\0') {
-        syslog(LOG_DEBUG, "pam_rosec: auth phase — no password available (ret=%d, null=%d)",
-               ret, password == NULL);
+    if (ret != PAM_SUCCESS || password == NULL || password[0] == '\0')
         return PAM_SUCCESS;
-    }
 
-    syslog(LOG_DEBUG, "pam_rosec: auth phase — got password, stashing");
+    /* Get username for the helper */
+    pam_get_item(ph, PAM_USER, (const void **)&username);
 
-    /* Stash a copy.  The cleanup callback zeroizes + frees it when
-     * the PAM transaction ends or the data is overwritten. */
+    /*
+     * Fire-and-forget: launch the unlock helper in the background.
+     * This handles screen lockers (hyprlock, swaylock, etc.) that
+     * authenticate but never open a session.  The helper runs
+     * asynchronously — PAM returns immediately and login is never
+     * delayed.
+     *
+     * The helper will fail silently if D-Bus / rosecd aren't
+     * available yet (initial login), which is fine.
+     */
+    run_unlock_helper(password, username);
+
+    /*
+     * Also stash a copy for the session phase.  Since the helper
+     * runs asynchronously we cannot know if it succeeded, and for
+     * initial login (GDM) the auth-phase helper may fail because
+     * the session bus isn't up yet.  The session phase retries.
+     */
     stash = strdup(password);
-    if (!stash) {
-        syslog(LOG_ERR, "pam_rosec: out of memory");
+    if (!stash)
         return PAM_SUCCESS;  /* still don't block login */
-    }
 
     ret = pam_set_data(ph, STASH_KEY, stash, cleanup_stash);
     if (ret != PAM_SUCCESS) {
         zeroize_free(stash);
-        syslog(LOG_ERR, "pam_rosec: failed to stash password");
         return PAM_SUCCESS;
     }
 
-    syslog(LOG_DEBUG, "pam_rosec: auth phase — password stashed OK");
     return PAM_SUCCESS;
 }
 
@@ -400,16 +405,16 @@ pam_sm_open_session(pam_handle_t *ph, int flags, int argc, const char **argv)
         return PAM_SUCCESS;
     }
 
-    syslog(LOG_DEBUG, "pam_rosec: session phase — got stashed password, running helper");
+    /* Get the username for the helper to derive the D-Bus bus path */
+    const char *username = NULL;
+    pam_get_item(ph, PAM_USER, (const void **)&username);
 
-    /* Run the unlock helper.  Failure is non-fatal. */
-    ret = run_unlock_helper(password);
+    syslog(LOG_DEBUG, "pam_rosec: session phase — got stashed password, launching helper for user=%s",
+           username ? username : "(null)");
 
-    if (ret == 0) {
-        syslog(LOG_INFO, "pam_rosec: unlocked providers");
-    } else {
-        syslog(LOG_DEBUG, "pam_rosec: session phase — helper returned %d", ret);
-    }
+    /* Fire-and-forget: launch the unlock helper in the background.
+     * The helper runs asynchronously — session setup is never delayed. */
+    run_unlock_helper(password, username);
 
     /*
      * Clear the stash.  The cleanup callback zeroizes the old copy.

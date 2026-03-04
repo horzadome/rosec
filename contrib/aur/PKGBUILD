@@ -132,7 +132,7 @@ package_rosec() {
     install -Dm755 target/release/rosecd "${pkgdir}/usr/bin/rosecd"
     install -Dm755 target/release/rosec  "${pkgdir}/usr/bin/rosec"
 
-    # PAM helper binary (must match pam_helper_paths in config)
+    # PAM helper binary — talks to rosecd over D-Bus to unlock providers
     install -Dm755 target/release/rosec-pam-unlock \
         "${pkgdir}/usr/lib/rosec/rosec-pam-unlock"
 
@@ -140,7 +140,7 @@ package_rosec() {
     install -Dm755 contrib/pam/pam_rosec.so \
         "${pkgdir}/usr/lib/security/pam_rosec.so"
 
-    # PAM config snippet (include from /etc/pam.d/system-login or screen locker)
+    # PAM config snippet (include from /etc/pam.d/system-local-login or screen locker)
     install -Dm644 contrib/pam/rosec \
         "${pkgdir}/etc/pam.d/rosec"
 
