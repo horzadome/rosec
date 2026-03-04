@@ -192,30 +192,39 @@ fn scan_directory(
         }
 
         // Step 1: signature verification (before loading into wasmtime).
+        let wasm_name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
         match verify_plugin(&path, verify) {
             Ok(VerifyOutcome::Verified) => {
                 info!(
-                    wasm = %path.file_name().unwrap_or_default().to_string_lossy(),
+                    wasm = %wasm_name,
+                    path = %path.display(),
+                    ?source,
                     verified = true,
-                    "verifying WASM plugin",
+                    "WASM plugin signature verified",
                 );
             }
             Ok(VerifyOutcome::Skipped { reason }) => {
                 warn!(
-                    wasm = %path.file_name().unwrap_or_default().to_string_lossy(),
-                    verified = false,
+                    wasm = %wasm_name,
+                    path = %path.display(),
+                    ?source,
                     skip_reason = %reason,
-                    "verifying WASM plugin",
+                    "skipping unsigned WASM plugin",
                 );
                 // Unverified plugins are never loaded.
                 continue;
             }
             Err(e) => {
                 warn!(
-                    wasm = %path.file_name().unwrap_or_default().to_string_lossy(),
-                    verified = false,
+                    wasm = %wasm_name,
+                    path = %path.display(),
+                    ?source,
                     error = %e,
-                    "verifying WASM plugin",
+                    "skipping WASM plugin with invalid signature",
                 );
                 // Invalid signature — never load.
                 continue;
