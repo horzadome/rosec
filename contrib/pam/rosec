@@ -1,0 +1,17 @@
+# /etc/pam.d/rosec — PAM config snippet for rosec auto-unlock.
+#
+# Include this from your login and screen-locker PAM configs:
+#
+#   # /etc/pam.d/system-login (after the existing auth/session lines):
+#   auth     include  rosec
+#   session  include  rosec
+#
+#   # /etc/pam.d/hyprlock (after the auth include):
+#   auth     include  rosec
+#   session  include  rosec
+#
+# Both lines are marked `optional` — pam_rosec.so CANNOT block login
+# or account lockout under any circumstances.
+
+auth     optional  pam_rosec.so
+session  optional  pam_rosec.so

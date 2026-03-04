@@ -1,0 +1,4 @@
+# Build artifacts
+*.so
+mock_unlock_helper
+test_pam_rosec
