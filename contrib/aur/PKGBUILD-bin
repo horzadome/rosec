@@ -17,20 +17,25 @@ url="https://github.com/jmylchreest/rosec"
 license=('MIT')
 depends=(
     'dbus'
+    'pam'
 )
 optdepends=(
     'libnotify: desktop notifications on lock/unlock'
-    'pam: PAM auto-unlock support via rosec-pam-unlock'
+)
+optdepends+=(
+    'rosec-provider-bitwarden-pm-bin: Bitwarden Password Manager provider'
+    'rosec-provider-bitwarden-sm-bin: Bitwarden Secrets Manager provider'
+    'rosec-provider-gnome-keyring-bin: GNOME Keyring read-only provider'
 )
 provides=('rosec' 'org.freedesktop.secrets')
 conflicts=('rosec')
 install=rosec.install
 
 source_x86_64=(
-    "${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/jmylchreest/${pkgname}/releases/download/v${pkgver}/${pkgname}-${pkgver}-x86_64-unknown-linux-gnu.tar.gz"
+    "rosec-${pkgver}-x86_64.tar.gz::https://github.com/jmylchreest/rosec/releases/download/v${pkgver}/rosec-${pkgver}-x86_64-unknown-linux-gnu.tar.gz"
 )
 source_aarch64=(
-    "${pkgname}-${pkgver}-aarch64.tar.gz::https://github.com/jmylchreest/${pkgname}/releases/download/v${pkgver}/${pkgname}-${pkgver}-aarch64-unknown-linux-gnu.tar.gz"
+    "rosec-${pkgver}-aarch64.tar.gz::https://github.com/jmylchreest/rosec/releases/download/v${pkgver}/rosec-${pkgver}-aarch64-unknown-linux-gnu.tar.gz"
 )
 
 sha256sums_x86_64=('@X86_64_SHA256@')
@@ -45,9 +50,19 @@ package() {
     install -Dm755 "${srcdir_inner}/rosecd" "${pkgdir}/usr/bin/rosecd"
     install -Dm755 "${srcdir_inner}/rosec"  "${pkgdir}/usr/bin/rosec"
 
-    # PAM helper (installed to libexec; must match pam_helper_paths in config)
+    # PAM helper binary (must match pam_helper_paths in config)
     install -Dm755 "${srcdir_inner}/rosec-pam-unlock" \
         "${pkgdir}/usr/lib/rosec/rosec-pam-unlock"
+
+    # PAM module (native .so — stashes password in auth, forks helper in session)
+    if [[ -f "${srcdir_inner}/pam_rosec.so" ]]; then
+        install -Dm755 "${srcdir_inner}/pam_rosec.so" \
+            "${pkgdir}/usr/lib/security/pam_rosec.so"
+    fi
+
+    # PAM config snippet (include from /etc/pam.d/system-login or screen locker)
+    install -Dm644 "${srcdir_inner}/contrib/pam/rosec" \
+        "${pkgdir}/etc/pam.d/rosec"
 
     # Service activation files (shipped as reference examples — use
     # `rosec enable` to generate them with correct binary paths at runtime)

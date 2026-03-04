@@ -181,6 +181,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             libdbus-1-dev \
+            libpam0g-dev \
             pkg-config
 
       - name: Install Rust toolchain
@@ -200,14 +201,18 @@ jobs:
         if: matrix.cross == false
         run: |
           cargo build --release --locked \
-            --bin rosecd --bin rosec --bin rosec-prompt \
+            --bin rosecd --bin rosec --bin rosec-prompt --bin rosec-pam-unlock \
             --target ${{ matrix.target }}
+
+      - name: Build PAM module (native only)
+        if: matrix.cross == false
+        run: make -C contrib/pam pam_rosec.so
 
       - name: Build (cross)
         if: matrix.cross == true
         run: |
           cross build --release --locked \
-            --bin rosecd --bin rosec --bin rosec-prompt \
+            --bin rosecd --bin rosec --bin rosec-prompt --bin rosec-pam-unlock \
             --target ${{ matrix.target }}
 
       - name: Package artifacts
@@ -220,8 +225,15 @@ jobs:
           cp "target/${TARGET}/release/rosecd" "${STAGE}/"
           cp "target/${TARGET}/release/rosec"  "${STAGE}/"
           cp "target/${TARGET}/release/rosec-prompt" "${STAGE}/"
+          cp "target/${TARGET}/release/rosec-pam-unlock" "${STAGE}/"
           cp -r contrib "${STAGE}/"
           cp README.md  "${STAGE}/" 2>/dev/null || true
+          cp LICENSE     "${STAGE}/" 2>/dev/null || true
+
+          # PAM module is only built for native targets (needs libpam-dev)
+          if [[ -f contrib/pam/pam_rosec.so ]]; then
+            cp contrib/pam/pam_rosec.so "${STAGE}/"
+          fi
 
           ARCHIVE="rosec-${VERSION}-${TARGET}.tar.gz"
           tar -czf "${ARCHIVE}" -C "dist" "${TARGET}"
@@ -519,6 +531,67 @@ jobs:
         uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
         with:
           pkgname: rosec-bin
+          pkgbuild: ${{ github.workspace }}/PKGBUILD-rendered
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
+          commit_message: "Update to ${{ needs.prepare.outputs.version }}"
+          force_push: true
+
+  # ---------------------------------------------------------------------------
+  # AUR provider -bin packages
+  #
+  # Each WASM provider gets its own AUR package. The PKGBUILD templates use
+  # @VERSION@ and @WASM_SHA256@ placeholders rendered from the release.
+  # ---------------------------------------------------------------------------
+  aur-publish-providers:
+    name: Publish provider -bin to AUR
+    runs-on: ubuntu-latest
+    needs: [prepare, release]
+    if: needs.prepare.outputs.is_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: bitwarden-pm
+            pkgbuild: contrib/aur/PKGBUILD-provider-bitwarden-pm-bin
+            aur_name: rosec-provider-bitwarden-pm-bin
+          - provider: bitwarden-sm
+            pkgbuild: contrib/aur/PKGBUILD-provider-bitwarden-sm-bin
+            aur_name: rosec-provider-bitwarden-sm-bin
+          - provider: gnome-keyring
+            pkgbuild: contrib/aur/PKGBUILD-provider-gnome-keyring-bin
+            aur_name: rosec-provider-gnome-keyring-bin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download WASM provider artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rosec-wasm-providers
+          path: artifacts
+
+      - name: Compute WASM checksum
+        id: checksums
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          ARCHIVE="artifacts/rosec-provider-${{ matrix.provider }}-${VERSION}.wasm.tar.gz"
+          WASM_SHA=$(sha256sum "${ARCHIVE}" | awk '{print $1}')
+          echo "wasm_sha=${WASM_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Render PKGBUILD from template
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          sed \
+            -e "s|@VERSION@|${VERSION}|g" \
+            -e "s|@WASM_SHA256@|${{ steps.checksums.outputs.wasm_sha }}|g" \
+            ${{ matrix.pkgbuild }} > "$GITHUB_WORKSPACE/PKGBUILD-rendered"
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        with:
+          pkgname: ${{ matrix.aur_name }}
           pkgbuild: ${{ github.workspace }}/PKGBUILD-rendered
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}

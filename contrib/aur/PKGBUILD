@@ -2,6 +2,7 @@
 #
 # AUR split package: rosec + rosec-provider-bitwarden-pm
 #                          + rosec-provider-bitwarden-sm
+#                          + rosec-provider-gnome-keyring
 #
 # Builds rosec and all WASM providers from source in a single build step.
 
@@ -10,6 +11,7 @@ pkgname=(
     'rosec'
     'rosec-provider-bitwarden-pm'
     'rosec-provider-bitwarden-sm'
+    'rosec-provider-gnome-keyring'
 )
 pkgver=r0.unknown
 pkgrel=1
@@ -76,6 +78,9 @@ prepare() {
 
     cd "${srcdir}/${pkgbase}/rosec-bitwarden-sm"
     cargo fetch --locked 2>/dev/null || cargo fetch
+
+    cd "${srcdir}/${pkgbase}/rosec-gnome-keyring"
+    cargo fetch --locked 2>/dev/null || cargo fetch
 }
 
 build() {
@@ -96,6 +101,10 @@ build() {
     cd "${srcdir}/${pkgbase}/rosec-bitwarden-sm"
     cargo build --target wasm32-wasip1 --release --locked 2>/dev/null || \
     cargo build --target wasm32-wasip1 --release
+
+    cd "${srcdir}/${pkgbase}/rosec-gnome-keyring"
+    cargo build --target wasm32-wasip1 --release --locked 2>/dev/null || \
+    cargo build --target wasm32-wasip1 --release
 }
 
 check() {
@@ -110,6 +119,7 @@ package_rosec() {
     optdepends=(
         'rosec-provider-bitwarden-pm: Bitwarden Password Manager provider'
         'rosec-provider-bitwarden-sm: Bitwarden Secrets Manager provider'
+        'rosec-provider-gnome-keyring: GNOME Keyring read-only provider'
         'libnotify: desktop notifications on lock/unlock'
     )
     provides=('org.freedesktop.secrets')
@@ -184,4 +194,19 @@ package_rosec-provider-bitwarden-sm() {
 
     install -Dm644 LICENSE \
         "${pkgdir}/usr/share/licenses/rosec-provider-bitwarden-sm/LICENSE"
+}
+
+package_rosec-provider-gnome-keyring() {
+    pkgdesc="GNOME Keyring read-only provider for rosec"
+    arch=('any')
+    depends=('rosec')
+    conflicts=('rosec-provider-gnome-keyring-bin')
+
+    cd "${srcdir}/${pkgbase}"
+
+    install -Dm644 rosec-gnome-keyring/target/wasm32-wasip1/release/rosec_gnome_keyring.wasm \
+        "${pkgdir}/usr/lib/rosec/providers/rosec_gnome_keyring.wasm"
+
+    install -Dm644 LICENSE \
+        "${pkgdir}/usr/share/licenses/rosec-provider-gnome-keyring/LICENSE"
 }
