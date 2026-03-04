@@ -430,7 +430,7 @@ jobs:
       - name: Compute checksums for PKGBUILD
         id: checksums
         run: |
-          X86_64_SHA=$(grep "x86_64-unknown-linux-gnu" artifacts/checksums.txt | awk '{print $1}' | head -1)
+          X86_64_SHA=$(awk '{print $1}' artifacts/rosec-*-x86_64-unknown-linux-gnu.tar.gz.sha256)
           echo "x86_64_sha=${X86_64_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Render PKGBUILD from template
@@ -439,13 +439,13 @@ jobs:
           sed \
             -e "s|@VERSION@|${VERSION}|g" \
             -e "s|@X86_64_SHA256@|${{ steps.checksums.outputs.x86_64_sha }}|g" \
-            contrib/aur/PKGBUILD-bin > /tmp/PKGBUILD
+            contrib/aur/PKGBUILD-bin > "$GITHUB_WORKSPACE/PKGBUILD-rendered"
 
       - name: Publish to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v3
         with:
           pkgname: rosec-bin
-          pkgbuild: /tmp/PKGBUILD
+          pkgbuild: ./PKGBUILD-rendered
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
