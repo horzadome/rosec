@@ -12,6 +12,27 @@ A [`org.freedesktop.secrets`](https://specifications.freedesktop.org/secret-serv
 
 ## Install
 
+### Arch Linux (AUR)
+
+**Build from source (recommended):**
+
+```bash
+git clone https://aur.archlinux.org/rosec.git
+cd rosec
+makepkg -si
+```
+
+This installs a split package: `rosec` (daemon + CLI + PAM helper) plus optional
+`rosec-provider-bitwarden-pm` and `rosec-provider-bitwarden-sm` WASM plugins.
+
+**Pre-built binary:**
+
+```bash
+git clone https://aur.archlinux.org/rosec-bin.git
+cd rosec-bin
+makepkg -si
+```
+
 ### From source
 
 ```bash
@@ -22,7 +43,28 @@ sudo install -m755 target/release/rosec-pam-unlock    /usr/lib/rosec/rosec-pam-u
 sudo install -m755 target/release/rosec-prompt        /usr/local/bin/
 ```
 
-### systemd + D-Bus activation (recommended)
+### systemd + D-Bus activation
+
+The recommended way to enable rosecd as a persistent user service with D-Bus
+activation is the `rosec enable` command, which installs the systemd unit and
+D-Bus service files into your user directories automatically:
+
+```bash
+rosec enable
+```
+
+This writes:
+- `~/.config/systemd/user/rosecd.service`
+- `~/.local/share/dbus-1/services/org.freedesktop.secrets.service`
+- `~/.local/share/dbus-1/services/org.gnome.keyring.service`
+
+...then reloads the systemd user daemon and enables the service.  To undo:
+
+```bash
+rosec disable
+```
+
+**Manual setup** (if you prefer to manage the files yourself):
 
 ```bash
 cp contrib/systemd/rosecd.service ~/.config/systemd/user/
@@ -100,6 +142,7 @@ rosec supports multiple providers simultaneously. Each is independently locked a
 | `local` | Local encrypted vault (AES-256, PBKDF2, key wrapping) | [docs/providers/local.md](docs/providers/local.md) |
 | `bitwarden` | Bitwarden Password Manager | [docs/providers/bitwarden.md](docs/providers/bitwarden.md) |
 | `bitwarden-sm` | Bitwarden Secrets Manager | [docs/providers/bitwarden-sm.md](docs/providers/bitwarden-sm.md) |
+| `gnome-keyring` | Read-only access to existing GNOME Keyring files | [docs/providers/gnome-keyring.md](docs/providers/gnome-keyring.md) |
 
 ### Managing providers
 
@@ -148,26 +191,67 @@ rosec provider detach <id>
 
 ## PAM auto-unlock
 
-`rosec-pam-unlock` is a `pam_exec` hook. At login, PAM passes your login password to the helper via stdin (`expose_authtok`). The helper sends it to `rosecd` via Unix pipe fd-passing (SCM_RIGHTS) — it never appears on the D-Bus wire. Any vault with a matching wrapping entry unlocks silently. Vaults without a match are skipped; login is never blocked.
+rosec ships a native PAM module (`pam_rosec.so`) that captures your login
+password during the `auth` phase, then passes it to `rosec-pam-unlock` during
+the `session` phase (when the D-Bus session bus is available).  This means
+your providers unlock automatically at both **initial login** and
+**screen unlock** — just like gnome-keyring does.
+
+The password is sent to `rosecd` via Unix pipe fd-passing (SCM_RIGHTS) — it
+never appears on the D-Bus wire.  Any provider with a matching password
+unlocks silently.  Providers without a match are skipped.  **Login is never
+blocked** — `pam_rosec.so` always returns `PAM_SUCCESS` on failure.
 
 ### Setup
 
-**1.** Install the binary (see [Install](#install)).
+**1.** Install the PAM module and helper:
 
-**2.** If your login password differs from your vault master password, add it as a wrapping entry:
+```bash
+# From the AUR package (installed automatically):
+#   /usr/lib/security/pam_rosec.so
+#   /usr/lib/rosec/rosec-pam-unlock
+#   /etc/pam.d/rosec
+
+# Or build manually:
+cd contrib/pam && make && sudo make install
+```
+
+**2.** If your login password differs from your vault master password, add it
+as a wrapping entry:
 
 ```bash
 rosec provider add-password <vault-id> --label pam
 ```
 
-Enter your **login password** when prompted. If it matches your vault master password, skip this step.
+Enter your **login password** when prompted. If it matches your vault master
+password, skip this step.
 
-**3.** Add to your PAM config after `pam_unix.so`:
+**3.** Add rosec to your PAM config.  A drop-in snippet is installed at
+`/etc/pam.d/rosec` — include it from whichever PAM service you use:
+
+**For login + screen lock (recommended — covers both):**
 
 ```
-# /etc/pam.d/system-login  (or login, sddm, gdm-password, lightdm, etc.)
-auth  optional  pam_exec.so  expose_authtok quiet /usr/lib/rosec/rosec-pam-unlock
+# /etc/pam.d/system-login — add at the end:
+auth     include   rosec
+session  include   rosec
 ```
+
+**For screen lockers only:**
+
+```
+# /etc/pam.d/hyprlock — add after the existing auth line:
+auth     include   rosec
+session  include   rosec
+```
+
+| Screen locker | PAM config |
+|---|---|
+| hyprlock | `/etc/pam.d/hyprlock` |
+| swaylock | `/etc/pam.d/swaylock` |
+| i3lock | `/etc/pam.d/i3lock` |
+| GDM | `/etc/pam.d/gdm-password` |
+| SDDM | `/etc/pam.d/sddm` |
 
 **4.** If you install to a non-standard path, configure the allowed helper paths:
 
@@ -177,12 +261,35 @@ auth  optional  pam_exec.so  expose_authtok quiet /usr/lib/rosec/rosec-pam-unloc
 pam_helper_paths = ["/home/you/rosec/target/debug/rosec-pam-unlock"]
 ```
 
+### Fallback: pam_exec (no native module)
+
+If you prefer not to install `pam_rosec.so`, the helper works standalone
+via `pam_exec`.  This only works for **screen unlock** (not initial login,
+because the session bus doesn't exist yet during the `auth` phase):
+
+```
+# /etc/pam.d/hyprlock — after auth:
+auth  optional  pam_exec.so  expose_authtok quiet /usr/lib/rosec/rosec-pam-unlock
+```
+
 ### Security
 
-- Password sent via Unix pipe fd-passing — never a D-Bus string argument
-- `AuthBackendFromPipe` only accepts calls from paths listed in `pam_helper_paths` (verified via `/proc/<pid>/exe`)
-- Password buffers zeroized after use in both helper and daemon
-- Configured `optional` — any failure exits with `PAM_IGNORE`, never blocking login
+- **Cannot block login:** `pam_rosec.so` returns `PAM_SUCCESS` on every
+  error path — stash failure, fork failure, helper timeout, helper crash.
+  The PAM config line uses `optional` as defence-in-depth.
+- **Password zeroization:** The stashed password is zeroized with
+  `explicit_bzero()` + volatile barrier on cleanup (PAM transaction end,
+  stash overwrite, or explicit clear after use).
+- **Password sent via pipe:** Never appears as a D-Bus message, argv
+  argument, or environment variable.  `rosec-pam-unlock` reads from stdin,
+  passes to `rosecd` via pipe fd (SCM_RIGHTS).
+- **Helper timeout:** If `rosec-pam-unlock` hangs, it is killed after 10
+  seconds.  Login continues normally.
+- **Minimal attack surface:** The `.so` is 17 KB of C with no runtime
+  dependencies beyond libc and libpam.  All crypto and D-Bus logic lives
+  in the separate `rosec-pam-unlock` binary.
+- **Process isolation:** All fds above stderr are closed in the child
+  before exec.  stdout/stderr are redirected to `/dev/null`.
 
 ---
 
@@ -237,15 +344,58 @@ Full reference: [docs/configuration.md](docs/configuration.md)
 
 ---
 
+## Migrating from GNOME Keyring
+
+rosec includes a read-only `gnome-keyring` provider (WASM plugin) that reads
+your existing `~/.local/share/keyrings/*.keyring` files directly.  This lets
+you run rosec as the Secret Service daemon while still accessing your old
+GNOME Keyring items — no export/import needed.
+
+**1.** Stop gnome-keyring-daemon and enable rosec (see [Install](#install)):
+
+```bash
+systemctl --user mask gnome-keyring-daemon.service gnome-keyring-daemon.socket
+rosec enable
+```
+
+**2.** Add the `gnome-keyring` provider to your config:
+
+```toml
+# ~/.config/rosec/config.toml
+[[provider]]
+kind = "gnome-keyring"
+id   = "gnome-keyring"
+name = "GNOME Keyring"
+```
+
+**3.** Unlock it (you will be prompted for your GNOME Keyring password —
+usually your login password):
+
+```bash
+rosec provider auth gnome-keyring
+```
+
+Your existing GNOME Keyring items are now accessible via `org.freedesktop.secrets`
+alongside any other rosec providers.
+
+> **Note:** the `gnome-keyring` provider is **read-only**.  Items created by
+> applications while rosec is running are stored in whichever rosec provider
+> is designated as the write target (typically your `local` vault).  Once you
+> have migrated, you can remove the `gnome-keyring` provider from your config.
+
+---
+
 ## FAQ
 
 **`gnome-keyring-daemon` keeps stealing `org.freedesktop.secrets`**
 
 ```bash
 systemctl --user mask gnome-keyring-daemon.service gnome-keyring-daemon.socket
+rosec enable
 ```
 
-Then override D-Bus activation using the contrib files (see [Install](#install)). User-level files in `~/.local/share/dbus-1/services/` take precedence over system files per the D-Bus spec.
+User-level D-Bus service files in `~/.local/share/dbus-1/services/` (written
+by `rosec enable`) take precedence over system files per the D-Bus spec.
 
 **How do I update my Bitwarden master password?**
 

@@ -1,0 +1,28 @@
+[package]
+name = "rosec-gnome-keyring"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+description = "GNOME Keyring read-only provider as an Extism WASM guest plugin for rosec"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Extism guest SDK
+extism-pdk = "1.4.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto — GNOME Keyring binary format uses MD5-based KDF + AES-128-CBC
+md-5 = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+block-padding = "0.3"
+base64 = "0.22"
+
+# Zeroize for secret scrubbing
+zeroize = { version = "1", features = ["derive"] }
