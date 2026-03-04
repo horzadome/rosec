@@ -36,7 +36,29 @@ sha256sums=('SKIP')
 
 pkgver() {
     cd "${srcdir}/${pkgbase}"
-    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+    # Mirror release.yml / Justfile version derivation:
+    #   semver:  0.0.7-dev.5+e1fcd29   (CI/Justfile)
+    #   git tag: v0.0.7-dev.5           (GitHub, no + allowed)
+    #   pacman:  0.0.7dev5              (no hyphens/+/colons/slashes allowed)
+    #
+    # vercmp sorts alphanumeric suffixes before bare versions:
+    #   0.0.6 < 0.0.7dev1 < 0.0.7dev5 < 0.0.7 < 0.0.8dev1
+    # This gives correct prerelease ordering for free.
+    local describe
+    describe=$(git describe --tags --long --match 'v[0-9]*')
+    if [[ $describe =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)-([0-9]+)-g([a-f0-9]+)$ ]]; then
+        local major=${BASH_REMATCH[1]}
+        local minor=${BASH_REMATCH[2]}
+        local patch=${BASH_REMATCH[3]}
+        local commits=${BASH_REMATCH[4]}
+        if (( commits == 0 )); then
+            printf '%s.%s.%s' "$major" "$minor" "$patch"
+        else
+            printf '%s.%s.%sdev%s' "$major" "$minor" "$((patch + 1))" "$commits"
+        fi
+    else
+        printf '0.0.0dev0'
+    fi
 }
 
 prepare() {
