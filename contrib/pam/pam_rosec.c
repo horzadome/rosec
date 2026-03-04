@@ -325,13 +325,19 @@ pam_sm_authenticate(pam_handle_t *ph, int flags, int argc, const char **argv)
     (void)argc;
     (void)argv;
 
+    syslog(LOG_DEBUG, "pam_rosec: auth phase entered");
+
     /* Get the password that was set by an earlier auth module
      * (typically pam_unix).  If no password is available, that's fine
      * — we just won't be able to unlock anything. */
     ret = pam_get_item(ph, PAM_AUTHTOK, (const void **)&password);
     if (ret != PAM_SUCCESS || password == NULL || password[0] == '\0') {
+        syslog(LOG_DEBUG, "pam_rosec: auth phase — no password available (ret=%d, null=%d)",
+               ret, password == NULL);
         return PAM_SUCCESS;
     }
+
+    syslog(LOG_DEBUG, "pam_rosec: auth phase — got password, stashing");
 
     /* Stash a copy.  The cleanup callback zeroizes + frees it when
      * the PAM transaction ends or the data is overwritten. */
@@ -348,6 +354,7 @@ pam_sm_authenticate(pam_handle_t *ph, int flags, int argc, const char **argv)
         return PAM_SUCCESS;
     }
 
+    syslog(LOG_DEBUG, "pam_rosec: auth phase — password stashed OK");
     return PAM_SUCCESS;
 }
 
@@ -383,30 +390,26 @@ pam_sm_open_session(pam_handle_t *ph, int flags, int argc, const char **argv)
     (void)argc;
     (void)argv;
 
+    syslog(LOG_DEBUG, "pam_rosec: session phase entered");
+
     /* Retrieve the stashed password from the auth phase */
     ret = pam_get_data(ph, STASH_KEY, (const void **)&password);
     if (ret != PAM_SUCCESS || password == NULL || password[0] == '\0') {
-        /*
-         * No stashed password.  This is normal if:
-         *   - This PAM service didn't run the auth phase (some screen
-         *     lockers only define session).
-         *   - The auth module was called from a different process (some
-         *     display managers do this).
-         *   - No password was entered (e.g. fingerprint auth).
-         *
-         * In all cases, we silently do nothing.
-         */
+        syslog(LOG_DEBUG, "pam_rosec: session phase — no stashed password (ret=%d, null=%d)",
+               ret, password == NULL);
         return PAM_SUCCESS;
     }
+
+    syslog(LOG_DEBUG, "pam_rosec: session phase — got stashed password, running helper");
 
     /* Run the unlock helper.  Failure is non-fatal. */
     ret = run_unlock_helper(password);
 
     if (ret == 0) {
         syslog(LOG_INFO, "pam_rosec: unlocked providers");
+    } else {
+        syslog(LOG_DEBUG, "pam_rosec: session phase — helper returned %d", ret);
     }
-    /* On failure: no log at all to avoid noise in normal cases
-     * (e.g. rosecd not running at initial login) */
 
     /*
      * Clear the stash.  The cleanup callback zeroizes the old copy.
