@@ -22,10 +22,22 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use extism::{Manifest, Plugin, Wasm};
+use extism::{Manifest, PluginBuilder, Wasm};
+use minisign_verify::{PublicKey, Signature};
+use rosec_core::{WasmPreference, WasmVerify};
 use tracing::{debug, info, warn};
 
+use crate::keys::WASM_SIGNING_PUBKEY;
 use crate::protocol::{PluginManifest, PluginOptionDescriptor};
+
+/// Maximum `.wasm` file size accepted during probing (10 MiB).
+const MAX_WASM_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Fuel limit for the `plugin_manifest` call during probing (per plugin instance).
+/// 250K instructions — ~6× headroom over the most complex observed provider
+/// (~37K instructions for bitwarden-pm).  Kills runaway code in the WASM
+/// `start` section or `plugin_manifest` without affecting legitimate plugins.
+const PROBE_FUEL_LIMIT: u64 = 250_000;
 
 /// System-wide provider directory (for distro packages).
 const SYSTEM_PLUGIN_DIR: &str = "/usr/lib/rosec/providers";
@@ -87,6 +99,13 @@ impl PluginRegistry {
 
 // ── Scanning ─────────────────────────────────────────────────────
 
+/// Which directory a discovered plugin came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginSource {
+    System,
+    User,
+}
+
 /// Scan the standard provider directories and return a registry of
 /// discovered providers.
 ///
@@ -94,17 +113,35 @@ impl PluginRegistry {
 /// 1. System-wide (`/usr/lib/rosec/providers/`)
 /// 2. User-local (`$XDG_DATA_HOME/rosec/providers/`)
 ///
-/// User-local providers override system-wide providers with the same kind.
-pub fn scan_plugins() -> PluginRegistry {
+/// When the same kind appears in both directories, `preference` controls
+/// which copy wins:
+/// - `User` (default) — user-local always wins
+/// - `System` — system copy always wins
+/// - `Newest` — compare semver `version` fields; ties fall back to user-local
+///
+/// `verify` controls signature checking before probing each plugin.
+pub fn scan_plugins(preference: WasmPreference, verify: WasmVerify) -> PluginRegistry {
     let mut registry = PluginRegistry::default();
 
     // 1. System-wide directory.
     let system_dir = PathBuf::from(SYSTEM_PLUGIN_DIR);
-    scan_directory(&system_dir, &mut registry);
+    scan_directory(
+        &system_dir,
+        &mut registry,
+        PluginSource::System,
+        preference,
+        verify,
+    );
 
     // 2. User-local directory.
     if let Some(user_dir) = user_plugin_dir() {
-        scan_directory(&user_dir, &mut registry);
+        scan_directory(
+            &user_dir,
+            &mut registry,
+            PluginSource::User,
+            preference,
+            verify,
+        );
     }
 
     if registry.is_empty() {
@@ -120,10 +157,16 @@ pub fn scan_plugins() -> PluginRegistry {
     registry
 }
 
-/// Scan a single directory for `.wasm` files and register their
-/// manifests.  Later calls with the same kind overwrite earlier ones
-/// (user-local overrides system-wide).
-fn scan_directory(dir: &Path, registry: &mut PluginRegistry) {
+/// Scan a single directory for `.wasm` files and register their manifests.
+/// When a kind already exists in the registry, the preference policy decides
+/// whether to replace it.
+fn scan_directory(
+    dir: &Path,
+    registry: &mut PluginRegistry,
+    source: PluginSource,
+    preference: WasmPreference,
+    verify: WasmVerify,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -148,15 +191,60 @@ fn scan_directory(dir: &Path, registry: &mut PluginRegistry) {
             continue;
         }
 
+        // Step 1: signature verification (before loading into wasmtime).
+        match verify_plugin(&path, verify) {
+            Ok(VerifyOutcome::Verified) => {
+                info!(
+                    wasm = %path.file_name().unwrap_or_default().to_string_lossy(),
+                    verified = true,
+                    "verifying WASM plugin",
+                );
+            }
+            Ok(VerifyOutcome::Skipped { reason }) => {
+                warn!(
+                    wasm = %path.file_name().unwrap_or_default().to_string_lossy(),
+                    verified = false,
+                    skip_reason = %reason,
+                    "verifying WASM plugin",
+                );
+                // Unverified plugins are never loaded.
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    wasm = %path.file_name().unwrap_or_default().to_string_lossy(),
+                    verified = false,
+                    error = %e,
+                    "verifying WASM plugin",
+                );
+                // Invalid signature — never load.
+                continue;
+            }
+        }
+
+        // Step 2: probe the plugin (fuel-limited, size-capped).
         match probe_plugin(&path) {
             Ok(manifest) => {
                 let kind = manifest.kind.clone();
-                if registry.plugins.contains_key(&kind) {
-                    info!(
-                        kind = %kind,
-                        path = %path.display(),
-                        "overriding previously discovered plugin",
-                    );
+                if let Some(existing) = registry.plugins.get(&kind) {
+                    let replace = should_replace(existing, &manifest, source, preference);
+                    if replace {
+                        info!(
+                            kind = %kind,
+                            path = %path.display(),
+                            ?source,
+                            ?preference,
+                            "overriding previously discovered plugin",
+                        );
+                    } else {
+                        debug!(
+                            kind = %kind,
+                            path = %path.display(),
+                            ?source,
+                            "keeping existing plugin, skipping",
+                        );
+                        continue;
+                    }
                 }
                 debug!(
                     kind = %kind,
@@ -182,17 +270,117 @@ fn scan_directory(dir: &Path, registry: &mut PluginRegistry) {
     }
 }
 
+/// Decide whether the incoming plugin should replace the existing registry
+/// entry, based on the configured preference.
+fn should_replace(
+    existing: &DiscoveredPlugin,
+    incoming: &PluginManifest,
+    source: PluginSource,
+    preference: WasmPreference,
+) -> bool {
+    match preference {
+        WasmPreference::User => source == PluginSource::User,
+        WasmPreference::System => source == PluginSource::System,
+        WasmPreference::Newest => {
+            let zero = semver::Version::new(0, 0, 0);
+            let existing_ver = existing.manifest.version.as_ref().unwrap_or(&zero);
+            let incoming_ver = incoming.version.as_ref().unwrap_or(&zero);
+            if incoming_ver > existing_ver {
+                true
+            } else if incoming_ver == existing_ver {
+                // Tie-break: prefer user-local.
+                source == PluginSource::User
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Outcome of signature verification.
+enum VerifyOutcome {
+    Verified,
+    Skipped { reason: &'static str },
+}
+
+/// Check the signature of a `.wasm` file according to the configured policy.
+///
+/// Returns `Ok(Verified)` if the signature is present and valid,
+/// `Ok(Skipped)` if verification is disabled or the sig is absent under
+/// `IfPresent`, or `Err` if the signature is present but invalid.
+fn verify_plugin(wasm_path: &Path, verify: WasmVerify) -> Result<VerifyOutcome, anyhow::Error> {
+    if verify == WasmVerify::Disabled {
+        return Ok(VerifyOutcome::Skipped { reason: "disabled" });
+    }
+
+    let sig_path = wasm_path.with_extension("wasm.minisig");
+
+    if !sig_path.exists() {
+        return match verify {
+            WasmVerify::IfPresent => Ok(VerifyOutcome::Skipped {
+                reason: "sig-not-present",
+            }),
+            WasmVerify::Required => Err(anyhow::anyhow!(
+                "signature file '{}' not found (wasm_verify = required)",
+                sig_path.display(),
+            )),
+            WasmVerify::Disabled => unreachable!(),
+        };
+    }
+
+    let pk = PublicKey::from_base64(WASM_SIGNING_PUBKEY)
+        .map_err(|e| anyhow::anyhow!("invalid embedded public key: {e}"))?;
+
+    let signature = Signature::from_file(&sig_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to read signature file '{}': {e}",
+            sig_path.display()
+        )
+    })?;
+
+    let wasm_bytes = std::fs::read(wasm_path)
+        .map_err(|e| anyhow::anyhow!("failed to read WASM file '{}': {e}", wasm_path.display()))?;
+
+    pk.verify(&wasm_bytes, &signature, false).map_err(|e| {
+        anyhow::anyhow!(
+            "signature verification failed for '{}': {e}",
+            wasm_path.display()
+        )
+    })?;
+
+    Ok(VerifyOutcome::Verified)
+}
+
 /// Load a `.wasm` file and call `plugin_manifest()` to extract its
 /// metadata.  The plugin is discarded after probing.
+///
+/// Guards:
+/// - File size capped at [`MAX_WASM_SIZE_BYTES`] before loading.
+/// - Fuel-limited to [`PROBE_FUEL_LIMIT`] instructions to prevent
+///   runaway execution in the WASM `start` section or `plugin_manifest`.
 fn probe_plugin(wasm_path: &Path) -> Result<PluginManifest, anyhow::Error> {
+    // Size cap — reject before handing to wasmtime.
+    let file_size = std::fs::metadata(wasm_path)
+        .map_err(|e| anyhow::anyhow!("cannot stat '{}': {e}", wasm_path.display()))?
+        .len();
+    if file_size > MAX_WASM_SIZE_BYTES {
+        return Err(anyhow::anyhow!(
+            "'{}' is {file_size} bytes, exceeds limit of {MAX_WASM_SIZE_BYTES}",
+            wasm_path.display(),
+        ));
+    }
+
     let wasm = Wasm::file(wasm_path);
-    // No allowed hosts for probing — we only call plugin_manifest which
-    // should not make HTTP requests.
+    // No allowed hosts for probing — plugin_manifest must not make HTTP requests.
     let manifest = Manifest::new([wasm]);
 
-    let mut plugin = Plugin::new(&manifest, [], true).map_err(|e| {
-        anyhow::anyhow!("failed to load WASM plugin '{}': {e}", wasm_path.display(),)
-    })?;
+    let mut plugin = PluginBuilder::new(manifest)
+        .with_wasi(true)
+        .with_fuel_limit(PROBE_FUEL_LIMIT)
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!("failed to load WASM plugin '{}': {e}", wasm_path.display())
+        })?;
 
     if !plugin.function_exists("plugin_manifest") {
         return Err(anyhow::anyhow!(

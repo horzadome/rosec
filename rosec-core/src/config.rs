@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AutoLockOverride, AutoLockPolicy, DedupStrategy, DedupTimeFallback};
+use crate::{
+    AutoLockOverride, AutoLockPolicy, DedupStrategy, DedupTimeFallback, WasmPreference, WasmVerify,
+};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -39,6 +41,24 @@ pub struct ServiceConfig {
     /// custom paths for development / non-standard installs.
     #[serde(default = "default_pam_helper_paths")]
     pub pam_helper_paths: Vec<String>,
+    /// When the same WASM provider kind is found in both the system
+    /// (`/usr/lib/rosec/providers/`) and user (`$XDG_DATA_HOME/rosec/providers/`)
+    /// directories, controls which copy is preferred.
+    ///
+    /// - `"user"` (default) — user-local copy always wins
+    /// - `"system"` — system copy always wins
+    /// - `"newest"` — compare `version` fields from each plugin's manifest;
+    ///   the higher semver wins.  Ties (or missing versions) fall back to `"user"`.
+    #[serde(default)]
+    pub wasm_prefer: WasmPreference,
+    /// Controls signature verification of WASM provider plugins.
+    ///
+    /// - `"if-present"` (default) — verify if `.wasm.sig` exists; skip with
+    ///   warning if absent; never load a plugin with an invalid signature
+    /// - `"required"` — reject plugins without a valid `.wasm.sig`
+    /// - `"disabled"` — skip all verification (local development only)
+    #[serde(default)]
+    pub wasm_verify: WasmVerify,
 }
 
 impl Default for ServiceConfig {
@@ -49,6 +69,8 @@ impl Default for ServiceConfig {
             refresh_interval_secs: None,
             write_provider: None,
             pam_helper_paths: default_pam_helper_paths(),
+            wasm_prefer: WasmPreference::default(),
+            wasm_verify: WasmVerify::default(),
         }
     }
 }

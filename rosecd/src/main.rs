@@ -51,7 +51,8 @@ async fn run() -> Result<()> {
     );
 
     // Discover WASM plugins from system and user directories.
-    let plugin_registry = rosec_wasm::discovery::scan_plugins();
+    let plugin_registry =
+        rosec_wasm::discovery::scan_plugins(config.service.wasm_prefer, config.service.wasm_verify);
 
     let router_config = RouterConfig {
         dedup_strategy: config.service.dedup_strategy,
@@ -1121,7 +1122,10 @@ async fn config_watcher(
         });
         if needs_rescan {
             tracing::info!("hot-reload: re-scanning WASM plugins for new provider kinds");
-            plugin_registry = rosec_wasm::discovery::scan_plugins();
+            plugin_registry = rosec_wasm::discovery::scan_plugins(
+                new_config.service.wasm_prefer,
+                new_config.service.wasm_verify,
+            );
         }
 
         for entry in &new_config.provider {

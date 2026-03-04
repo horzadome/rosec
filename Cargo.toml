@@ -15,10 +15,11 @@ members = [
 exclude = [
     "rosec-bitwarden-pm",
     "rosec-bitwarden-sm",
+    "rosec-gnome-keyring",
 ]
 
 [workspace.package]
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"
@@ -51,6 +52,8 @@ toml_edit = "0.25"
 futures-util = { version = "0.3", features = ["sink"] }
 wildmatch = "2.6.1"
 chrono = { version = "0.4", features = ["serde"] }
+semver = { version = "1", features = ["serde"] }
+minisign-verify = "0.2"
 pbkdf2 = "0.12.2"
 tempfile = "3"
 

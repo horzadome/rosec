@@ -165,8 +165,8 @@ async fn unlock_vaults_async(password: &[u8]) -> Result<(), ()> {
         proxy.call("ProviderList", &()).await.map_err(|_| ())?;
 
     let mut any_unlocked = false;
-    for (id, _name, kind, locked) in &providers {
-        if kind != "vault" || !locked {
+    for (id, _name, _kind, locked) in &providers {
+        if !locked {
             continue;
         }
 

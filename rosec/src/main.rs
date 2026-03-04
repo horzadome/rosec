@@ -9,6 +9,7 @@ use zbus::Connection;
 use zeroize::Zeroizing;
 use zvariant::{OwnedObjectPath, OwnedValue};
 
+use rosec_core::WasmPreference;
 use rosec_core::config::Config;
 use rosec_core::config_edit;
 
@@ -295,7 +296,10 @@ fn cmd_provider_kinds() {
     }
 
     // List dynamically discovered WASM plugin kinds.
-    let registry = rosec_wasm::discovery::scan_plugins();
+    let registry = rosec_wasm::discovery::scan_plugins(
+        WasmPreference::default(),
+        rosec_core::WasmVerify::default(),
+    );
     for kind in registry.kinds() {
         let plugin = registry
             .get(kind)
@@ -1027,7 +1031,10 @@ async fn cmd_provider_auth(args: &[String]) -> Result<()> {
 /// `rosec provider add <kind> [--id <id>] [key=value ...]`
 async fn cmd_provider_add(args: &[String]) -> Result<()> {
     // Scan for discovered plugin kinds so we can validate and prompt correctly.
-    let registry = rosec_wasm::discovery::scan_plugins();
+    let registry = rosec_wasm::discovery::scan_plugins(
+        WasmPreference::default(),
+        rosec_core::WasmVerify::default(),
+    );
 
     let all_kinds: Vec<String> = {
         let mut v: Vec<String> = config_edit::KNOWN_KINDS

@@ -2570,6 +2570,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3786,7 +3792,7 @@ dependencies = [
 
 [[package]]
 name = "rosec"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -3808,7 +3814,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-core"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "aes",
  "anyhow",
@@ -3819,6 +3825,7 @@ dependencies = [
  "chrono",
  "hmac",
  "rand 0.10.0",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -3832,7 +3839,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-fuse"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "fuser",
@@ -3848,7 +3855,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-pam"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "libc",
  "tokio",
@@ -3859,7 +3866,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-prompt"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "iced",
@@ -3874,7 +3881,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-secret-service"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "aes",
  "anyhow",
@@ -3902,7 +3909,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-ssh-agent"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "libc",
@@ -3918,7 +3925,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-vault"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "aes",
  "anyhow",
@@ -3944,7 +3951,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-wasm"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3952,7 +3959,9 @@ dependencies = [
  "chrono",
  "extism",
  "hkdf",
+ "minisign-verify",
  "rosec-core",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
@@ -3964,7 +3973,7 @@ dependencies = [
 
 [[package]]
 name = "rosecd"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "anyhow",
  "futures-util",

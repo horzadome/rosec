@@ -27,6 +27,7 @@
 //! | `capabilities`           | *(empty)*                | `CapabilitiesResponse`       |
 
 pub mod discovery;
+pub mod keys;
 pub mod protocol;
 mod provider;
 mod wasm_cred;

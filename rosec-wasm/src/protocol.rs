@@ -343,6 +343,11 @@ pub struct PluginManifest {
     pub name: String,
     /// Short description shown in `rosec provider kinds`.
     pub description: String,
+    /// Plugin version (semver).  Used by the host when the same kind is
+    /// found in multiple directories to select the newest copy.
+    /// Guests that omit this are treated as version `0.0.0`.
+    #[serde(default)]
+    pub version: Option<semver::Version>,
     /// HTTP hosts the plugin needs access to (defaults).
     /// Users can override via config.
     #[serde(default)]

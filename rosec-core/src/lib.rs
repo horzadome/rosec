@@ -1003,6 +1003,41 @@ pub enum DedupTimeFallback {
     None,
 }
 
+/// Controls which copy of a WASM provider is preferred when the same kind
+/// is found in both the system and user provider directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WasmPreference {
+    /// User-local copy always wins (default).
+    #[default]
+    User,
+    /// System copy always wins.
+    System,
+    /// Pick the copy with the higher semver `version` field in its manifest.
+    /// Ties or missing versions fall back to user-local.
+    Newest,
+}
+
+/// Controls signature verification of WASM provider plugins before probing.
+///
+/// A `.wasm.sig` file (minisign format, ed25519) is expected alongside the
+/// `.wasm` file.  The public key is baked into the `rosec-wasm` crate at
+/// build time from the CI signing key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WasmVerify {
+    /// Verify signature if a `.wasm.sig` file exists; warn and skip if absent.
+    /// Unverified plugins (missing or invalid sig) are never loaded.
+    #[default]
+    IfPresent,
+    /// Signature is required.  Plugins without a valid `.wasm.sig` are
+    /// rejected and never loaded.
+    Required,
+    /// Signature verification is disabled.  All plugins are loaded regardless.
+    /// Only use for local development builds.
+    Disabled,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoLockPolicy {
