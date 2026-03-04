@@ -28,6 +28,7 @@ makedepends=(
     'cargo'
     'pkg-config'
     'dbus'
+    'pam'
 )
 
 source=("${pkgbase}::git+https://github.com/jmylchreest/rosec.git")
@@ -61,6 +62,10 @@ build() {
     cargo build --release --locked --bin rosecd --bin rosec --bin rosec-pam-unlock 2>/dev/null || \
     cargo build --release         --bin rosecd --bin rosec --bin rosec-pam-unlock
 
+    # Build PAM module (C, no Rust deps — tiny .so for libpam)
+    cd "${srcdir}/${pkgbase}/contrib/pam"
+    make
+
     # Build WASM providers
     cd "${srcdir}/${pkgbase}/rosec-bitwarden-pm"
     cargo build --target wasm32-wasip1 --release --locked 2>/dev/null || \
@@ -79,12 +84,11 @@ check() {
 
 package_rosec() {
     pkgdesc="Read-only Secret Service daemon with Bitwarden backend"
-    depends=('dbus')
+    depends=('dbus' 'pam')
     optdepends=(
         'rosec-provider-bitwarden-pm: Bitwarden Password Manager provider'
         'rosec-provider-bitwarden-sm: Bitwarden Secrets Manager provider'
         'libnotify: desktop notifications on lock/unlock'
-        'pam: PAM auto-unlock support via rosec-pam-unlock'
     )
     provides=('org.freedesktop.secrets')
     conflicts=('rosec-bin')
@@ -96,9 +100,17 @@ package_rosec() {
     install -Dm755 target/release/rosecd "${pkgdir}/usr/bin/rosecd"
     install -Dm755 target/release/rosec  "${pkgdir}/usr/bin/rosec"
 
-    # PAM helper (installed to libexec; must match pam_helper_paths in config)
+    # PAM helper binary (must match pam_helper_paths in config)
     install -Dm755 target/release/rosec-pam-unlock \
         "${pkgdir}/usr/lib/rosec/rosec-pam-unlock"
+
+    # PAM module (native .so — stashes password in auth, forks helper in session)
+    install -Dm755 contrib/pam/pam_rosec.so \
+        "${pkgdir}/usr/lib/security/pam_rosec.so"
+
+    # PAM config snippet (include from /etc/pam.d/system-login or screen locker)
+    install -Dm644 contrib/pam/rosec \
+        "${pkgdir}/etc/pam.d/rosec"
 
     # Service activation files (shipped as reference examples — use
     # `rosec enable` to generate them with correct binary paths at runtime)
