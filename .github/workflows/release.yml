@@ -447,8 +447,8 @@ jobs:
         with:
           pkgname: rosec-bin
           pkgbuild: /tmp/PKGBUILD
-          commit_username: rosec-bot
-          commit_email: bot@rosec
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
           commit_message: "Update to ${{ needs.prepare.outputs.version }}"
           force_push: true
