@@ -206,7 +206,12 @@ _release version push="":
     echo "Mode: EXECUTE + PUSH — this will commit, tag, and push to origin"
     echo ""
     cargo release "${VERSION}" --execute --no-confirm
-    git push --follow-tags origin HEAD
+    # Push branch and tag separately so GitHub fires distinct workflow events.
+    # --follow-tags in a single push can cause GitHub to only trigger for the
+    # branch ref, which then skips (it sees the tag on HEAD). The tag ref
+    # never gets its own workflow run.
+    git push origin HEAD
+    git push origin "v${VERSION}"
     echo ""
     echo "Pushed v${VERSION} — GHA release workflow will now build and publish."
   else
