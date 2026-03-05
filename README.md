@@ -413,6 +413,19 @@ fusermount3 -uz "$XDG_RUNTIME_DIR/rosec/ssh"
 
 ---
 
+## Shell integration
+
+A zsh plugin is included for fetching secrets and exporting them as environment variables.
+
+```
+# ~/.zsh_plugins.txt (antidote)
+jmylchreest/rosec path:contrib/zsh kind:defer
+```
+
+Provides `get-key` (print a secret) and `rosec-env` (fetch + export). See [contrib/zsh/README.md](contrib/zsh/README.md) for full documentation.
+
+---
+
 ## Development
 
 ```bash

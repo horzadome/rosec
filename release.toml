@@ -32,9 +32,14 @@ pre-release-commit-message = "chore: release v{{version}}"
 # Run these checks before doing anything. Mirrors what GHA CI runs.
 pre-release-hook = ["cargo", "clippy", "--", "-D", "warnings"]
 
+# Sign the release commit and tag (requires gpg.format = ssh or GPG in git config).
+sign-commit = true
+sign-tag = true
+
 # Do not push by default — the Justfile controls when to push.
 # This prevents accidental pushes when running cargo-release directly.
 push = false
 
-# Do not create a GitHub release — GHA does that on tag push.
-release = false
+# Note: do NOT set `release = false` here — cargo-release interprets that as
+# "skip this package entirely", not "don't create a GitHub release".
+# GitHub releases are handled by GHA on tag push, not by cargo-release.
