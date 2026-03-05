@@ -144,18 +144,8 @@ package_rosec() {
     install -Dm644 contrib/pam/rosec \
         "${pkgdir}/etc/pam.d/rosec"
 
-    # Service activation files (shipped as reference examples — use
-    # `rosec enable` to generate them with correct binary paths at runtime)
-    install -Dm644 contrib/systemd/rosecd.service \
-        "${pkgdir}/usr/share/doc/rosec/systemd/rosecd.service"
-    install -Dm644 contrib/systemd/rosecd.socket \
-        "${pkgdir}/usr/share/doc/rosec/systemd/rosecd.socket"
-    install -Dm644 contrib/dbus/org.freedesktop.secrets.service \
-        "${pkgdir}/usr/share/doc/rosec/dbus/org.freedesktop.secrets.service"
-    install -Dm644 contrib/dbus/org.gnome.keyring.service \
-        "${pkgdir}/usr/share/doc/rosec/dbus/org.gnome.keyring.service"
-    install -Dm644 contrib/autostart/rosecd.desktop \
-        "${pkgdir}/usr/share/doc/rosec/autostart/rosecd.desktop"
+    # Service activation files are generated at runtime by `rosec enable`
+    # with the correct binary paths — no static copies shipped.
 
     # Docs
     install -Dm644 README.md \

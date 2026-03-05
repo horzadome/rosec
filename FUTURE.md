@@ -52,21 +52,10 @@ contrib/
 ```bash
 # 1. Install the binary (or adjust paths below to ~/.cargo/bin/rosecd)
 sudo install -m755 target/release/rosecd /usr/local/bin/rosecd
+sudo install -m755 target/release/rosec  /usr/local/bin/rosec
 
-# 2. D-Bus activation file — tells the bus to start rosecd via systemd
-mkdir -p ~/.local/share/dbus-1/services
-cp contrib/dbus/org.freedesktop.secrets.service ~/.local/share/dbus-1/services/
-
-# 3. Mask gnome-keyring so it cannot auto-activate and race with rosecd
-cp contrib/dbus/org.gnome.keyring.service ~/.local/share/dbus-1/services/
-
-# 4. systemd user unit
-mkdir -p ~/.config/systemd/user
-cp contrib/systemd/rosecd.service ~/.config/systemd/user/
-# Edit ExecStart path if needed (default: %h/.cargo/bin/rosecd)
-systemctl --user daemon-reload
-systemctl --user enable rosecd   # start at login
-systemctl --user start rosecd    # start now
+# 2. Enable rosec (generates D-Bus, systemd, and gnome-keyring mask files)
+rosec enable
 ```
 
 With `Type=dbus` and `BusName=org.freedesktop.secrets` in the systemd unit,
@@ -83,18 +72,12 @@ sufficient and more robust (handles restarts, correct ordering).
 For setups without systemd user sessions (e.g. openrc, runit):
 
 ```bash
-mkdir -p ~/.config/autostart
-cp contrib/autostart/rosecd.desktop ~/.config/autostart/
-
-# Still mask gnome-keyring D-Bus activation
-mkdir -p ~/.local/share/dbus-1/services
-cp contrib/dbus/org.freedesktop.secrets.service ~/.local/share/dbus-1/services/
-cp contrib/dbus/org.gnome.keyring.service ~/.local/share/dbus-1/services/
+rosec enable --no-systemd
 ```
 
-The `.desktop` file has `NotShowIn=GNOME;Unity;MATE;Cinnamon;` so it only
-activates on compositors that don't already manage gnome-keyring themselves
-(Hyprland, Sway, river, etc.).  Remove that line if you want it unconditional.
+This installs D-Bus activation files and the gnome-keyring mask, but skips
+systemd units. You will need to arrange for `rosecd` to start at login via
+your compositor's autostart mechanism (e.g. `exec-once = rosecd` in Hyprland).
 
 Alternatively, add to `hyprland.conf`:
 ```ini

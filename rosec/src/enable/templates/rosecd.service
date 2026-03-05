@@ -1,0 +1,36 @@
+[Unit]
+Description=rosec - multi-provider Secret Service daemon
+Documentation=https://github.com/jmylchreest/rosec
+After=dbus.service
+Requires=dbus.service
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.secrets
+ExecStart=@@ROSECD@@
+Restart=on-failure
+RestartSec=5
+
+# NoNewPrivileges is intentionally omitted: the SSH agent FUSE filesystem
+# requires fusermount3's setuid bit, which NoNewPrivileges suppresses.
+# The daemon runs as an unprivileged user with other hardening active.
+ProtectSystem=strict
+ReadWritePaths=%h/.config/rosec %h/.local/share/rosec %t/rosec
+DeviceAllow=/dev/fuse rw
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# RestrictNamespaces is intentionally omitted: fusermount3 may use mount
+# namespaces on some distributions.
+RestrictRealtime=yes
+# MemoryDenyWriteExecute is intentionally omitted: wasmtime's JIT compiler
+# requires the ability to map pages as both writable and executable.
+PrivateNetwork=no
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target
+Also=rosecd.socket

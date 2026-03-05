@@ -1,0 +1,11 @@
+[Unit]
+Description=rosec Secret Service socket
+Documentation=https://github.com/jmylchreest/rosec
+
+[Socket]
+ListenStream=%t/rosec/secrets.socket
+DirectoryMode=0700
+Accept=no
+
+[Install]
+WantedBy=sockets.target
