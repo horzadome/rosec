@@ -207,13 +207,31 @@ pub fn init(Json(req): Json<InitRequest>) -> FnResult<Json<InitResponse>> {
         .get("keyring_dir")
         .and_then(|v| v.as_str())
         .map(|s| s.to_owned())
-        .unwrap_or_else(|| {
-            // Attempt $HOME/.local/share/keyrings; fall back to hardcoded path
-            // if $HOME is not set (unlikely in WASM context but defensive).
-            std::env::var("HOME")
+        .or_else(|| {
+            // Use home_dir injected by the host (WASI sandbox does not
+            // forward env vars, so $HOME is unavailable inside the guest).
+            req.options
+                .get("home_dir")
+                .and_then(|v| v.as_str())
                 .map(|h| format!("{h}/.local/share/keyrings"))
-                .unwrap_or_else(|_| "/root/.local/share/keyrings".into())
+        })
+        .or_else(|| {
+            // Last resort: try $HOME directly (works outside WASM).
+            std::env::var("HOME")
+                .ok()
+                .map(|h| format!("{h}/.local/share/keyrings"))
         });
+
+    let Some(keyring_dir) = keyring_dir else {
+        return Ok(Json(InitResponse {
+            ok: false,
+            error: Some(
+                "cannot determine keyring directory: set 'keyring_dir' in provider options \
+                 or ensure $HOME is available"
+                    .into(),
+            ),
+        }));
+    };
 
     let keyrings: Vec<String> = req
         .options

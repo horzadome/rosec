@@ -132,10 +132,19 @@ impl WasmProvider {
         })?;
 
         // Call init to let the guest set up its internal state.
+        // Inject the host user's home directory into options so guests can
+        // resolve default paths without relying on env vars (WASI sandbox
+        // does not forward the host environment).
+        let mut options = config.options.clone();
+        if !options.contains_key("home_dir")
+            && let Ok(home) = std::env::var("HOME")
+        {
+            options.insert("home_dir".into(), serde_json::Value::String(home));
+        }
         let init_req = InitRequest {
             provider_id: config.id.clone(),
             provider_name: config.name.clone(),
-            options: config.options.clone(),
+            options,
         };
         let init_resp: InitResponse = call_guest_json(&mut plugin, "init", &init_req)?;
         if !init_resp.ok {
