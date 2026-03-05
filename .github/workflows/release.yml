@@ -600,3 +600,31 @@ jobs:
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
           commit_message: "Update to ${{ needs.prepare.outputs.version }}"
           force_push: true
+
+  # ---------------------------------------------------------------------------
+  # AUR rosec-git (VCS source package)
+  #
+  # Pushes the -git split PKGBUILD on each release so the AUR package stays
+  # discoverable. Users build from source via makepkg; pkgver() derives the
+  # version from git describe at build time — no template rendering needed.
+  # ---------------------------------------------------------------------------
+  aur-publish-git:
+    name: Publish rosec-git to AUR
+    runs-on: ubuntu-latest
+    needs: [prepare, release]
+    if: needs.prepare.outputs.is_release == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
+        with:
+          pkgname: rosec-git
+          pkgbuild: contrib/aur/PKGBUILD-git
+          assets: contrib/aur/rosec.install
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
+          commit_message: "Update to ${{ needs.prepare.outputs.version }}"
+          force_push: true
