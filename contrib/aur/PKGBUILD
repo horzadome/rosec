@@ -5,6 +5,9 @@
 #                          + rosec-provider-gnome-keyring
 #
 # Builds rosec and all WASM providers from source in a single build step.
+# rosec is a multi-provider Secret Service daemon: local encrypted vaults,
+# Bitwarden (PM and SM), GNOME Keyring, and custom WASM plugins.  It includes
+# an SSH agent with FUSE-mounted key files and PAM auto-unlock support.
 
 pkgbase=rosec
 pkgname=(
@@ -15,7 +18,7 @@ pkgname=(
 )
 pkgver=r0.unknown
 pkgrel=1
-pkgdesc="Read-only Secret Service daemon with Bitwarden backend"
+pkgdesc="Multi-provider Secret Service daemon with SSH agent, FUSE mount, and PAM unlock"
 arch=('x86_64' 'aarch64')
 url="https://github.com/jmylchreest/rosec"
 license=('MIT')
@@ -114,12 +117,14 @@ check() {
 }
 
 package_rosec() {
-    pkgdesc="Read-only Secret Service daemon with Bitwarden backend"
+    pkgdesc="Multi-provider Secret Service daemon with SSH agent, FUSE mount, and PAM unlock"
     depends=('dbus' 'pam')
     optdepends=(
         'rosec-provider-bitwarden-pm: Bitwarden Password Manager provider'
         'rosec-provider-bitwarden-sm: Bitwarden Secrets Manager provider'
         'rosec-provider-gnome-keyring: GNOME Keyring read-only provider'
+        'fuse3: SSH key FUSE filesystem at $XDG_RUNTIME_DIR/rosec/ssh'
+        'openssh: SSH agent support'
         'libnotify: desktop notifications on lock/unlock'
     )
     provides=('org.freedesktop.secrets')
@@ -157,7 +162,7 @@ package_rosec() {
 }
 
 package_rosec-provider-bitwarden-pm() {
-    pkgdesc="Bitwarden Password Manager provider for rosec"
+    pkgdesc="Bitwarden Password Manager provider for rosec (sync, SSH keys)"
     arch=('any')
     depends=('rosec')
     conflicts=('rosec-provider-bitwarden-pm-bin')
@@ -172,7 +177,7 @@ package_rosec-provider-bitwarden-pm() {
 }
 
 package_rosec-provider-bitwarden-sm() {
-    pkgdesc="Bitwarden Secrets Manager provider for rosec"
+    pkgdesc="Bitwarden Secrets Manager provider for rosec (sync)"
     arch=('any')
     depends=('rosec')
     conflicts=('rosec-provider-bitwarden-sm-bin')

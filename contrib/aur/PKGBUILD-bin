@@ -11,7 +11,7 @@
 pkgname=rosec-bin
 pkgver=@VERSION@
 pkgrel=1
-pkgdesc="Read-only Secret Service daemon with Bitwarden backend"
+pkgdesc="Multi-provider Secret Service daemon with SSH agent, FUSE mount, and PAM unlock"
 arch=('x86_64' 'aarch64')
 url="https://github.com/jmylchreest/rosec"
 license=('MIT')
@@ -20,11 +20,13 @@ depends=(
     'pam'
 )
 optdepends=(
+    'fuse3: SSH key FUSE filesystem at $XDG_RUNTIME_DIR/rosec/ssh'
+    'openssh: SSH agent support'
     'libnotify: desktop notifications on lock/unlock'
 )
 optdepends+=(
-    'rosec-provider-bitwarden-pm-bin: Bitwarden Password Manager provider'
-    'rosec-provider-bitwarden-sm-bin: Bitwarden Secrets Manager provider'
+    'rosec-provider-bitwarden-pm-bin: Bitwarden Password Manager provider (sync, SSH keys)'
+    'rosec-provider-bitwarden-sm-bin: Bitwarden Secrets Manager provider (sync)'
     'rosec-provider-gnome-keyring-bin: GNOME Keyring read-only provider'
 )
 provides=('rosec' 'org.freedesktop.secrets')

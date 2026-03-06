@@ -12,7 +12,7 @@
 pkgname=rosec-provider-bitwarden-pm-bin
 pkgver=@VERSION@
 pkgrel=1
-pkgdesc="Bitwarden Password Manager provider for rosec (prebuilt)"
+pkgdesc="Bitwarden Password Manager provider for rosec (sync, SSH keys) (prebuilt)"
 arch=('any')
 url="https://github.com/jmylchreest/rosec"
 license=('MIT')
