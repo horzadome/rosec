@@ -3,15 +3,16 @@
 //! Handles two formats:
 //!
 //! 1. **Binary encrypted** (magic `GnomeKeyring\n\r\0\n`): most `.keyring`
-//!    files.  KDF is a custom MD5-based password stretching scheme; cipher is
-//!    AES-128-CBC with no padding verification beyond an in-band hash check.
+//!    files.  KDF is `egg_symkey_generate_simple(GCRY_CIPHER_AES128,
+//!    GCRY_MD_SHA256, ...)` — a SHA-256-based password stretching scheme
+//!    (despite the file header claiming "hash = MD5").  Cipher is AES-128-CBC.
+//!    An in-band MD5 hash of the decrypted payload verifies the password.
 //!
 //! 2. **Plaintext GKeyFile** format: used when the user has set no password.
 //!    Begins with `[keyring]` and is an INI-style text file.
 //!
-//! Reference: https://wiki.gnome.org/Projects/GnomeKeyring/KeyringFormats/FileFormat
-//! and gnome-keyring source `daemon/login/gkd-login-password.c`,
-//! `pkcs11/gkd-pkcs11-secret.c`, `keyrings/gkr-keyring.c`.
+//! Reference: `egg/egg-symkey.c` `egg_symkey_generate_simple()`,
+//! `pkcs11/secret-store/gkm-secret-binary.c` in gnome-keyring source.
 
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read};
@@ -27,6 +28,9 @@ const MAGIC: &[u8] = b"GnomeKeyring\n\r\0\n";
 const MAGIC_LEN: usize = 16;
 
 const CRYPTO_AES128_CBC: u8 = 0;
+/// The file header byte for hash — confusingly labelled "MD5" (0) but
+/// the actual KDF uses SHA-256.  MD5 is only used for the post-decryption
+/// integrity check (`verify_decrypted_buffer` in gnome-keyring source).
 const HASH_MD5: u8 = 0;
 const SUPPORTED_VERSION: u16 = 0;
 
@@ -245,31 +249,49 @@ fn parse_binary(bytes: &[u8], password: &Zeroizing<String>) -> Result<ParsedKeyr
 
 /// Derive AES-128 key (16 bytes) + IV (16 bytes) from password + salt.
 ///
-/// GNOME Keyring's KDF: repeatedly MD5-hash (password || salt) `iterations`
-/// times, accumulating output until we have 32 bytes (key + IV).
+/// This is a faithful port of `egg_symkey_generate_simple()` from
+/// `egg/egg-symkey.c` in the gnome-keyring source, called with
+/// `GCRY_CIPHER_AES128` (key=16, iv=16) and `GCRY_MD_SHA256` (digest=32).
+///
+/// Algorithm (multi-pass, though AES128+SHA256 only needs one pass):
+///   - Pass 0: SHA256(password || salt), then iterate hash `iterations-1`
+///     more times.
+///   - Pass N (N>0): SHA256(prev_digest || password || salt), then iterate.
+///   - Fill key bytes first, then IV bytes, from each pass's final digest.
 fn derive_key_iv(password: &[u8], salt: &[u8; 8], iterations: u32) -> ([u8; 16], [u8; 16]) {
-    let mut result = Zeroizing::new([0u8; 32]);
-    let mut offset = 0usize;
-    let mut digest_index = 0u32;
+    // SHA-256 produces 32 bytes — exactly what we need for key(16) + IV(16).
+    // So only one pass is required, but the loop handles the general case.
+    const N_DIGEST: usize = 32;
+    const NEEDED: usize = 32; // 16 key + 16 iv
 
-    while offset < 32 {
-        // Seed: index bytes (4) || password || salt
-        let mut seed = Zeroizing::new(Vec::with_capacity(4 + password.len() + 8));
-        seed.extend_from_slice(&digest_index.to_be_bytes());
-        seed.extend_from_slice(password);
-        seed.extend_from_slice(salt);
-        digest_index += 1;
+    let mut result = Zeroizing::new([0u8; NEEDED]);
+    let mut filled = 0usize;
+    let mut prev_digest: Option<Zeroizing<[u8; N_DIGEST]>> = None;
 
-        // Iterate MD5 `iterations` times
-        let mut hash = Zeroizing::new(md5::Md5::digest(seed.as_slice()).to_vec());
+    while filled < NEEDED {
+        // First iteration of this pass: hash (prev_digest? || password || salt)
+        let mut hasher = sha2::Sha256::new();
+        if let Some(ref prev) = prev_digest {
+            sha2::Digest::update(&mut hasher, prev.as_slice());
+        }
+        sha2::Digest::update(&mut hasher, password);
+        sha2::Digest::update(&mut hasher, salt);
+        let mut digest = Zeroizing::new([0u8; N_DIGEST]);
+        digest.copy_from_slice(&sha2::Digest::finalize(hasher));
+
+        // Remaining iterations: hash the digest itself
         for _ in 1..iterations {
-            hash = Zeroizing::new(md5::Md5::digest(hash.as_slice()).to_vec());
+            let mut h = sha2::Sha256::new();
+            sha2::Digest::update(&mut h, digest.as_slice());
+            digest.copy_from_slice(&sha2::Digest::finalize(h));
         }
 
         // Copy as many bytes as we still need
-        let take = (32 - offset).min(hash.len());
-        result[offset..offset + take].copy_from_slice(&hash[..take]);
-        offset += take;
+        let take = (NEEDED - filled).min(N_DIGEST);
+        result[filled..filled + take].copy_from_slice(&digest[..take]);
+        filled += take;
+
+        prev_digest = Some(digest);
     }
 
     let mut key = [0u8; 16];
