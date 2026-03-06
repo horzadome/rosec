@@ -2863,7 +2863,8 @@ async fn cmd_get_inner(conn: &Connection, path: &str, attr: Option<&str>) -> Res
     let item_path = OwnedObjectPath::try_from(path.to_string())
         .map_err(|e| anyhow::anyhow!("invalid item path: {e}"))?;
     let items = vec![&item_path];
-    let secrets_result: Result<HashMap<OwnedObjectPath, OwnedValue>, zbus::Error> = service_proxy
+    type SecretTuple = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
+    let secrets_result: Result<HashMap<OwnedObjectPath, SecretTuple>, zbus::Error> = service_proxy
         .call("GetSecrets", &(items, &session_path))
         .await;
 
@@ -2876,22 +2877,18 @@ async fn cmd_get_inner(conn: &Connection, path: &str, attr: Option<&str>) -> Res
             bail!("no secret found for item");
         }
         Ok(secrets) => {
-            if let Some((_item_path, value)) = secrets.into_iter().next() {
-                match <(OwnedObjectPath, Vec<u8>, Vec<u8>, String)>::try_from(value) {
-                    Ok((_session, _params, secret_bytes, _content_type)) => {
-                        let mut out = std::io::stdout();
-                        out.write_all(&secret_bytes)?;
-                        // Add a trailing newline on TTY only if the secret itself
-                        // doesn't already end with one (avoids the double-newline
-                        // that appears when the stored value has a trailing \n).
-                        if std::io::IsTerminal::is_terminal(&out) && !secret_bytes.ends_with(b"\n")
-                        {
-                            out.write_all(b"\n")?;
-                        }
-                        return Ok(());
-                    }
-                    Err(_) => bail!("could not decode secret value"),
+            if let Some((_item_path, (_session, _params, secret_bytes, _content_type))) =
+                secrets.into_iter().next()
+            {
+                let mut out = std::io::stdout();
+                out.write_all(&secret_bytes)?;
+                // Add a trailing newline on TTY only if the secret itself
+                // doesn't already end with one (avoids the double-newline
+                // that appears when the stored value has a trailing \n).
+                if std::io::IsTerminal::is_terminal(&out) && !secret_bytes.ends_with(b"\n") {
+                    out.write_all(b"\n")?;
                 }
+                return Ok(());
             }
             bail!("no secret found for item");
         }
@@ -3047,7 +3044,8 @@ async fn cmd_inspect_inner(
     let inspect_item_path = OwnedObjectPath::try_from(path.to_string())
         .map_err(|e| anyhow::anyhow!("invalid item path: {e}"))?;
     let items = vec![&inspect_item_path];
-    let secrets_result: Result<HashMap<OwnedObjectPath, OwnedValue>, zbus::Error> = service_proxy
+    type SecretTuple = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
+    let secrets_result: Result<HashMap<OwnedObjectPath, SecretTuple>, zbus::Error> = service_proxy
         .call("GetSecrets", &(items, &session_path))
         .await;
 
@@ -3085,18 +3083,13 @@ async fn cmd_inspect_inner(
                     println!("Secret:     <none>");
                 }
                 Ok(secrets) => {
-                    for (_item_path, value) in secrets {
-                        match <(OwnedObjectPath, Vec<u8>, Vec<u8>, String)>::try_from(value) {
-                            Ok((_session, _params, secret_bytes, content_type)) => {
-                                let text = String::from_utf8_lossy(&secret_bytes);
-                                if text.is_empty() {
-                                    println!("Secret:     <empty>");
-                                } else {
-                                    println!("Secret ({content_type}):");
-                                    println!("  {text}");
-                                }
-                            }
-                            Err(_) => println!("Secret:     <could not decode>"),
+                    for (_item_path, (_session, _params, secret_bytes, content_type)) in secrets {
+                        let text = String::from_utf8_lossy(&secret_bytes);
+                        if text.is_empty() {
+                            println!("Secret:     <empty>");
+                        } else {
+                            println!("Secret ({content_type}):");
+                            println!("  {text}");
                         }
                     }
                 }
@@ -3123,13 +3116,9 @@ async fn cmd_inspect_inner(
             }
             // Also emit primary secret as `secret=` for completeness.
             if let Ok(secrets) = secrets_result {
-                for (_item_path, value) in secrets {
-                    if let Ok((_session, _params, secret_bytes, _ct)) =
-                        <(OwnedObjectPath, Vec<u8>, Vec<u8>, String)>::try_from(value)
-                    {
-                        let text = String::from_utf8_lossy(&secret_bytes);
-                        println!("secret={text}");
-                    }
+                for (_item_path, (_session, _params, secret_bytes, _ct)) in secrets {
+                    let text = String::from_utf8_lossy(&secret_bytes);
+                    println!("secret={text}");
                 }
             }
         }
@@ -3157,14 +3146,10 @@ async fn cmd_inspect_inner(
             let primary_secret = match secrets_result {
                 Ok(secrets) => {
                     let mut val = serde_json::Value::Null;
-                    for (_item_path, value) in secrets {
-                        if let Ok((_session, _params, secret_bytes, _ct)) =
-                            <(OwnedObjectPath, Vec<u8>, Vec<u8>, String)>::try_from(value)
-                        {
-                            val = serde_json::Value::String(
-                                String::from_utf8_lossy(&secret_bytes).into_owned(),
-                            );
-                        }
+                    for (_item_path, (_session, _params, secret_bytes, _ct)) in secrets {
+                        val = serde_json::Value::String(
+                            String::from_utf8_lossy(&secret_bytes).into_owned(),
+                        );
                     }
                     val
                 }
