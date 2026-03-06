@@ -8,6 +8,8 @@
 # rosec is a multi-provider Secret Service daemon: local encrypted vaults,
 # Bitwarden (PM and SM), GNOME Keyring, and custom WASM plugins.  It includes
 # an SSH agent with FUSE-mounted key files and PAM auto-unlock support.
+#
+# The release workflow renders this file by substituting @VERSION@.
 
 pkgbase=rosec
 pkgname=(
@@ -16,7 +18,7 @@ pkgname=(
     'rosec-provider-bitwarden-sm'
     'rosec-provider-gnome-keyring'
 )
-pkgver=r0.unknown
+pkgver=@VERSION@
 pkgrel=1
 pkgdesc="Multi-provider Secret Service daemon with SSH agent, FUSE mount, and PAM unlock"
 arch=('x86_64' 'aarch64')

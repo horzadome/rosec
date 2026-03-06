@@ -617,11 +617,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Render PKGBUILD from template
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          sed \
+            -e "s|@VERSION@|${VERSION}|g" \
+            contrib/aur/PKGBUILD-git > "$GITHUB_WORKSPACE/PKGBUILD-git-rendered"
+
       - name: Publish to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v4.1.1
         with:
           pkgname: rosec-git
-          pkgbuild: contrib/aur/PKGBUILD-git
+          pkgbuild: ${{ github.workspace }}/PKGBUILD-git-rendered
           assets: contrib/aur/rosec.install
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
