@@ -536,6 +536,18 @@ pub fn mount(mountpoint: &Path, agent_sock: PathBuf) -> anyhow::Result<MountHand
         .args(["-uz", mountpoint.to_string_lossy().as_ref()])
         .output();
 
+    // After a lazy unmount the kernel may still consider the path a stale
+    // mountpoint ("Transport endpoint is not connected").  In that state
+    // create_dir_all fails with EEXIST because the path exists but isn't
+    // usable as a directory.  Remove it and recreate if necessary.
+    if mountpoint.exists() || mountpoint.symlink_metadata().is_ok() {
+        // Try a quick probe — if read_dir works the directory is healthy.
+        if std::fs::read_dir(mountpoint).is_err() {
+            // Stale / broken mount — remove and recreate.
+            let _ = std::fs::remove_dir(mountpoint);
+        }
+    }
+
     std::fs::create_dir_all(mountpoint)
         .with_context(|| format!("create FUSE mountpoint {:?}", mountpoint))?;
 
