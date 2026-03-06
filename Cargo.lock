@@ -3792,7 +3792,7 @@ dependencies = [
 
 [[package]]
 name = "rosec"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -3814,7 +3814,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-core"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "aes",
  "anyhow",
@@ -3839,7 +3839,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-fuse"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "fuser",
@@ -3855,7 +3855,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-pam"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "libc",
  "tokio",
@@ -3866,7 +3866,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-prompt"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "iced",
@@ -3881,7 +3881,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-secret-service"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "aes",
  "anyhow",
@@ -3909,7 +3909,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-ssh-agent"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "libc",
@@ -3925,7 +3925,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-vault"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "aes",
  "anyhow",
@@ -3951,7 +3951,7 @@ dependencies = [
 
 [[package]]
 name = "rosec-wasm"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3973,7 +3973,7 @@ dependencies = [
 
 [[package]]
 name = "rosecd"
-version = "0.0.11"
+version = "0.0.12"
 dependencies = [
  "anyhow",
  "futures-util",
