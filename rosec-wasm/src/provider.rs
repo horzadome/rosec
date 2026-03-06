@@ -50,6 +50,12 @@ pub struct WasmProviderConfig {
     pub wasm_path: String,
     /// Allowed HTTP hosts the plugin may contact (e.g. `["*.bitwarden.com"]`).
     pub allowed_hosts: Vec<String>,
+    /// Filesystem paths the WASI sandbox may access.
+    ///
+    /// Each entry maps a host path to the guest-visible path.
+    /// Prefix the host path with `ro:` for read-only access (recommended).
+    /// Example: `("ro:/home/user/.local/share/keyrings", "/home/user/.local/share/keyrings")`
+    pub allowed_paths: Vec<(String, std::path::PathBuf)>,
     /// Opaque key-value options forwarded to the guest `init` function.
     pub options: HashMap<String, serde_json::Value>,
 }
@@ -117,12 +123,23 @@ impl WasmProvider {
         }
 
         let wasm = Wasm::file(&config.wasm_path);
-        let manifest = Manifest::new([wasm])
+        let mut manifest = Manifest::new([wasm])
             .with_allowed_hosts(config.allowed_hosts.iter().cloned())
             .with_timeout(GUEST_CALL_TIMEOUT)
             // Limit WASM linear memory to 256 MiB (4096 pages × 64 KiB/page).
             // Prevents a misbehaving plugin from consuming unbounded host memory.
             .with_memory_max(4096);
+
+        // Pre-open filesystem paths so the WASI sandbox can access them.
+        for (src, dest) in &config.allowed_paths {
+            debug!(
+                provider = %config.id,
+                src = %src,
+                dest = %dest.display(),
+                "pre-opening WASI path",
+            );
+            manifest = manifest.with_allowed_path(src.clone(), dest);
+        }
 
         let mut plugin = Plugin::new(&manifest, [], true).map_err(|e| {
             ProviderError::Other(anyhow::anyhow!(

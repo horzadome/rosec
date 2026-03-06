@@ -157,7 +157,7 @@ EXAMPLES:
     rosec inspect /org/freedesktop/secrets/collection/default/… # full D-Bus path
 
     rosec enable                                            # activate rosec as Secret Service
-    rosec enable --no-mask                                  # don't mask gnome-keyring
+    rosec enable --mask                                     # also suppress gnome-keyring
     rosec enable --no-systemd                               # skip systemd enable/start
     rosec disable                                           # deactivate, restore gnome-keyring"
     );

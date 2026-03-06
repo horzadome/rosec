@@ -192,19 +192,105 @@ fn run_systemctl(extra_args: &[&str]) {
 }
 
 // ---------------------------------------------------------------------------
+// gnome-keyring autostart masking
+// ---------------------------------------------------------------------------
+
+/// XDG autostart `.desktop` files that gnome-keyring ships.
+/// We create user-local overrides with `Hidden=true` to prevent the desktop
+/// session from launching them.
+const GNOME_KEYRING_AUTOSTART_DESKTOPS: &[&str] =
+    &["gnome-keyring-secrets.desktop", "gnome-keyring-ssh.desktop"];
+
+/// System-wide XDG autostart directory.
+const XDG_AUTOSTART_SYSTEM: &str = "/etc/xdg/autostart";
+
+/// Return `~/.config/autostart/`.
+fn user_autostart_dir() -> Result<PathBuf> {
+    let config_home = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
+            PathBuf::from(home).join(".config")
+        });
+    Ok(config_home.join("autostart"))
+}
+
+/// Create user-local `~/.config/autostart/<name>.desktop` with `Hidden=true`
+/// for each gnome-keyring autostart entry that exists system-wide.
+fn mask_gnome_keyring_autostart() -> Result<()> {
+    let autostart_dir = user_autostart_dir()?;
+    for desktop in GNOME_KEYRING_AUTOSTART_DESKTOPS {
+        let system_file = Path::new(XDG_AUTOSTART_SYSTEM).join(desktop);
+        if !system_file.exists() {
+            continue;
+        }
+        let user_file = autostart_dir.join(desktop);
+        let contents = "[Desktop Entry]\nHidden=true\n";
+        if install_file(&user_file, contents)? {
+            println!("installed {} (masks autostart)", user_file.display());
+        } else {
+            println!("unchanged {}", user_file.display());
+        }
+    }
+    Ok(())
+}
+
+/// Remove user-local autostart overrides that rosec created.
+fn unmask_gnome_keyring_autostart() -> Result<()> {
+    let autostart_dir = user_autostart_dir()?;
+    for desktop in GNOME_KEYRING_AUTOSTART_DESKTOPS {
+        let user_file = autostart_dir.join(desktop);
+        if !user_file.exists() {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&user_file).unwrap_or_default();
+        if contents.contains("Hidden=true") {
+            std::fs::remove_file(&user_file)
+                .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", user_file.display()))?;
+            println!("removed {} (autostart mask)", user_file.display());
+        } else {
+            eprintln!(
+                "warning: {} does not look like a rosec autostart mask, leaving it alone",
+                user_file.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// gnome-keyring systemd socket masking
+// ---------------------------------------------------------------------------
+
+/// The gnome-keyring systemd user socket unit to mask.
+const GNOME_KEYRING_SOCKET_UNIT: &str = "gnome-keyring-daemon.socket";
+
+/// Mask gnome-keyring's systemd user socket via `systemctl --user mask`.
+fn mask_gnome_keyring_systemd_socket() -> Result<()> {
+    run_systemctl(&["mask", GNOME_KEYRING_SOCKET_UNIT]);
+    Ok(())
+}
+
+/// Unmask gnome-keyring's systemd user socket via `systemctl --user unmask`.
+fn unmask_gnome_keyring_systemd_socket() -> Result<()> {
+    run_systemctl(&["unmask", GNOME_KEYRING_SOCKET_UNIT]);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 
 /// `rosec enable [flags]`
 pub fn cmd_enable(args: &[String]) -> Result<()> {
     let mut enable_systemd = true;
-    let mut no_mask = false;
+    let mut mask = false;
     let mut force = false;
 
     for arg in args {
         match arg.as_str() {
             "--no-systemd" => enable_systemd = false,
-            "--no-mask" => no_mask = true,
+            "--mask" => mask = true,
             "--force" | "-f" => force = true,
             "--help" | "-h" => {
                 print_enable_help();
@@ -251,11 +337,13 @@ pub fn cmd_enable(args: &[String]) -> Result<()> {
         }
         println!();
         let has_gnome_keyring = existing.iter().any(|(n, _)| *n == "gnome-keyring");
-        if has_gnome_keyring && !no_mask {
+        if has_gnome_keyring && !mask {
             println!(
-                "gnome-keyring will be masked via user-local D-Bus override.\n\
-                 (pass --no-mask to skip masking)"
+                "gnome-keyring detected. Pass --mask to suppress it via D-Bus override,\n\
+                 XDG autostart masking, and systemd socket masking."
             );
+        } else if has_gnome_keyring && mask {
+            println!("gnome-keyring will be masked (D-Bus, autostart, systemd socket).");
         }
         println!();
     }
@@ -269,16 +357,29 @@ pub fn cmd_enable(args: &[String]) -> Result<()> {
         println!("unchanged {}", secrets_path.display());
     }
 
-    // Write gnome-keyring mask (unless --no-mask).
-    if !no_mask {
+    // Write gnome-keyring D-Bus mask (only with --mask).
+    if mask {
         let has_gnome_keyring = existing.iter().any(|(n, _)| *n == "gnome-keyring");
         if has_gnome_keyring || force {
             if install_file(&keyring_path, TEMPLATE_DBUS_KEYRING_MASK)? {
-                println!("installed {} (masks gnome-keyring)", keyring_path.display());
+                println!(
+                    "installed {} (masks gnome-keyring D-Bus)",
+                    keyring_path.display()
+                );
             } else {
                 println!("unchanged {}", keyring_path.display());
             }
         }
+    }
+
+    // Mask gnome-keyring XDG autostart entries (only with --mask).
+    if mask {
+        mask_gnome_keyring_autostart()?;
+    }
+
+    // Mask gnome-keyring systemd socket (only with --mask).
+    if mask {
+        mask_gnome_keyring_systemd_socket()?;
     }
 
     // --- install systemd user units ------------------------------------------
@@ -304,11 +405,15 @@ pub fn cmd_enable(args: &[String]) -> Result<()> {
 
     println!();
     println!("rosec is now enabled as the Secret Service provider.");
-    println!();
-    println!("Note: the D-Bus mask prevents future auto-activation of competing providers,");
-    println!("but cannot stop one that is already running (e.g. started by your compositor");
-    println!("autostart config). If another Secret Service daemon is running, remove it");
-    println!("from your autostart and log out/in for rosec to take effect.");
+    if mask {
+        println!();
+        println!("gnome-keyring has been masked. You may need to log out and back in");
+        println!("(or kill the running gnome-keyring-daemon) for masking to take full effect.");
+    } else {
+        println!();
+        println!("Note: if another Secret Service provider (e.g. gnome-keyring) is running,");
+        println!("you may need to stop it or pass --mask to suppress it.");
+    }
     Ok(())
 }
 
@@ -355,7 +460,10 @@ pub fn cmd_disable(args: &[String]) -> Result<()> {
         if contents.contains("/bin/false") {
             std::fs::remove_file(&keyring_path)
                 .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", keyring_path.display()))?;
-            println!("removed {} (gnome-keyring mask)", keyring_path.display());
+            println!(
+                "removed {} (gnome-keyring D-Bus mask)",
+                keyring_path.display()
+            );
             removed_any = true;
         } else {
             eprintln!(
@@ -364,6 +472,14 @@ pub fn cmd_disable(args: &[String]) -> Result<()> {
             );
         }
     }
+
+    // --- remove gnome-keyring autostart masks --------------------------------
+
+    unmask_gnome_keyring_autostart()?;
+
+    // --- unmask gnome-keyring systemd socket ----------------------------------
+
+    unmask_gnome_keyring_systemd_socket()?;
 
     // --- remove systemd unit files -------------------------------------------
 
@@ -415,20 +531,27 @@ FILES INSTALLED:
     ~/.local/share/dbus-1/services/org.freedesktop.secrets.service
         Routes D-Bus activation of org.freedesktop.secrets to rosecd.
 
-    ~/.local/share/dbus-1/services/org.gnome.keyring.service
-        Masks gnome-keyring D-Bus auto-activation (only if gnome-keyring
-        is detected). User-local files take priority over system-wide
-        files in /usr/share/dbus-1/services/.
-
     ~/.config/systemd/user/rosecd.service
         systemd user service unit with the resolved rosecd path.
 
     ~/.config/systemd/user/rosecd.socket
         systemd user socket unit for private-socket activation.
 
+FILES INSTALLED WITH --mask:
+    ~/.local/share/dbus-1/services/org.gnome.keyring.service
+        Masks gnome-keyring D-Bus auto-activation. User-local files
+        take priority over system-wide /usr/share/dbus-1/services/.
+
+    ~/.config/autostart/gnome-keyring-secrets.desktop
+        Hides the gnome-keyring XDG autostart entry so your desktop
+        session does not launch it automatically.
+
+    systemctl --user mask gnome-keyring-daemon.socket
+        Masks the gnome-keyring systemd user socket.
+
 FLAGS:
     --no-systemd    Do not install/enable systemd user units
-    --no-mask       Do not install the gnome-keyring mask file
+    --mask          Suppress gnome-keyring (D-Bus, autostart, systemd socket)
     --force, -f     Overwrite existing files even if already enabled
 
 NOTES:
@@ -449,13 +572,15 @@ USAGE:
 Removes all files installed by `rosec enable`:
   - D-Bus activation files from ~/.local/share/dbus-1/services/
   - systemd user units from ~/.config/systemd/user/
+  - gnome-keyring autostart overrides from ~/.config/autostart/
+  - gnome-keyring systemd socket mask (systemctl --user unmask)
 
 FLAGS:
     --no-systemd    Do not remove/disable systemd user units
 
 NOTES:
     Only removes files that rosec created. If gnome-keyring was masked,
-    removing the mask file allows it to resume handling Secret Service
-    requests via its system-wide D-Bus activation file."
+    the mask files are removed and the systemd socket is unmasked,
+    allowing gnome-keyring to resume handling Secret Service requests."
     );
 }

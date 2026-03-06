@@ -1271,12 +1271,16 @@ async fn build_single_provider(
                 .entry("device_id".to_string())
                 .or_insert_with(|| serde_json::Value::String(load_or_create_device_id()));
 
+            // Compute WASI filesystem paths to pre-open for the sandbox.
+            let allowed_paths = compute_wasi_allowed_paths(kind, &guest_options);
+
             let wasm_config = rosec_wasm::WasmProviderConfig {
                 id: entry.id.clone(),
                 name,
                 kind: kind.to_string(),
                 wasm_path: discovered.wasm_path.display().to_string(),
                 allowed_hosts,
+                allowed_paths,
                 options: guest_options,
             };
 
@@ -1287,6 +1291,47 @@ async fn build_single_provider(
         }
         other => anyhow::bail!("unknown provider kind '{other}'"),
     }
+}
+
+/// Compute WASI filesystem paths to pre-open for a plugin.
+///
+/// The WASI sandbox blocks all host filesystem access unless directories are
+/// explicitly pre-opened.  This function inspects the plugin kind and options
+/// to determine which host paths the guest needs.
+///
+/// Paths are returned as `(src, dest)` pairs where `src` is the host path
+/// (prefixed with `ro:` for read-only) and `dest` is the guest-visible path.
+fn compute_wasi_allowed_paths(
+    kind: &str,
+    options: &std::collections::HashMap<String, serde_json::Value>,
+) -> Vec<(String, PathBuf)> {
+    let mut paths = Vec::new();
+
+    if kind == "gnome-keyring" {
+        // Mirror the guest's default: keyring_dir option, or $HOME/.local/share/keyrings
+        let keyring_dir = options
+            .get("keyring_dir")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| {
+                options
+                    .get("home_dir")
+                    .and_then(|v| v.as_str())
+                    .map(|h| format!("{h}/.local/share/keyrings"))
+            })
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| format!("{h}/.local/share/keyrings"))
+            });
+
+        if let Some(dir) = keyring_dir {
+            let dest = PathBuf::from(&dir);
+            paths.push((format!("ro:{dir}"), dest));
+        }
+    }
+
+    paths
 }
 
 /// Parse `--config <path>` from CLI args, falling back to XDG default.
