@@ -20,6 +20,8 @@ ProtectSystem=strict
 ReadWritePaths=%h/.config/rosec %h/.local/share/rosec %t/rosec
 DeviceAllow=/dev/fuse rw
 PrivateTmp=yes
+# Allow mlockall so decrypted secrets are never swapped to disk.
+LimitMEMLOCK=infinity
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

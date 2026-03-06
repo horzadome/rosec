@@ -82,7 +82,7 @@ impl SshManager {
                 // because fusermount3's setuid bit is suppressed.  This is expected
                 // when running as a systemd user service.  The SSH agent is disabled
                 // but the daemon continues normally.
-                debug!("SSH FUSE mount failed (SSH agent disabled): {e:#}");
+                warn!("SSH FUSE mount failed (SSH agent disabled): {e:#}");
                 return None;
             }
         };

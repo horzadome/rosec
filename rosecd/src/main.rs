@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use notify::Watcher;
-use rosec_core::Provider;
 use rosec_core::config::Config;
 use rosec_core::router::{Router, RouterConfig};
+use rosec_core::{Capability, Provider};
 use rosec_secret_service::server::register_objects_with_full_config;
 use rosec_secret_service::session::SessionManager;
 use zbus::fdo::RequestNameFlags;
@@ -216,6 +216,14 @@ async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
 
         for provider in state.providers_ordered() {
             let provider_id = provider.id().to_string();
+
+            // Skip providers that don't support sync — avoids pointless
+            // check_remote_changed / sync cycles for read-only backends
+            // like gnome-keyring.
+            if !provider.capabilities().contains(&Capability::Sync) {
+                continue;
+            }
+
             let locked = match provider.status().await {
                 Ok(s) => s.locked,
                 Err(e) => {

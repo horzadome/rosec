@@ -553,6 +553,20 @@ pub fn mount(mountpoint: &Path, agent_sock: PathBuf) -> anyhow::Result<MountHand
     let session = fuser::spawn_mount2(fs_wrapper, mountpoint, &config)
         .with_context(|| format!("mount FUSE at {:?}", mountpoint))?;
 
+    // Health check: verify the FUSE session is actually serving requests.
+    // spawn_mount2 can return Ok even when the background session thread
+    // dies immediately (e.g. under certain systemd hardening directives),
+    // leaving a stale "Transport endpoint is not connected" mount.
+    // A small delay gives the background thread time to initialise.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::fs::read_dir(mountpoint).with_context(|| {
+        format!(
+            "FUSE health check failed: mount at {:?} is not responding \
+             (the background session may have died)",
+            mountpoint
+        )
+    })?;
+
     Ok(MountHandle {
         session: Some(session),
         fuse,
