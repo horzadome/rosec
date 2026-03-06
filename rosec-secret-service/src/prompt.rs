@@ -218,6 +218,10 @@ async fn run_prompt_task(
             return;
         };
 
+        // Clone the password before the unlock consumes it — we need it for the
+        // opportunistic sweep against other locked providers.
+        let password_for_sweep = password.clone();
+
         let unlock_result = provider
             .unlock(UnlockInput::Password(password))
             .await
@@ -240,6 +244,19 @@ async fn run_prompt_task(
                 }
 
                 tracing::debug!(provider = %provider_id, "provider unlocked via Prompt");
+
+                // Opportunistic sweep: try the same password against all
+                // other locked providers (detached — does not block the
+                // Completed signal).  This mirrors the TTY unlock behaviour.
+                {
+                    let sweep_state = Arc::clone(&state);
+                    let sweep_id = provider_id.clone();
+                    tokio::spawn(async move {
+                        sweep_state
+                            .opportunistic_sweep(&password_for_sweep, &sweep_id)
+                            .await;
+                    });
+                }
 
                 // Execute any deferred operation that was stashed when the
                 // prompt was created (e.g. CreateItem on a locked collection).
