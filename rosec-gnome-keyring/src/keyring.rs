@@ -340,8 +340,7 @@ fn parse_encrypted_items(
 
         let display_name =
             Zeroizing::new(read_string(cur, "item display_name")?.unwrap_or_default());
-        let secret_str = read_string(cur, "item secret")?.unwrap_or_default();
-        let secret = Zeroizing::new(secret_str.into_bytes());
+        let secret = Zeroizing::new(read_byte_array(cur, "item secret")?);
 
         let ctime = read_time_t(cur, "item ctime")?;
         let mtime = read_time_t(cur, "item mtime")?;
@@ -591,6 +590,21 @@ fn read_string(cur: &mut Cursor<&[u8]>, ctx: &'static str) -> Result<Option<Stri
         .map_err(|_| KeyringError::TruncatedFile(ctx))?;
     let s = String::from_utf8(buf)?;
     Ok(Some(s))
+}
+
+/// Read a length-prefixed byte array (raw bytes, no UTF-8 validation).
+/// The gnome-keyring binary format uses this for secrets:
+/// `egg_buffer_get_byte_array()` in C source.
+/// Length `0xffffffff` means NULL → returns empty vec.
+fn read_byte_array(cur: &mut Cursor<&[u8]>, ctx: &'static str) -> Result<Vec<u8>, KeyringError> {
+    let len = read_u32(cur, ctx)?;
+    if len == 0xffff_ffff {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; len as usize];
+    cur.read_exact(&mut buf)
+        .map_err(|_| KeyringError::TruncatedFile(ctx))?;
+    Ok(buf)
 }
 
 /// Skip a length-prefixed string without allocating.
