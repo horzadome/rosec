@@ -13,23 +13,22 @@ ExecStart=@@ROSECD@@
 Restart=on-failure
 RestartSec=5
 
-# NoNewPrivileges is intentionally omitted: the SSH agent FUSE filesystem
-# requires fusermount3's setuid bit, which NoNewPrivileges suppresses.
-# The daemon runs as an unprivileged user with other hardening active.
-ProtectSystem=strict
-ReadWritePaths=%h/.config/rosec %h/.local/share/rosec %t/rosec
+# Security hardening.
+#
+# The SSH agent exposes a FUSE filesystem at $XDG_RUNTIME_DIR/rosec/ssh/ that
+# must be visible in the user's session mount namespace.  Any systemd directive
+# that implies a private mount namespace (ProtectSystem, PrivateTmp,
+# ProtectKernelTunables, ProtectKernelModules, ProtectControlGroups) would make
+# the FUSE mount invisible outside the service, so they are intentionally
+# omitted.
+#
+# NoNewPrivileges is omitted because fusermount3's setuid bit is required.
+# MemoryDenyWriteExecute is omitted because wasmtime's JIT needs W+X pages.
+# RestrictNamespaces is omitted because fusermount3 may use mount namespaces.
 DeviceAllow=/dev/fuse rw
-PrivateTmp=yes
 # Allow mlockall so decrypted secrets are never swapped to disk.
 LimitMEMLOCK=infinity
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-# RestrictNamespaces is intentionally omitted: fusermount3 may use mount
-# namespaces on some distributions.
 RestrictRealtime=yes
-# MemoryDenyWriteExecute is intentionally omitted: wasmtime's JIT compiler
-# requires the ability to map pages as both writable and executable.
 PrivateNetwork=no
 Environment=RUST_LOG=info
 
