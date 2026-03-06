@@ -25,7 +25,11 @@ RestartSec=5
 # NoNewPrivileges is omitted because fusermount3's setuid bit is required.
 # MemoryDenyWriteExecute is omitted because wasmtime's JIT needs W+X pages.
 # RestrictNamespaces is omitted because fusermount3 may use mount namespaces.
-DeviceAllow=/dev/fuse rw
+#
+# DeviceAllow is omitted because /dev/fuse is world-accessible (crw-rw-rw-)
+# and the device cgroup filter it installs can block fusermount3 in user
+# service units even when the device path is explicitly allowed.
+#
 # Allow mlockall so decrypted secrets are never swapped to disk.
 LimitMEMLOCK=infinity
 RestrictRealtime=yes

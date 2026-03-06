@@ -528,22 +528,33 @@ impl Drop for MountHandle {
 /// `Drop` impl instead.
 pub fn mount(mountpoint: &Path, agent_sock: PathBuf) -> anyhow::Result<MountHandle> {
     // Clean up any stale FUSE mount from a previous crashed instance.
-    // `fusermount3 -uz` (lazy unmount) is safe to call unconditionally:
-    // - If a stale mount exists, it will be cleaned up
-    // - If nothing is mounted, it fails harmlessly
-    // We ignore the exit status because failure just means nothing was mounted.
+    //
+    // After a daemon crash the kernel still sees a FUSE mount whose session is
+    // gone, so any access returns ENOTCONN ("Transport endpoint is not
+    // connected").  `create_dir_all` then fails with EEXIST because the path
+    // exists but isn't a usable directory.
+    //
+    // Strategy:
+    //   1. Always attempt `fusermount3 -uz` (lazy unmount).  Harmless if
+    //      nothing is mounted.
+    //   2. Probe with `symlink_metadata` (lstat, does not traverse mounts).
+    //      If the path exists but `read_dir` fails, it is stale — remove it.
+    //   3. If `remove_dir` fails (e.g. still mounted), try `fusermount3 -u`
+    //      (synchronous unmount) as a fallback, then remove again.
+    let mp = mountpoint.to_string_lossy();
     let _ = std::process::Command::new("fusermount3")
-        .args(["-uz", mountpoint.to_string_lossy().as_ref()])
+        .args(["-uz", mp.as_ref()])
         .output();
 
-    // After a lazy unmount the kernel may still consider the path a stale
-    // mountpoint ("Transport endpoint is not connected").  In that state
-    // create_dir_all fails with EEXIST because the path exists but isn't
-    // usable as a directory.  Remove it and recreate if necessary.
-    if mountpoint.exists() || mountpoint.symlink_metadata().is_ok() {
-        // Try a quick probe — if read_dir works the directory is healthy.
-        if std::fs::read_dir(mountpoint).is_err() {
-            // Stale / broken mount — remove and recreate.
+    // symlink_metadata uses lstat which succeeds on stale FUSE mounts
+    // (unlike stat/exists which fail with ENOTCONN).
+    if mountpoint.symlink_metadata().is_ok() && std::fs::read_dir(mountpoint).is_err() {
+        // Path exists but is broken — remove it.
+        if std::fs::remove_dir(mountpoint).is_err() {
+            // remove_dir can fail if still mounted; try synchronous unmount.
+            let _ = std::process::Command::new("fusermount3")
+                .args(["-u", mp.as_ref()])
+                .output();
             let _ = std::fs::remove_dir(mountpoint);
         }
     }
