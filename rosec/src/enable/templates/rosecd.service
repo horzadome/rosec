@@ -23,6 +23,13 @@ RestartSec=5
 # omitted.
 #
 # NoNewPrivileges is omitted because fusermount3's setuid bit is required.
+#   IMPORTANT: Many directives implicitly enable NoNewPrivileges — including
+#   RestrictRealtime, SystemCallFilter, SystemCallArchitectures,
+#   RestrictAddressFamilies, RestrictNamespaces, PrivateDevices, ProtectClock,
+#   ProtectKernelTunables, ProtectKernelModules, ProtectKernelLogs,
+#   MemoryDenyWriteExecute, RestrictSUIDSGID, LockPersonality, and
+#   PrivateUsers.  None of these may be used here.
+#
 # MemoryDenyWriteExecute is omitted because wasmtime's JIT needs W+X pages.
 # RestrictNamespaces is omitted because fusermount3 may use mount namespaces.
 #
@@ -30,9 +37,10 @@ RestartSec=5
 # and the device cgroup filter it installs can block fusermount3 in user
 # service units even when the device path is explicitly allowed.
 #
+# RestrictRealtime is omitted because it implicitly sets NoNewPrivileges=yes.
+#
 # Allow mlockall so decrypted secrets are never swapped to disk.
 LimitMEMLOCK=infinity
-RestrictRealtime=yes
 PrivateNetwork=no
 Environment=RUST_LOG=info
 
