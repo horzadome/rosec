@@ -198,7 +198,7 @@ fn scan_directory(
             .to_string_lossy()
             .into_owned();
         match verify_plugin(&path, verify) {
-            Ok(VerifyOutcome::Verified) => {
+            VerifyOutcome::Verified => {
                 info!(
                     wasm = %wasm_name,
                     path = %path.display(),
@@ -207,26 +207,23 @@ fn scan_directory(
                     "WASM plugin signature verified",
                 );
             }
-            Ok(VerifyOutcome::Skipped { reason }) => {
-                warn!(
+            VerifyOutcome::NotVerified { reason } => {
+                debug!(
                     wasm = %wasm_name,
                     path = %path.display(),
                     ?source,
-                    skip_reason = %reason,
-                    "skipping unsigned WASM plugin",
+                    reason = %reason,
+                    "WASM plugin loaded without signature verification",
                 );
-                // Unverified plugins are never loaded.
-                continue;
             }
-            Err(e) => {
+            VerifyOutcome::Rejected { reason } => {
                 warn!(
                     wasm = %wasm_name,
                     path = %path.display(),
                     ?source,
-                    error = %e,
-                    "skipping WASM plugin with invalid signature",
+                    reason = %reason,
+                    "skipping WASM plugin (signature check failed)",
                 );
-                // Invalid signature — never load.
                 continue;
             }
         }
@@ -308,8 +305,13 @@ fn should_replace(
 
 /// Outcome of signature verification.
 enum VerifyOutcome {
+    /// Signature present and verified.
     Verified,
-    Skipped { reason: &'static str },
+    /// Verification was not performed (disabled or sig absent under `IfPresent`).
+    /// The plugin may still be loaded.
+    NotVerified { reason: &'static str },
+    /// Plugin should NOT be loaded (e.g. unsigned under `Required`).
+    Rejected { reason: String },
 }
 
 /// Check the signature of a `.wasm` file according to the configured policy.
@@ -317,47 +319,68 @@ enum VerifyOutcome {
 /// Returns `Ok(Verified)` if the signature is present and valid,
 /// `Ok(Skipped)` if verification is disabled or the sig is absent under
 /// `IfPresent`, or `Err` if the signature is present but invalid.
-fn verify_plugin(wasm_path: &Path, verify: WasmVerify) -> Result<VerifyOutcome, anyhow::Error> {
+fn verify_plugin(wasm_path: &Path, verify: WasmVerify) -> VerifyOutcome {
     if verify == WasmVerify::Disabled {
-        return Ok(VerifyOutcome::Skipped { reason: "disabled" });
+        return VerifyOutcome::NotVerified { reason: "disabled" };
     }
 
     let sig_path = wasm_path.with_extension("wasm.minisig");
 
     if !sig_path.exists() {
         return match verify {
-            WasmVerify::IfPresent => Ok(VerifyOutcome::Skipped {
+            WasmVerify::IfPresent => VerifyOutcome::NotVerified {
                 reason: "sig-not-present",
-            }),
-            WasmVerify::Required => Err(anyhow::anyhow!(
-                "signature file '{}' not found (wasm_verify = required)",
-                sig_path.display(),
-            )),
+            },
+            WasmVerify::Required => VerifyOutcome::Rejected {
+                reason: format!(
+                    "signature file '{}' not found (wasm_verify = required)",
+                    sig_path.display(),
+                ),
+            },
             WasmVerify::Disabled => unreachable!(),
         };
     }
 
-    let pk = PublicKey::from_base64(WASM_SIGNING_PUBKEY)
-        .map_err(|e| anyhow::anyhow!("invalid embedded public key: {e}"))?;
+    let pk = match PublicKey::from_base64(WASM_SIGNING_PUBKEY) {
+        Ok(pk) => pk,
+        Err(e) => {
+            return VerifyOutcome::Rejected {
+                reason: format!("invalid embedded public key: {e}"),
+            };
+        }
+    };
 
-    let signature = Signature::from_file(&sig_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to read signature file '{}': {e}",
-            sig_path.display()
-        )
-    })?;
+    let signature = match Signature::from_file(&sig_path) {
+        Ok(sig) => sig,
+        Err(e) => {
+            return VerifyOutcome::Rejected {
+                reason: format!(
+                    "failed to read signature file '{}': {e}",
+                    sig_path.display()
+                ),
+            };
+        }
+    };
 
-    let wasm_bytes = std::fs::read(wasm_path)
-        .map_err(|e| anyhow::anyhow!("failed to read WASM file '{}': {e}", wasm_path.display()))?;
+    let wasm_bytes = match std::fs::read(wasm_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return VerifyOutcome::Rejected {
+                reason: format!("failed to read WASM file '{}': {e}", wasm_path.display()),
+            };
+        }
+    };
 
-    pk.verify(&wasm_bytes, &signature, false).map_err(|e| {
-        anyhow::anyhow!(
-            "signature verification failed for '{}': {e}",
-            wasm_path.display()
-        )
-    })?;
+    if let Err(e) = pk.verify(&wasm_bytes, &signature, false) {
+        return VerifyOutcome::Rejected {
+            reason: format!(
+                "signature verification failed for '{}': {e}",
+                wasm_path.display()
+            ),
+        };
+    }
 
-    Ok(VerifyOutcome::Verified)
+    VerifyOutcome::Verified
 }
 
 /// Load a `.wasm` file and call `plugin_manifest()` to extract its

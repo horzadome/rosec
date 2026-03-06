@@ -208,6 +208,16 @@ fn default_font_size() -> f32 {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
+    // Handle --version before anything else (no stdin read needed).
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!(
+            "rosec-prompt {} ({})",
+            env!("ROSEC_VERSION"),
+            env!("ROSEC_GIT_SHA")
+        );
+        return Ok(());
+    }
+
     tracing_subscriber::fmt().with_env_filter("warn").init();
 
     let mut raw = String::new();

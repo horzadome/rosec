@@ -40,6 +40,14 @@ async fn main() -> Result<()> {
         "unlock" => cmd_unlock().await,
         "enable" => enable::cmd_enable(&args[1..]),
         "disable" => enable::cmd_disable(&args[1..]),
+        "--version" | "-V" | "version" => {
+            println!(
+                "rosec {} ({})",
+                env!("ROSEC_VERSION"),
+                env!("ROSEC_GIT_SHA")
+            );
+            Ok(())
+        }
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -1692,6 +1700,44 @@ fn expand_tilde(path: &str) -> String {
 // ---------------------------------------------------------------------------
 
 async fn cmd_status() -> Result<()> {
+    // ── Version info ────────────────────────────────────────────────
+    println!("Components:");
+    println!(
+        "  {:<22} {} ({})",
+        "rosec",
+        env!("ROSEC_VERSION"),
+        env!("ROSEC_GIT_SHA"),
+    );
+
+    // Probe sibling binaries for their version strings.
+    for bin in &["rosecd", "rosec-prompt"] {
+        let ver = probe_binary_version(bin).unwrap_or_else(|| "not found".to_string());
+        println!("  {:<22} {ver}", bin);
+    }
+
+    // rosec-pam-unlock may live in /usr/lib/rosec/ rather than on $PATH.
+    let pam_unlock_ver = probe_binary_version("rosec-pam-unlock")
+        .or_else(|| probe_binary_version_at("/usr/lib/rosec/rosec-pam-unlock"));
+    println!(
+        "  {:<22} {}",
+        "rosec-pam-unlock",
+        pam_unlock_ver.unwrap_or_else(|| "not found".to_string())
+    );
+
+    // pam_rosec.so — no version info, just presence check.
+    let pam_so = std::path::Path::new("/usr/lib/security/pam_rosec.so");
+    println!(
+        "  {:<22} {}",
+        "pam_rosec.so",
+        if pam_so.exists() {
+            "installed"
+        } else {
+            "not found"
+        }
+    );
+    println!();
+
+    // ── Daemon status ───────────────────────────────────────────────
     let conn = conn().await?;
     let proxy = zbus::Proxy::new(
         &conn,
@@ -1721,6 +1767,53 @@ async fn cmd_status() -> Result<()> {
     }
     println!("Sessions:    {sessions}");
     Ok(())
+}
+
+/// Run `<binary> --version` and return the first line of output, or `None`.
+fn probe_binary_version(name: &str) -> Option<String> {
+    let output = std::process::Command::new(name)
+        .arg("--version")
+        .output()
+        .ok()?;
+    // Some binaries print to stdout, others to stderr.
+    let text = if output.stdout.is_empty() {
+        String::from_utf8_lossy(&output.stderr).to_string()
+    } else {
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
+    let line = text.lines().next()?.trim().to_string();
+    // Strip the binary name prefix to just show the version part.
+    let ver = line
+        .strip_prefix(name)
+        .map(|s| s.trim().to_string())
+        .unwrap_or(line);
+    if ver.is_empty() { None } else { Some(ver) }
+}
+
+/// Run a binary at an absolute path with `--version`.
+fn probe_binary_version_at(path: &str) -> Option<String> {
+    if !std::path::Path::new(path).exists() {
+        return None;
+    }
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = if output.stdout.is_empty() {
+        String::from_utf8_lossy(&output.stderr).to_string()
+    } else {
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
+    let line = text.lines().next()?.trim().to_string();
+    let bin_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let ver = line
+        .strip_prefix(bin_name)
+        .map(|s| s.trim().to_string())
+        .unwrap_or(line);
+    if ver.is_empty() { None } else { Some(ver) }
 }
 
 async fn cmd_sync() -> Result<()> {

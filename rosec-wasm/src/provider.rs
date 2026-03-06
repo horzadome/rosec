@@ -131,6 +131,9 @@ impl WasmProvider {
             .with_memory_max(4096);
 
         // Pre-open filesystem paths so the WASI sandbox can access them.
+        if config.allowed_paths.is_empty() {
+            debug!(provider = %config.id, "no WASI allowed_paths configured");
+        }
         for (src, dest) in &config.allowed_paths {
             debug!(
                 provider = %config.id,
@@ -140,6 +143,13 @@ impl WasmProvider {
             );
             manifest = manifest.with_allowed_path(src.clone(), dest);
         }
+
+        debug!(
+            provider = %config.id,
+            allowed_hosts = ?config.allowed_hosts,
+            allowed_paths = config.allowed_paths.len(),
+            "WASM manifest configured",
+        );
 
         let mut plugin = Plugin::new(&manifest, [], true).map_err(|e| {
             ProviderError::Other(anyhow::anyhow!(
@@ -156,8 +166,34 @@ impl WasmProvider {
         if !options.contains_key("home_dir")
             && let Ok(home) = std::env::var("HOME")
         {
+            debug!(provider = %config.id, home = %home, "injecting home_dir into guest options");
             options.insert("home_dir".into(), serde_json::Value::String(home));
         }
+
+        // Log all options being sent to the guest (redact values that may be
+        // sensitive — only log the keys and string lengths).
+        for (key, val) in &options {
+            match val {
+                serde_json::Value::String(s) => {
+                    debug!(
+                        provider = %config.id,
+                        key = %key,
+                        value_len = s.len(),
+                        value_preview = %if s.len() <= 60 { s.as_str() } else { &s[..60] },
+                        "guest init option",
+                    );
+                }
+                other => {
+                    debug!(
+                        provider = %config.id,
+                        key = %key,
+                        value = %other,
+                        "guest init option",
+                    );
+                }
+            }
+        }
+
         let init_req = InitRequest {
             provider_id: config.id.clone(),
             provider_name: config.name.clone(),

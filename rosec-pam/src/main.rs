@@ -72,6 +72,16 @@ fn debug_log(msg: &str) {
 }
 
 fn main() -> ! {
+    // Handle --version before anything else.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        eprintln!(
+            "rosec-pam-unlock {} ({})",
+            env!("ROSEC_VERSION"),
+            env!("ROSEC_GIT_SHA")
+        );
+        std::process::exit(0);
+    }
+
     debug_log("helper started");
     let code = match run() {
         Ok(()) => {

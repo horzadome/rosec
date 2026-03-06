@@ -1349,6 +1349,14 @@ fn parse_config_path() -> PathBuf {
         if let Some(path) = args[i].strip_prefix("--config=") {
             return PathBuf::from(path);
         }
+        if args[i] == "--version" || args[i] == "-V" {
+            eprintln!(
+                "rosecd {} ({})",
+                env!("ROSEC_VERSION"),
+                env!("ROSEC_GIT_SHA")
+            );
+            std::process::exit(0);
+        }
         if args[i] == "--help" || args[i] == "-h" {
             eprintln!("Usage: rosecd [--config <path>]");
             eprintln!();
@@ -1356,6 +1364,7 @@ fn parse_config_path() -> PathBuf {
             eprintln!(
                 "  -c, --config <path>  Path to config file (default: $XDG_CONFIG_HOME/rosec/config.toml)"
             );
+            eprintln!("  -V, --version        Show version");
             eprintln!("  -h, --help           Show this help message");
             std::process::exit(0);
         }
