@@ -8,6 +8,7 @@ repository = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }
+cosmic-text = "0.12.1"
 iced = { workspace = true }
 rpassword = { workspace = true }
 rosec-core = { path = "../rosec-core" }

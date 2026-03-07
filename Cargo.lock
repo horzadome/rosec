@@ -3869,6 +3869,7 @@ name = "rosec-prompt"
 version = "0.0.14"
 dependencies = [
  "anyhow",
+ "cosmic-text",
  "iced",
  "rosec-core",
  "rpassword",

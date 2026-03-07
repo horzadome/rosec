@@ -322,42 +322,68 @@ fn run_gui(request: PromptRequest) -> Result<()> {
     let fields = request.effective_fields();
     let font_size = request.theme.font_size;
 
-    // Calculate height from actual widget dimensions:
-    //   outer padding (4×2) + inner padding (14×2) + title + spacing + message
-    //   + spacing + per-field (label + 3 + input) + spacing + buttons
-    let line_h = font_size + 6.0; // text line height with a little breathing room
-    let input_h = font_size + 16.0; // text_input: padding(8) top+bottom + font
-    let field_h = line_h + 3.0 + input_h; // label + spacing(3) + input
-    let btn_h = font_size + 16.0; // button: padding(8) top+bottom + font
+    // Iced's default LineHeight is Relative(1.3).
+    let iced_line_h = |sz: f32| (sz * 1.3).ceil();
+    let input_h = iced_line_h(font_size) + 16.0; // text_input: padding(8) top+bottom + text
+    let btn_h = iced_line_h(font_size) + 16.0; // button: padding(8) top+bottom + text
 
-    // Usable content width after outer padding (4×2) + inner padding (14×2).
+    // Usable content width after outer padding (4) + inner padding (14).
+    // Iced draws borders *inside* the container bounds (overlapping the
+    // outer padding), so the border does not further reduce content width.
     let content_w = 420.0 - (4.0 + 14.0) * 2.0;
-    // Approximate characters per line.  Proportional fonts average roughly
-    // 0.43× the font pixel size per glyph — deliberately conservative so we
-    // overcount wrapped lines rather than clip content.
-    let avg_char_w = font_size * 0.43;
-    let chars_per_line = (content_w / avg_char_w).floor().max(1.0);
 
-    // Estimate visual line count, accounting for word-wrap on each hard line.
-    // Title is rendered at font_size+1 so its glyphs are slightly wider.
-    let title_chars_per_line = (content_w / ((font_size + 1.0) * 0.43)).floor().max(1.0);
-    let title_lines = estimate_wrapped_lines(&request.title, title_chars_per_line);
+    // --- Exact text measurement via cosmic-text (same shaping engine as iced) ---
+    let mut font_system = cosmic_text::FontSystem::new();
+    let font_family = cosmic_font_family(&request.theme.font_family);
 
-    // Only account for message height when one is actually present — an empty
-    // message still occupies one line_h in the naive formula, which produces
-    // a visible blank gap.
-    let msg_lines = if request.message.is_empty() {
+    let title_h = measure_text_height(
+        &mut font_system,
+        &request.title,
+        font_size + 1.0,
+        content_w,
+        font_family,
+        cosmic_text::Weight::BOLD,
+    );
+
+    let msg_h = if request.message.is_empty() {
         0.0
     } else {
-        estimate_wrapped_lines(&request.message, chars_per_line)
+        measure_text_height(
+            &mut font_system,
+            &request.message,
+            font_size,
+            content_w,
+            font_family,
+            cosmic_text::Weight::NORMAL,
+        )
     };
 
-    let height = (4.0 + 14.0) * 2.0                        // outer + inner padding (top+bottom)
-        + line_h * title_lines                               // title (may wrap)
+    // Sum per-field heights individually to account for label wrapping.
+    let fields_total_h: f32 = fields
+        .iter()
+        .map(|f| {
+            let label_text = if f.label.is_empty() { &f.id } else { &f.label };
+            let label_h = measure_text_height(
+                &mut font_system,
+                label_text,
+                font_size - 1.0,
+                content_w,
+                font_family,
+                cosmic_text::Weight::NORMAL,
+            );
+            label_h + 3.0 + input_h + 10.0 // label + spacing(3) + input + column gap
+        })
+        .sum();
+
+    // Iced draws borders *inside* the container bounds, overlapping with the
+    // padding — the border does not add extra height.  Only the two padding
+    // layers contribute to vertical overhead.
+    let height = (4.0 + 14.0) * 2.0                         // outer pad + inner pad (top+bottom)
+        + title_h                                            // title (exact, may wrap)
         + 10.0                                               // spacing after title
-        + line_h * msg_lines                                 // message (may wrap, 0 if absent)
-        + if msg_lines > 0.0 { 10.0 } else { 0.0 }          // spacing after message (only if present)
-        + (field_h + 10.0) * fields.len() as f32            // fields + spacing after each
+        + msg_h                                              // message (exact, 0 if absent)
+        + if msg_h > 0.0 { 10.0 } else { 0.0 }              // spacing after message (only if present)
+        + fields_total_h                                     // fields (label may wrap)
         + btn_h; // buttons row
 
     application("rosec prompt", update, view)
@@ -711,8 +737,12 @@ fn view(state: &GuiApp) -> iced::Element<'_, Message> {
         .padding(14)
         .align_x(Alignment::Start);
 
+    // The styled container fills the entire window so that any sub-pixel
+    // rounding between the calculated height and iced's actual layout is
+    // hidden — the background colour covers the full window area.
     container(content)
-        .width(Length::Shrink)
+        .width(Length::Fill)
+        .height(Length::Fill)
         .padding(4)
         .style(move |_| container::Style {
             background: Some(Background::Color(state.bg)),
@@ -724,7 +754,6 @@ fn view(state: &GuiApp) -> iced::Element<'_, Message> {
             text_color: None,
             shadow: iced::Shadow::default(),
         })
-        .center_x(Length::Fill)
         .into()
 }
 
@@ -732,23 +761,55 @@ fn view(state: &GuiApp) -> iced::Element<'_, Message> {
 // Colour / font helpers
 // ---------------------------------------------------------------------------
 
-/// Estimate the number of visual lines a string occupies given a maximum
-/// character width per line.  Each hard newline starts a new line, and long
-/// segments are assumed to wrap at `chars_per_line` boundaries.
-fn estimate_wrapped_lines(s: &str, chars_per_line: f32) -> f32 {
-    if s.is_empty() {
-        return 1.0;
+/// Measure the pixel height of `text` rendered at `font_size` within a given
+/// `wrap_width`, using cosmic-text (the same shaping engine iced uses) for
+/// exact glyph measurement and word-wrap.
+///
+/// Iced uses `LineHeight::Relative(1.3)` by default, so the cosmic-text
+/// `Metrics` line height is set to `font_size * 1.3`.
+fn measure_text_height(
+    font_system: &mut cosmic_text::FontSystem,
+    text: &str,
+    font_size: f32,
+    wrap_width: f32,
+    family: cosmic_text::Family<'_>,
+    weight: cosmic_text::Weight,
+) -> f32 {
+    let line_height = (font_size * 1.3).ceil();
+    let metrics = cosmic_text::Metrics::new(font_size, line_height);
+    let mut buffer = cosmic_text::Buffer::new(font_system, metrics);
+    buffer.set_size(font_system, Some(wrap_width), None);
+    let attrs = cosmic_text::Attrs::new().family(family).weight(weight);
+    buffer.set_text(font_system, text, attrs, cosmic_text::Shaping::Advanced);
+    buffer.shape_until_scroll(font_system, false);
+
+    // Sum the line_height of every layout run.  Each run represents one
+    // visual line after word-wrapping.
+    let mut total = 0.0_f32;
+    for run in buffer.layout_runs() {
+        total += run.line_height;
     }
-    let cpl = chars_per_line.max(1.0);
-    s.lines()
-        .map(|line| {
-            let len = line.len() as f32;
-            (len / cpl).ceil().max(1.0)
-        })
-        .sum::<f32>()
-        // If the string ends with a trailing newline, `.lines()` won't emit
-        // an extra empty item, but we already handle empty → 1 above.
-        .max(1.0)
+    // Empty text still occupies one line in iced's layout.
+    total.max(line_height)
+}
+
+/// Map the theme's font_family string to a `cosmic_text::Family` value,
+/// mirroring the logic in `font_from_string()` for iced fonts.
+fn cosmic_font_family(name: &str) -> cosmic_text::Family<'_> {
+    let name = name.trim();
+    if name.eq_ignore_ascii_case("monospace") {
+        return cosmic_text::Family::Monospace;
+    }
+    if name.eq_ignore_ascii_case("sans")
+        || name.eq_ignore_ascii_case("sans-serif")
+        || name.is_empty()
+    {
+        return cosmic_text::Family::SansSerif;
+    }
+    if name.eq_ignore_ascii_case("serif") {
+        return cosmic_text::Family::Serif;
+    }
+    cosmic_text::Family::Name(name)
 }
 
 fn parse_color(value: &str, fallback: iced::Color) -> iced::Color {
