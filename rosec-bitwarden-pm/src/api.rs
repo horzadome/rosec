@@ -484,12 +484,43 @@ struct LoginErrorResponse {
     error: Option<String>,
     #[serde(alias = "error_description")]
     error_description: Option<String>,
-    #[serde(alias = "TwoFactorProviders")]
+    #[serde(alias = "TwoFactorProviders", deserialize_with = "deser_two_factor_providers")]
     two_factor_providers: Option<Vec<u8>>,
     /// Per-provider metadata.  Keyed by provider code (as a string).
     /// Provider 1 (email) has `{ "Email": "j***@example.com" }`.
     #[serde(alias = "TwoFactorProviders2", default)]
     two_factor_providers2: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// Deserialize TwoFactorProviders from either numeric or string provider codes.
+fn deser_two_factor_providers<'de, D>(de: D) -> Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ProviderCode {
+        Num(u8),
+        Str(String),
+    }
+
+    let raw = Option::<Vec<ProviderCode>>::deserialize(de)?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    let mut out = Vec::with_capacity(raw.len());
+    for code in raw {
+        match code {
+            ProviderCode::Num(v) => out.push(v),
+            ProviderCode::Str(s) => {
+                let parsed = s.parse::<u8>().map_err(serde::de::Error::custom)?;
+                out.push(parsed);
+            }
+        }
+    }
+
+    Ok(Some(out))
 }
 
 /// Refresh response — tokens are sensitive.
@@ -611,6 +642,39 @@ pub struct SyncUri {
     #[serde(alias = "Match", alias = "match")]
     #[allow(dead_code)]
     pub match_type: Option<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoginErrorResponse;
+
+    #[test]
+    fn login_error_parses_two_factor_providers_as_strings() {
+        let payload = r#"{
+            "error":"invalid_grant",
+            "error_description":"Two factor required.",
+            "TwoFactorProviders":["0","7","3"]
+        }"#;
+
+        let parsed: LoginErrorResponse =
+            serde_json::from_str(payload).expect("login error should deserialize");
+
+        assert_eq!(parsed.two_factor_providers, Some(vec![0, 7, 3]));
+    }
+
+    #[test]
+    fn login_error_parses_two_factor_providers_as_numbers() {
+        let payload = r#"{
+            "error":"invalid_grant",
+            "error_description":"Two factor required.",
+            "TwoFactorProviders":[0,7,3]
+        }"#;
+
+        let parsed: LoginErrorResponse =
+            serde_json::from_str(payload).expect("login error should deserialize");
+
+        assert_eq!(parsed.two_factor_providers, Some(vec![0, 7, 3]));
+    }
 }
 
 #[derive(Debug, Deserialize)]
