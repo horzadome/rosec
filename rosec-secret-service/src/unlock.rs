@@ -124,6 +124,8 @@ pub async fn unlock_with_tty(
 
     // Track which providers need a registration flow (password already collected).
     let mut need_registration: Vec<(String, Zeroizing<String>)> = Vec::new();
+    // Track which providers need 2FA (password already collected).
+    let mut need_2fa: Vec<(String, Zeroizing<String>)> = Vec::new();
     // Track which providers had a plain auth failure (wrong password etc).
     let mut need_individual: Vec<String> = Vec::new();
 
@@ -148,6 +150,10 @@ pub async fn unlock_with_tty(
             Err(FdoError::Failed(ref msg)) if msg == "registration_required" => {
                 debug!(provider = %id, "registration required after opportunistic unlock");
                 need_registration.push((id, raw_password.clone()));
+            }
+            Err(FdoError::Failed(ref msg)) if msg == "two_factor_required" => {
+                debug!(provider = %id, "2FA required after opportunistic unlock");
+                need_2fa.push((id, raw_password.clone()));
             }
             Err(FdoError::Failed(ref msg))
                 if msg.contains("not found") || msg.contains("unavailable") =>
@@ -202,6 +208,50 @@ pub async fn unlock_with_tty(
             provider_id: id.clone(),
             success: true,
             message: "unlocked (registered)".to_string(),
+        });
+        if let Err(e) = state.try_sync_provider(&id).await {
+            debug!(provider = %id, "post-unlock sync failed: {e}");
+        }
+    }
+
+    // Handle providers that need 2FA (password already collected — only prompt
+    // for the 2FA code, not the master password again).
+    for (id, password) in need_2fa {
+        let (pw_field_id, name) = {
+            let b = state
+                .provider_by_id(&id)
+                .ok_or_else(|| anyhow!("provider '{id}' not found"))?;
+            (b.password_field().id.to_string(), b.name().to_string())
+        };
+        // Print a header so the user knows which provider needs 2FA.
+        print_on_fd(tty_fd, "\n");
+        if name.is_empty() || name == id {
+            print_on_fd(tty_fd, &format!("Unlocking {id}\n"));
+        } else {
+            print_on_fd(tty_fd, &format!("Unlocking {id}  ({name})\n"));
+        }
+        let mut prefill = HashMap::new();
+        prefill.insert(pw_field_id, password);
+        let fields = {
+            let b = state
+                .provider_by_id(&id)
+                .ok_or_else(|| anyhow!("provider '{id}' not found"))?;
+            provider_auth_fields(b.as_ref())
+        };
+        let _password = auth_provider_with_tty_inner(
+            &state,
+            tty_fd,
+            cancel_fd,
+            &id,
+            &fields,
+            Some(prefill),
+            false,
+        )
+        .await?;
+        results.push(UnlockResult {
+            provider_id: id.clone(),
+            success: true,
+            message: "unlocked (2FA)".to_string(),
         });
         if let Err(e) = state.try_sync_provider(&id).await {
             debug!(provider = %id, "post-unlock sync failed: {e}");
@@ -462,8 +512,8 @@ async fn auth_provider_with_tty_inner(
         // Collect the 2FA token from the user.
         let token_field = vec![TtyField {
             id: "__2fa_token".to_string(),
-            label: chosen.label.clone(),
-            kind: "text".to_string(),
+            label: "Code".to_string(),
+            kind: "secret".to_string(),
             placeholder: String::new(),
         }];
         let token_map = collect_tty_on_fd(tty_fd, &token_field, cancel_fd).await?;

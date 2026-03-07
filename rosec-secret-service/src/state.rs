@@ -980,6 +980,124 @@ impl ServiceState {
         )))
     }
 
+    /// Launch `rosec-prompt` (or SSH_ASKPASS / built-in TTY) with arbitrary
+    /// fields and return the full response map.
+    ///
+    /// Unlike [`spawn_prompt`], which always sends a single `password` field
+    /// and returns just the password, this method accepts a pre-built JSON
+    /// `fields` array and returns **all** field values from the prompt response.
+    ///
+    /// This is used by the GUI prompt 2FA flow: after the initial unlock
+    /// returns `TwoFactorRequired`, the caller builds a fields array with
+    /// the 2FA method selector and/or token input, launches a second prompt
+    /// via this method, and feeds the response into `auth_provider_inner`.
+    ///
+    /// # Security
+    /// - All map values are wrapped in `Zeroizing<String>`.
+    /// - Unused response values are zeroized when the map drops.
+    pub(crate) fn spawn_prompt_fields(
+        self: &Arc<Self>,
+        prompt_path: &str,
+        title: &str,
+        fields_json: &[serde_json::Value],
+    ) -> Result<HashMap<String, Zeroizing<String>>, FdoError> {
+        use std::io::BufRead as _;
+        use std::process::Stdio;
+
+        tracing::debug!(%prompt_path, %title, "spawn_prompt_fields called");
+
+        // Snapshot prompt config for binary path and theme.
+        let prompt_cfg = self
+            .prompt_config
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let program = match prompt_cfg.backend.as_str() {
+            "builtin" | "" => resolve_prompt_binary(),
+            custom => custom.to_string(),
+        };
+
+        let has_display =
+            std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
+        let has_tty = std::path::Path::new("/dev/tty").exists();
+
+        if !has_display && !has_tty {
+            return Err(FdoError::Failed(
+                "headless: no display, no TTY — cannot prompt for 2FA".to_string(),
+            ));
+        }
+
+        let json = build_prompt_fields_json(title, fields_json, &prompt_cfg);
+
+        let mut cmd = std::process::Command::new(&program);
+        // SAFETY: pre_exec runs after fork() in the child process.
+        // setsid() is async-signal-safe and has no preconditions.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        if !has_display {
+            cmd.arg("--tty");
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| FdoError::Failed(format!("rosec-prompt failed to launch: {e}")))?;
+
+        let pid = child.id();
+        let prompt_path_owned = prompt_path.to_string();
+        self.set_prompt_pid(&prompt_path_owned, pid);
+
+        // Send JSON on stdin then close it.
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write as _;
+            stdin
+                .write_all(json.as_bytes())
+                .map_err(|e| FdoError::Failed(format!("rosec-prompt stdin write: {e}")))?;
+        }
+
+        // Read one line of JSON from stdout.
+        let response_line = {
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| FdoError::Failed("rosec-prompt: no stdout pipe".to_string()))?;
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = Zeroizing::new(String::new());
+            reader
+                .read_line(&mut line)
+                .map_err(|e| FdoError::Failed(format!("rosec-prompt read error: {e}")))?;
+            drop(reader);
+            line
+        };
+
+        let status = child
+            .wait()
+            .map_err(|e| FdoError::Failed(format!("rosec-prompt wait: {e}")))?;
+        self.finish_prompt(&prompt_path_owned);
+
+        if !status.success() {
+            return Err(FdoError::Failed("prompt cancelled".to_string()));
+        }
+
+        // Parse the JSON response into a map, wrapping all values in Zeroizing.
+        let raw_map: HashMap<String, String> = serde_json::from_str(response_line.trim())
+            .map_err(|e| FdoError::Failed(format!("rosec-prompt JSON parse: {e}")))?;
+
+        let mut result = HashMap::with_capacity(raw_map.len());
+        for (k, v) in raw_map {
+            result.insert(k, Zeroizing::new(v));
+        }
+
+        Ok(result)
+    }
+
     /// Built-in TTY prompt: opens `/dev/tty` directly and collects the
     /// password using the daemon's own `read_hidden()`.
     ///
@@ -1934,6 +2052,45 @@ fn build_prompt_json(provider_id: String, label: &str, cfg: &PromptConfig) -> St
                 "placeholder": "",
             }
         ],
+        "theme": {
+            "background":         theme.background,
+            "foreground":         theme.foreground,
+            "border_color":       theme.border_color,
+            "border_width":       theme.border_width,
+            "font_family":        theme.font_family,
+            "label_color":        theme.label_color,
+            "accent_color":       theme.accent_color,
+            "confirm_background": theme.confirm_background,
+            "confirm_text":       theme.confirm_text,
+            "cancel_background":  theme.cancel_background,
+            "cancel_text":        theme.cancel_text,
+            "input_background":   theme.input_background,
+            "input_text":         theme.input_text,
+            "font_size":          theme.font_size,
+        }
+    });
+    req.to_string()
+}
+
+/// Build a JSON request payload for `rosec-prompt` with caller-specified fields.
+///
+/// This is used by the 2FA prompt flow where the fields are dynamic (method
+/// selector, TOTP code) rather than the fixed single password field.
+fn build_prompt_fields_json(
+    title: &str,
+    fields: &[serde_json::Value],
+    cfg: &PromptConfig,
+) -> String {
+    use serde_json::{Value, json};
+    let theme = &cfg.theme;
+    let req: Value = json!({
+        "title": title,
+        "message": "",
+        "hint": "",
+        "provider": "",
+        "confirm_label": "Submit",
+        "cancel_label": "Cancel",
+        "fields": fields,
         "theme": {
             "background":         theme.background,
             "foreground":         theme.foreground,
