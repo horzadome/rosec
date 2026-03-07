@@ -5,8 +5,9 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use base64::prelude::{BASE64_STANDARD, Engine};
 use rosec_core::{
-    Attributes, Capability, ItemAttributes, ItemMeta, ItemUpdate, NewItem, Provider,
-    ProviderCallbacks, ProviderError, ProviderStatus, SecretBytes, SshKeyMeta, UnlockInput,
+    AttributeDescriptor, Attributes, Capability, ItemAttributes, ItemMeta, ItemType, ItemUpdate,
+    NewItem, Provider, ProviderCallbacks, ProviderError, ProviderStatus, SecretBytes, SshKeyMeta,
+    SshPrivateKeyMaterial, UnlockInput,
 };
 use tokio::fs;
 use tokio::sync::RwLock;
@@ -256,6 +257,102 @@ impl std::fmt::Debug for LocalVault {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Static attribute catalogue for LocalVault
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Helper: build an `AttributeDescriptor` with `'static` lifetimes.
+const fn desc(
+    name: &'static str,
+    sensitive: bool,
+    item_types: &'static [&'static str],
+    description: &'static str,
+) -> AttributeDescriptor {
+    AttributeDescriptor {
+        name,
+        sensitive,
+        item_types,
+        description,
+    }
+}
+
+/// Catalogue of attributes the local vault can store per item type.
+///
+/// These mirror the Bitwarden PM descriptors where applicable, so that items
+/// created locally and items synced from a remote backend produce a consistent
+/// attribute namespace.
+static LOCAL_VAULT_ATTRIBUTES: &[AttributeDescriptor] = &[
+    // -- Common (all item types) --
+    desc("name", false, &[], "Item display name"),
+    desc(
+        rosec_core::ATTR_TYPE,
+        false,
+        &[],
+        "Item type (generic, login, ssh-key, note, card, identity)",
+    ),
+    desc("notes", true, &[], "Free-form notes (always sensitive)"),
+    // -- Login --
+    desc(
+        "username",
+        false,
+        &["login"],
+        "Login username (public per attribute-model decision)",
+    ),
+    desc("password", true, &["login"], "Login password"),
+    desc("totp", true, &["login"], "TOTP seed / otpauth URI"),
+    desc("uri", false, &["login"], "Primary login URI"),
+    // -- SSH Key --
+    desc("private_key", true, &["ssh-key"], "SSH private key (PEM)"),
+    desc("public_key", false, &["ssh-key"], "SSH public key"),
+    desc("fingerprint", false, &["ssh-key"], "SSH key fingerprint"),
+    // -- Card --
+    desc("cardholder", true, &["card"], "Cardholder name (PII)"),
+    desc("number", true, &["card"], "Card number"),
+    desc(
+        "brand",
+        false,
+        &["card"],
+        "Card brand (Visa, Mastercard, etc.)",
+    ),
+    desc("exp_month", true, &["card"], "Card expiration month"),
+    desc("exp_year", true, &["card"], "Card expiration year"),
+    desc("code", true, &["card"], "Card security code (CVV)"),
+    // -- Identity (all PII → sensitive) --
+    desc(
+        "title",
+        true,
+        &["identity"],
+        "Identity title (Mr, Ms, etc.)",
+    ),
+    desc("first_name", true, &["identity"], "First name"),
+    desc("middle_name", true, &["identity"], "Middle name"),
+    desc("last_name", true, &["identity"], "Last name"),
+    desc("username", true, &["identity"], "Identity username (PII)"),
+    desc("company", true, &["identity"], "Company name"),
+    desc("ssn", true, &["identity"], "Social Security Number"),
+    desc("passport_number", true, &["identity"], "Passport number"),
+    desc(
+        "license_number",
+        true,
+        &["identity"],
+        "Driver's license number",
+    ),
+    desc("email", true, &["identity"], "Identity email address (PII)"),
+    desc("phone", true, &["identity"], "Identity phone number (PII)"),
+    desc("address1", true, &["identity"], "Address line 1"),
+    desc("address2", true, &["identity"], "Address line 2"),
+    desc("address3", true, &["identity"], "Address line 3"),
+    desc("city", true, &["identity"], "City"),
+    desc("state", true, &["identity"], "State / province"),
+    desc("postal_code", true, &["identity"], "Postal / ZIP code"),
+    desc("country", true, &["identity"], "Country"),
+    // -- Note --
+    // Notes use only the common "notes" attribute (always sensitive).
+    // -- Generic --
+    // Generic items use only common attributes + a "secret" sensitive attribute.
+    desc("secret", true, &["generic"], "Generic secret value"),
+];
+
 #[async_trait]
 impl Provider for LocalVault {
     fn id(&self) -> &str {
@@ -273,8 +370,24 @@ impl Provider for LocalVault {
     fn capabilities(&self) -> &'static [Capability] {
         &[
             Capability::Write,
+            Capability::Ssh,
             Capability::KeyWrapping,
             Capability::PasswordChange,
+        ]
+    }
+
+    fn available_attributes(&self) -> &'static [AttributeDescriptor] {
+        LOCAL_VAULT_ATTRIBUTES
+    }
+
+    fn supported_item_types(&self) -> &'static [ItemType] {
+        &[
+            ItemType::Generic,
+            ItemType::Login,
+            ItemType::SshKey,
+            ItemType::Note,
+            ItemType::Card,
+            ItemType::Identity,
         ]
     }
 
@@ -489,12 +602,18 @@ impl Provider for LocalVault {
         let mut guard = self.state.write().await;
         let state = guard.as_mut().ok_or(ProviderError::Locked)?;
 
+        // Stamp rosec:type from the typed item_type field.
+        let mut attributes = item.attributes.clone();
+        if let Some(ref item_type) = item.item_type {
+            attributes.insert(rosec_core::ATTR_TYPE.to_string(), item_type.to_string());
+        }
+
         if let Some((idx, _)) = state
             .data
             .items
             .iter()
             .enumerate()
-            .find(|(_, i)| self.matches_attributes(i, &item.attributes))
+            .find(|(_, i)| self.matches_attributes(i, &attributes))
         {
             if !replace {
                 return Err(ProviderError::AlreadyExists);
@@ -503,7 +622,7 @@ impl Provider for LocalVault {
             let now = chrono::Utc::now().timestamp();
             let mut existing_item = state.data.items[idx].clone();
             existing_item.label = item.label.clone();
-            existing_item.attributes = item.attributes.clone();
+            existing_item.attributes = attributes;
             existing_item.secrets = item
                 .secrets
                 .iter()
@@ -533,7 +652,7 @@ impl Provider for LocalVault {
         let new_item = VaultItemData {
             id: id.clone(),
             label: item.label,
-            attributes: item.attributes,
+            attributes,
             secrets,
             created: now,
             modified: now,
@@ -580,6 +699,14 @@ impl Provider for LocalVault {
             item.attributes = attrs;
         }
 
+        // Stamp rosec:type from the typed item_type field.
+        // Applied after attribute replacement so the caller-provided type
+        // always wins, even if they also replaced all attributes.
+        if let Some(item_type) = update.item_type {
+            item.attributes
+                .insert(rosec_core::ATTR_TYPE.to_string(), item_type.to_string());
+        }
+
         if let Some(secrets) = update.secrets {
             for (k, v) in secrets {
                 item.secrets.insert(k, BASE64_STANDARD.encode(v.as_slice()));
@@ -617,7 +744,103 @@ impl Provider for LocalVault {
     }
 
     async fn list_ssh_keys(&self) -> Result<Vec<SshKeyMeta>, ProviderError> {
-        Ok(Vec::new())
+        let guard = self.state.read().await;
+        let state = guard.as_ref().ok_or(ProviderError::Locked)?;
+
+        let provider_id = self.id.clone();
+        let keys = state
+            .data
+            .items
+            .iter()
+            .filter(|item| {
+                // Must be an ssh-key item with a private_key secret present.
+                item.attributes
+                    .get(rosec_core::ATTR_TYPE)
+                    .is_some_and(|t| t == "ssh-key")
+                    && item.secrets.contains_key("private_key")
+            })
+            .map(|item| {
+                let public_key_openssh = item
+                    .attributes
+                    .get("public_key")
+                    .cloned()
+                    .filter(|v| !v.is_empty());
+                let fingerprint = item
+                    .attributes
+                    .get("fingerprint")
+                    .cloned()
+                    .filter(|v| !v.is_empty());
+
+                // SSH host patterns from custom.ssh_host / custom.ssh-host attributes.
+                let ssh_hosts: Vec<String> = ["custom.ssh_host", "custom.ssh-host"]
+                    .iter()
+                    .filter_map(|key| item.attributes.get(*key))
+                    .flat_map(|v| v.lines())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+
+                // SSH username from custom.ssh_user / custom.ssh-user.
+                let ssh_user = ["custom.ssh_user", "custom.ssh-user"]
+                    .iter()
+                    .filter_map(|key| item.attributes.get(*key))
+                    .map(|v| v.trim().to_string())
+                    .find(|s| !s.is_empty());
+
+                // Require confirmation from custom.ssh_confirm / custom.ssh-confirm.
+                let require_confirm = ["custom.ssh_confirm", "custom.ssh-confirm"]
+                    .iter()
+                    .filter_map(|key| item.attributes.get(*key))
+                    .any(|v| v == "true");
+
+                let revision_date = SystemTime::UNIX_EPOCH
+                    .checked_add(std::time::Duration::from_secs(item.modified as u64));
+
+                SshKeyMeta {
+                    item_id: item.id.clone(),
+                    item_name: item.label.clone(),
+                    provider_id: provider_id.clone(),
+                    public_key_openssh,
+                    fingerprint,
+                    ssh_hosts,
+                    ssh_user,
+                    require_confirm,
+                    revision_date,
+                }
+            })
+            .collect();
+
+        Ok(keys)
+    }
+
+    async fn get_ssh_private_key(&self, id: &str) -> Result<SshPrivateKeyMaterial, ProviderError> {
+        let guard = self.state.read().await;
+        let state = guard.as_ref().ok_or(ProviderError::Locked)?;
+
+        let item = state
+            .data
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .ok_or(ProviderError::NotFound)?;
+
+        let encoded = item
+            .secrets
+            .get("private_key")
+            .ok_or(ProviderError::NotFound)?;
+
+        let raw = BASE64_STANDARD
+            .decode(encoded)
+            .map_err(|e| ProviderError::Other(anyhow::anyhow!("base64 decode failed: {e}")))?;
+
+        let pem = String::from_utf8(raw).map_err(|e| {
+            ProviderError::Other(anyhow::anyhow!("private key is not valid UTF-8: {e}"))
+        })?;
+
+        Ok(SshPrivateKeyMaterial {
+            pem: Zeroizing::new(pem),
+        })
     }
 
     /// Local vaults have no remote source — nothing to sync.
@@ -778,6 +1001,7 @@ mod tests {
 
         let item = NewItem {
             label: "Test Item".to_string(),
+            item_type: None,
             attributes: HashMap::new(),
             secrets,
         };
@@ -809,6 +1033,7 @@ mod tests {
 
         let item = NewItem {
             label: "Test".to_string(),
+            item_type: None,
             attributes: attrs.clone(),
             secrets: secrets.clone(),
         };
@@ -817,6 +1042,7 @@ mod tests {
 
         let item2 = NewItem {
             label: "Test2".to_string(),
+            item_type: None,
             attributes: attrs,
             secrets,
         };
@@ -843,6 +1069,7 @@ mod tests {
 
         let item = NewItem {
             label: "Test".to_string(),
+            item_type: None,
             attributes: attrs.clone(),
             secrets: secrets.clone(),
         };
@@ -851,6 +1078,7 @@ mod tests {
 
         let item2 = NewItem {
             label: "Replaced".to_string(),
+            item_type: None,
             attributes: attrs,
             secrets,
         };
@@ -879,6 +1107,7 @@ mod tests {
 
         let item = NewItem {
             label: "Original".to_string(),
+            item_type: None,
             attributes: HashMap::new(),
             secrets,
         };
@@ -887,6 +1116,7 @@ mod tests {
 
         let update = ItemUpdate {
             label: Some("Updated".to_string()),
+            item_type: None,
             attributes: None,
             secrets: None,
         };
@@ -913,6 +1143,7 @@ mod tests {
 
         let item = NewItem {
             label: "Test".to_string(),
+            item_type: None,
             attributes: HashMap::new(),
             secrets,
         };
@@ -924,6 +1155,7 @@ mod tests {
 
         let update = ItemUpdate {
             label: None,
+            item_type: None,
             attributes: Some(attrs),
             secrets: None,
         };
@@ -947,6 +1179,7 @@ mod tests {
 
         let item = NewItem {
             label: "Test".to_string(),
+            item_type: None,
             attributes: HashMap::new(),
             secrets,
         };
@@ -982,11 +1215,13 @@ mod tests {
 
         let item1 = NewItem {
             label: "Item1".to_string(),
+            item_type: None,
             attributes: attrs1.clone(),
             secrets: secrets.clone(),
         };
         let item2 = NewItem {
             label: "Item2".to_string(),
+            item_type: None,
             attributes: attrs2,
             secrets,
         };
@@ -1016,6 +1251,7 @@ mod tests {
         secrets.insert("secret".to_string(), SecretBytes::new(b"test".to_vec()));
         let item = NewItem {
             label: "Test".to_string(),
+            item_type: None,
             attributes: HashMap::new(),
             secrets,
         };
@@ -1039,6 +1275,7 @@ mod tests {
 
         let item = NewItem {
             label: "Test".to_string(),
+            item_type: None,
             attributes: HashMap::new(),
             secrets,
         };

@@ -3802,6 +3802,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "ssh-key",
+ "tempfile",
  "tokio",
  "toml 1.0.3+spec-1.1.0",
  "toml_edit 0.25.3+spec-1.1.0",

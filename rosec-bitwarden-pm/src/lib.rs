@@ -125,7 +125,7 @@ fn bitwarden_attribute_descriptors() -> Vec<WasmAttributeDescriptor> {
             ATTR_TYPE,
             false,
             &[],
-            "Item type (login, note, card, identity, sshkey)",
+            "Item type (login, note, card, identity, ssh-key)",
         ),
         desc("folder", false, &[], "Folder name (if assigned)"),
         desc("notes", true, &[], "Free-form notes (always sensitive)"),
@@ -152,9 +152,9 @@ fn bitwarden_attribute_descriptors() -> Vec<WasmAttributeDescriptor> {
         desc("exp_year", true, &["card"], "Card expiration year"),
         desc("code", true, &["card"], "Card security code (CVV)"),
         // -- SSH Key --
-        desc("private_key", true, &["sshkey"], "SSH private key"),
-        desc("public_key", false, &["sshkey"], "SSH public key"),
-        desc("fingerprint", false, &["sshkey"], "SSH key fingerprint"),
+        desc("private_key", true, &["ssh-key"], "SSH private key"),
+        desc("public_key", false, &["ssh-key"], "SSH public key"),
+        desc("fingerprint", false, &["ssh-key"], "SSH key fingerprint"),
         // -- Identity (all PII → sensitive) --
         desc(
             "title",

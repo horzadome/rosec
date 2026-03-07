@@ -129,6 +129,7 @@ impl SecretCollection {
 
         let item = NewItem {
             label,
+            item_type: None,
             attributes,
             secrets,
         };

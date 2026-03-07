@@ -1,0 +1,292 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use rosec_core::{ATTR_PROVIDER, Capability, ItemMeta, ItemType, ItemUpdate, NewItem, SecretBytes};
+use tracing::{debug, info};
+use zbus::fdo::Error as FdoError;
+use zbus::interface;
+use zbus::message::Header;
+
+use crate::state::{ServiceState, make_item_path, map_provider_error};
+
+/// Log the D-Bus caller at debug level for an items-extension method.
+fn log_caller(method: &str, header: &Header<'_>) {
+    let sender = header.sender().map(|s| s.as_str()).unwrap_or("<unknown>");
+    debug!(method, sender, "D-Bus items-extension call");
+}
+
+pub struct RosecItems {
+    pub(super) state: Arc<ServiceState>,
+}
+
+impl RosecItems {
+    pub fn new(state: Arc<ServiceState>) -> Self {
+        Self { state }
+    }
+}
+
+#[interface(name = "org.rosec.Items")]
+impl RosecItems {
+    /// Create an item with full control over type and multiple secrets.
+    ///
+    /// Unlike the standard `CreateItem` (which only supports a single `"secret"`
+    /// key), this method accepts:
+    ///
+    /// - `label`: human-readable item name
+    /// - `item_type`: canonical rosec type string (`"generic"`, `"login"`,
+    ///   `"ssh-key"`, `"note"`, `"card"`, `"identity"`)
+    /// - `attributes`: public attribute key-value pairs
+    /// - `secrets`: map of secret attribute name to raw bytes (e.g.
+    ///   `{"password": [...], "totp": [...]}`)
+    /// - `replace`: if `true`, overwrite an existing item with matching attributes
+    ///
+    /// Returns the D-Bus object path of the created item.
+    async fn create_item_extended(
+        &self,
+        label: &str,
+        item_type: &str,
+        attributes: HashMap<String, String>,
+        secrets: HashMap<String, Vec<u8>>,
+        replace: bool,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<String, FdoError> {
+        log_caller("CreateItemExtended", &header);
+        self.state.touch_activity();
+
+        let write_provider = self
+            .state
+            .write_provider()
+            .ok_or_else(|| FdoError::NotSupported("no write-capable provider available".into()))?;
+
+        let parsed_type: ItemType = item_type
+            .parse()
+            .map_err(|e: String| FdoError::InvalidArgs(e))?;
+
+        // Check the provider supports this item type.
+        let supported = write_provider.supported_item_types();
+        if !supported.is_empty() && !supported.contains(&parsed_type) {
+            return Err(FdoError::NotSupported(format!(
+                "provider does not support item type '{item_type}'"
+            )));
+        }
+
+        // Build the NewItem with typed secrets.
+        let secret_map: HashMap<String, SecretBytes> = secrets
+            .into_iter()
+            .map(|(k, v)| (k, SecretBytes::new(v)))
+            .collect();
+
+        let item = NewItem {
+            label: label.to_string(),
+            item_type: Some(parsed_type),
+            attributes,
+            secrets: secret_map,
+        };
+
+        let provider_id = write_provider.id().to_string();
+        let provider = Arc::clone(&write_provider);
+        let item_for_create = item.clone();
+
+        let id = self
+            .state
+            .run_on_tokio(async move { provider.create_item(item_for_create, replace).await })
+            .await?
+            .map_err(map_provider_error)?;
+
+        info!(item_id = %id, provider = %provider_id, item_type = %item_type, "created item via D-Bus (extended)");
+
+        let item_path = make_item_path(&provider_id, &id);
+
+        let mut attrs = item.attributes.clone();
+        attrs
+            .entry(ATTR_PROVIDER.to_string())
+            .or_insert_with(|| provider_id.clone());
+
+        let meta = ItemMeta {
+            id: id.clone(),
+            provider_id: provider_id.clone(),
+            label: item.label.clone(),
+            attributes: attrs,
+            created: Some(std::time::SystemTime::now()),
+            modified: Some(std::time::SystemTime::now()),
+            locked: false,
+        };
+
+        self.state
+            .insert_created_item(&item_path, meta)
+            .await
+            .map_err(|e| FdoError::Failed(format!("cache update failed: {e}")))?;
+
+        Ok(item_path)
+    }
+
+    /// Update an existing item's label, type, attributes, and/or secrets.
+    ///
+    /// All fields are optional — only provided fields are updated.
+    ///
+    /// - `item_path`: D-Bus object path of the item to update
+    /// - `label`: new label (empty string = no change)
+    /// - `item_type`: new type string (empty string = no change)
+    /// - `attributes`: replacement attributes (empty map = no change)
+    /// - `secrets`: replacement secrets (empty map = no change)
+    async fn update_item(
+        &self,
+        item_path: &str,
+        label: &str,
+        item_type: &str,
+        attributes: HashMap<String, String>,
+        secrets: HashMap<String, Vec<u8>>,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), FdoError> {
+        log_caller("UpdateItem", &header);
+        self.state.touch_activity();
+
+        let (provider, item_id) = self.state.provider_and_id_for_path(item_path)?;
+
+        // Verify the provider supports writes.
+        if !provider.capabilities().contains(&Capability::Write) {
+            return Err(FdoError::NotSupported(
+                "provider does not support writes".into(),
+            ));
+        }
+
+        let parsed_type = if item_type.is_empty() {
+            None
+        } else {
+            Some(
+                item_type
+                    .parse::<ItemType>()
+                    .map_err(|e: String| FdoError::InvalidArgs(e))?,
+            )
+        };
+
+        let update_label = if label.is_empty() {
+            None
+        } else {
+            Some(label.to_string())
+        };
+
+        let update_attrs = if attributes.is_empty() {
+            None
+        } else {
+            Some(attributes)
+        };
+
+        let update_secrets = if secrets.is_empty() {
+            None
+        } else {
+            Some(
+                secrets
+                    .into_iter()
+                    .map(|(k, v)| (k, SecretBytes::new(v)))
+                    .collect(),
+            )
+        };
+
+        let update = ItemUpdate {
+            label: update_label,
+            item_type: parsed_type,
+            attributes: update_attrs,
+            secrets: update_secrets,
+        };
+
+        let provider_id = provider.id().to_string();
+        let item_id_for_log = item_id.clone();
+
+        self.state
+            .run_on_tokio(async move { provider.update_item(&item_id, update).await })
+            .await?
+            .map_err(map_provider_error)?;
+
+        info!(item_id = %item_id_for_log, provider = %provider_id, "updated item via D-Bus");
+
+        Ok(())
+    }
+
+    /// Delete an item by its D-Bus object path.
+    async fn delete_item(
+        &self,
+        item_path: &str,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), FdoError> {
+        log_caller("DeleteItem", &header);
+        self.state.touch_activity();
+
+        let (provider, item_id) = self.state.provider_and_id_for_path(item_path)?;
+
+        if !provider.capabilities().contains(&Capability::Write) {
+            return Err(FdoError::NotSupported(
+                "provider does not support writes".into(),
+            ));
+        }
+
+        let provider_id = provider.id().to_string();
+        let item_id_for_log = item_id.clone();
+        let path_owned = item_path.to_string();
+
+        self.state
+            .run_on_tokio(async move { provider.delete_item(&item_id).await })
+            .await?
+            .map_err(map_provider_error)?;
+
+        self.state.remove_deleted_item(&path_owned);
+
+        info!(item_id = %item_id_for_log, provider = %provider_id, "deleted item via D-Bus");
+
+        Ok(())
+    }
+
+    /// Return the capabilities of a provider.
+    ///
+    /// If `provider_id` is empty, returns capabilities of the default write provider.
+    fn get_capabilities(
+        &self,
+        provider_id: &str,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<Vec<String>, FdoError> {
+        log_caller("GetCapabilities", &header);
+
+        let provider = if provider_id.is_empty() {
+            self.state
+                .write_provider()
+                .ok_or_else(|| FdoError::Failed("no write-capable provider available".into()))?
+        } else {
+            self.state
+                .provider_by_id(provider_id)
+                .ok_or_else(|| FdoError::Failed(format!("provider not found: {provider_id}")))?
+        };
+
+        Ok(provider
+            .capabilities()
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect())
+    }
+
+    /// Return the item types supported by a provider for creation.
+    ///
+    /// If `provider_id` is empty, returns types for the default write provider.
+    fn get_supported_item_types(
+        &self,
+        provider_id: &str,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<Vec<String>, FdoError> {
+        log_caller("GetSupportedItemTypes", &header);
+
+        let provider = if provider_id.is_empty() {
+            self.state
+                .write_provider()
+                .ok_or_else(|| FdoError::Failed("no write-capable provider available".into()))?
+        } else {
+            self.state
+                .provider_by_id(provider_id)
+                .ok_or_else(|| FdoError::Failed(format!("provider not found: {provider_id}")))?
+        };
+
+        Ok(provider
+            .supported_item_types()
+            .iter()
+            .map(|t| t.to_string())
+            .collect())
+    }
+}

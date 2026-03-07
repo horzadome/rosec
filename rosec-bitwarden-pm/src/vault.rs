@@ -85,7 +85,7 @@ impl CipherType {
             Self::SecureNote => "note",
             Self::Card => "card",
             Self::Identity => "identity",
-            Self::SshKey => "sshkey",
+            Self::SshKey => "ssh-key",
             Self::Unknown(_) => "unknown",
         }
     }

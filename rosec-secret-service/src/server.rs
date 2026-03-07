@@ -7,7 +7,7 @@ use rosec_core::router::Router;
 use zbus::Connection;
 
 use crate::collection::{CollectionState, SecretCollection};
-use crate::daemon::{RosecManagement, RosecSearch, RosecSecrets};
+use crate::daemon::{RosecItems, RosecManagement, RosecSearch, RosecSecrets};
 use crate::service::SecretService;
 use crate::session::SessionManager;
 use crate::state::ServiceState;
@@ -117,6 +117,9 @@ pub async fn register_objects_with_full_config(
         .await?;
     server
         .at("/org/rosec/Secrets", RosecSecrets::new(Arc::clone(&state)))
+        .await?;
+    server
+        .at("/org/rosec/Items", RosecItems::new(Arc::clone(&state)))
         .await?;
 
     let collection_state = CollectionState {

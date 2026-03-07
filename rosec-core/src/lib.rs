@@ -113,7 +113,10 @@ pub fn require(provider: &dyn Provider, cap: Capability) -> Result<(), ProviderE
 ///
 /// Used by [`primary_secret`] to return the appropriate secret based on
 /// item type when the caller doesn't specify an attribute name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Canonical `rosec:type` strings: `"generic"`, `"login"`, `"ssh-key"`,
+/// `"note"`, `"card"`, `"identity"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemType {
     /// Generic secret. Default attr: "secret".
     Generic,
@@ -121,6 +124,12 @@ pub enum ItemType {
     Login,
     /// SSH private key. Default attr: "private_key".
     SshKey,
+    /// Secure note. Default attr: "secret" (the note body).
+    Note,
+    /// Payment card. Default attr: "number".
+    Card,
+    /// Identity / personal information. Default attr: "secret".
+    Identity,
 }
 
 impl ItemType {
@@ -129,16 +138,54 @@ impl ItemType {
         match attrs.get(ATTR_TYPE).map(|s| s.as_str()) {
             Some("login") => Self::Login,
             Some("ssh-key") => Self::SshKey,
+            Some("note") => Self::Note,
+            Some("card") => Self::Card,
+            Some("identity") => Self::Identity,
             _ => Self::Generic,
+        }
+    }
+
+    /// The canonical `rosec:type` attribute value for this type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::Login => "login",
+            Self::SshKey => "ssh-key",
+            Self::Note => "note",
+            Self::Card => "card",
+            Self::Identity => "identity",
         }
     }
 
     /// The default secret attribute name for this item type.
     pub fn default_secret_attr(&self) -> &'static str {
         match self {
-            Self::Generic => "secret",
+            Self::Generic | Self::Note | Self::Identity => "secret",
             Self::Login => "password",
             Self::SshKey => "private_key",
+            Self::Card => "number",
+        }
+    }
+}
+
+impl std::fmt::Display for ItemType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ItemType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "generic" => Ok(Self::Generic),
+            "login" => Ok(Self::Login),
+            "ssh-key" => Ok(Self::SshKey),
+            "note" => Ok(Self::Note),
+            "card" => Ok(Self::Card),
+            "identity" => Ok(Self::Identity),
+            _ => Err(format!("unknown item type: {s}")),
         }
     }
 }
@@ -148,6 +195,12 @@ impl ItemType {
 pub struct NewItem {
     /// Display label (required, non-empty).
     pub label: String,
+    /// Item type hint.
+    ///
+    /// If `Some`, the provider stamps `rosec:type` on the stored attributes
+    /// internally.  Callers must **not** put `rosec:type` in `attributes`
+    /// directly — that remains a reserved name rejected by [`validate`].
+    pub item_type: Option<ItemType>,
     /// Public, searchable attributes. Reserved names are rejected by validate().
     pub attributes: HashMap<String, String>,
     /// Named secret values. At least one required.
@@ -189,6 +242,10 @@ impl NewItem {
 pub struct ItemUpdate {
     /// New display label (None = no change).
     pub label: Option<String>,
+    /// New item type (None = no change).
+    ///
+    /// If `Some`, the provider updates the stored `rosec:type` attribute.
+    pub item_type: Option<ItemType>,
     /// Replace all public attributes (None = no change).
     /// Reserved names are validated when applied.
     pub attributes: Option<HashMap<String, String>>,
@@ -825,6 +882,17 @@ pub trait Provider: Send + Sync {
     ///
     /// Default: empty (providers that haven't migrated to the attribute model).
     fn available_attributes(&self) -> &'static [AttributeDescriptor] {
+        &[]
+    }
+
+    /// Declare which item types this provider can create.
+    ///
+    /// Returns the [`ItemType`] values this provider supports for
+    /// [`create_item`][Provider::create_item].  An empty slice means the
+    /// provider either doesn't support writes or accepts any type.
+    ///
+    /// Used by the CLI to generate templates and validate user input.
+    fn supported_item_types(&self) -> &'static [ItemType] {
         &[]
     }
 
