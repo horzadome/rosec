@@ -1,0 +1,301 @@
+#compdef rosec
+
+# rosec - Multi-provider Secret Service daemon CLI
+# Zsh completion script
+#
+# Install: copy to a directory in $fpath, e.g.
+#   cp _rosec /usr/share/zsh/site-functions/_rosec
+#
+# Or source from your .zshrc:
+#   fpath=(/path/to/dir/containing/_rosec $fpath)
+#   autoload -Uz compinit && compinit
+
+# ---------------------------------------------------------------------------
+# Dynamic helpers
+# ---------------------------------------------------------------------------
+
+# Complete provider IDs from config.toml (offline) or daemon (online).
+(( $+functions[__rosec_provider_ids] )) ||
+__rosec_provider_ids() {
+    local -a ids
+    # Try the daemon first (most accurate, includes runtime state)
+    if ids=( ${(f)"$(rosec provider list 2>/dev/null | awk 'NR>1 && NF{print $1}')"} ) && (( ${#ids} )); then
+        _describe -t providers 'provider id' ids
+        return
+    fi
+    # Fallback: parse config.toml directly (offline)
+    local config="${XDG_CONFIG_HOME:-$HOME/.config}/rosec/config.toml"
+    if [[ -f "$config" ]]; then
+        ids=( ${(f)"$(awk -F'"' '/^\[\[provider\]\]/{found=1; next} found && /^id[[:space:]]*=/{print $2; found=0}' "$config")"} )
+        (( ${#ids} )) && _describe -t providers 'provider id' ids
+    fi
+}
+
+# Complete provider kinds (built-in + discovered WASM plugins).
+(( $+functions[__rosec_provider_kinds] )) ||
+__rosec_provider_kinds() {
+    local -a kinds
+    if kinds=( ${(f)"$(rosec provider kinds 2>/dev/null)"} ) && (( ${#kinds} )); then
+        _describe -t kinds 'provider kind' kinds
+        return
+    fi
+    # Fallback: hardcoded built-in kind
+    local -a fallback=( 'local' )
+    # Try to discover WASM plugin kinds from standard paths
+    local dir
+    for dir in /usr/lib/rosec/providers "${XDG_DATA_HOME:-$HOME/.local/share}/rosec/providers"; do
+        if [[ -d "$dir" ]]; then
+            local f
+            for f in "$dir"/rosec_*.wasm(N); do
+                local name="${f:t:r}"           # rosec_bitwarden_pm -> rosec_bitwarden_pm
+                name="${name#rosec_}"            # bitwarden_pm
+                name="${name//_/-}"              # bitwarden-pm
+                fallback+=( "$name" )
+            done
+        fi
+    done
+    _describe -t kinds 'provider kind' fallback
+}
+
+# Complete config keys.
+(( $+functions[__rosec_config_keys] )) ||
+__rosec_config_keys() {
+    local -a keys=(
+        'service.refresh_interval_secs:Vault re-sync interval in seconds (0 = disabled)'
+        'service.dedup_strategy:Deduplication strategy (newest | priority)'
+        'service.dedup_time_fallback:Tie-break field when strategy=newest (created | none)'
+        'autolock.on_logout:Lock vault when the session ends (true | false)'
+        'autolock.on_session_lock:Lock vault when the screen locks (true | false)'
+        'autolock.idle_timeout_minutes:Lock after N minutes of inactivity (0 = disabled)'
+        'autolock.max_unlocked_minutes:Hard cap\: lock after N minutes unlocked (0 = disabled)'
+    )
+    _describe -t config-keys 'config key' keys
+}
+
+# Complete config values based on the key.
+(( $+functions[__rosec_config_values] )) ||
+__rosec_config_values() {
+    local key="$1"
+    case "$key" in
+        service.dedup_strategy)
+            local -a vals=( 'newest' 'priority' )
+            _describe -t values 'dedup strategy' vals ;;
+        service.dedup_time_fallback)
+            local -a vals=( 'created' 'none' )
+            _describe -t values 'time fallback' vals ;;
+        autolock.on_logout|autolock.on_session_lock)
+            local -a vals=( 'true' 'false' )
+            _describe -t values 'boolean' vals ;;
+        service.refresh_interval_secs|autolock.idle_timeout_minutes|autolock.max_unlocked_minutes)
+            _message 'non-negative integer' ;;
+    esac
+}
+
+# Complete item IDs (requires running daemon).
+(( $+functions[__rosec_item_ids] )) ||
+__rosec_item_ids() {
+    local -a items
+    items=( ${(f)"$(rosec search --format=kv 2>/dev/null | awk -F= '/^id=/{print $2}')"} )
+    if (( ${#items} )); then
+        _describe -t items 'item id' items
+    else
+        _message 'item id (daemon not running?)'
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand completions
+# ---------------------------------------------------------------------------
+
+_rosec_provider() {
+    local -a subcmds=(
+        'list:List configured providers'
+        'ls:List configured providers'
+        'kinds:List available provider kinds'
+        'auth:Authenticate a provider'
+        'add:Add a new provider'
+        'remove:Remove a provider'
+        'rm:Remove a provider'
+        'enable:Enable a provider'
+        'disable:Disable a provider'
+        'attach:Attach a local vault file'
+        'detach:Detach a local vault'
+        'add-password:Add a password entry to a local vault'
+        'remove-password:Remove a password entry from a local vault'
+        'list-passwords:List password entries for a local vault'
+        'change-password:Change a password on a local vault'
+        'help:Show help'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe -t subcommands 'provider subcommand' subcmds
+        return
+    fi
+
+    case "${words[2]}" in
+        auth)
+            if (( CURRENT == 3 )); then
+                __rosec_provider_ids
+            else
+                _arguments \
+                    '(-f --force)'{-f,--force}'[Force re-authentication]'
+            fi
+            ;;
+        add)
+            if (( CURRENT == 3 )); then
+                __rosec_provider_kinds
+            else
+                _arguments \
+                    '--id[Provider ID]:id:' \
+                    '--path[Vault file path]:path:_files' \
+                    '--collection[Collection name]:collection:' \
+                    '*:key=value:'
+            fi
+            ;;
+        remove|rm|enable|disable|detach|change-password)
+            if (( CURRENT == 3 )); then
+                __rosec_provider_ids
+            fi
+            ;;
+        attach)
+            _arguments \
+                '--path[Vault file path]:path:_files' \
+                '--id[Provider ID]:id:' \
+                '--collection[Collection name]:collection:'
+            ;;
+        add-password)
+            if (( CURRENT == 3 )); then
+                __rosec_provider_ids
+            else
+                _arguments \
+                    '--label[Password label]:label:'
+            fi
+            ;;
+        remove-password)
+            if (( CURRENT == 3 )); then
+                __rosec_provider_ids
+            fi
+            # 4th arg is entry-id — no completion available
+            ;;
+        list-passwords)
+            if (( CURRENT == 3 )); then
+                __rosec_provider_ids
+            fi
+            ;;
+    esac
+}
+
+_rosec_config() {
+    local -a subcmds=(
+        'show:Print the current effective configuration'
+        'get:Print the value of a config key'
+        'set:Update a config key'
+        'help:Show help'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe -t subcommands 'config subcommand' subcmds
+        return
+    fi
+
+    case "${words[2]}" in
+        get)
+            if (( CURRENT == 3 )); then
+                __rosec_config_keys
+            fi
+            ;;
+        set)
+            if (( CURRENT == 3 )); then
+                __rosec_config_keys
+            elif (( CURRENT == 4 )); then
+                __rosec_config_values "${words[3]}"
+            fi
+            ;;
+    esac
+}
+
+_rosec_search() {
+    _arguments \
+        '(-s --sync)'{-s,--sync}'[Sync before searching]' \
+        '--format[Output format]:format:(table kv json)' \
+        '--show-path[Show D-Bus object path]' \
+        '*:key=value:'
+}
+
+_rosec_get() {
+    _arguments \
+        '(-s --sync)'{-s,--sync}'[Sync before fetching]' \
+        '--attr[Attribute to retrieve]:attr:' \
+        ':item:__rosec_item_ids'
+}
+
+_rosec_inspect() {
+    _arguments \
+        '(-a --all-attrs)'{-a,--all-attrs}'[Show all attributes including sensitive]' \
+        '(-s --sync)'{-s,--sync}'[Sync before inspecting]' \
+        '--format[Output format]:format:(human kv json)' \
+        ':item:__rosec_item_ids'
+}
+
+_rosec_enable() {
+    _arguments \
+        '--no-systemd[Do not install/enable systemd user units]' \
+        '--mask[Suppress gnome-keyring (D-Bus, autostart, systemd socket)]' \
+        '(-f --force)'{-f,--force}'[Overwrite existing files]'
+}
+
+_rosec_disable() {
+    _arguments \
+        '--no-systemd[Do not remove/disable systemd user units]'
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatcher
+# ---------------------------------------------------------------------------
+
+_rosec() {
+    local -a commands=(
+        'provider:Manage providers'
+        'providers:Manage providers'
+        'config:Read or modify configuration'
+        'status:Show daemon and provider status'
+        'sync:Sync all providers'
+        'refresh:Sync all providers'
+        'search:Search items across providers'
+        'get:Get an item secret'
+        'inspect:Inspect an item in detail'
+        'lock:Lock all providers'
+        'unlock:Unlock providers'
+        'enable:Install D-Bus activation and systemd units'
+        'disable:Remove D-Bus activation and systemd units'
+        'version:Print version'
+        'help:Show help'
+    )
+
+    local curcontext="$curcontext" state state_descr line
+    typeset -A opt_args
+
+    _arguments -C \
+        '(-c --config)'{-c,--config}'[Config file path]:config:_files' \
+        '1:command:->cmds' \
+        '*::arg:->args'
+
+    case "$state" in
+        cmds)
+            _describe -t commands 'rosec command' commands
+            ;;
+        args)
+            case "${line[1]}" in
+                provider|providers) _rosec_provider ;;
+                config)             _rosec_config ;;
+                search)             _rosec_search ;;
+                get)                _rosec_get ;;
+                inspect)            _rosec_inspect ;;
+                enable)             _rosec_enable ;;
+                disable)            _rosec_disable ;;
+            esac
+            ;;
+    esac
+}
+
+_rosec "$@"

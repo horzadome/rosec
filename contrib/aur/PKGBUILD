@@ -167,6 +167,12 @@ package() {
     # Service activation files are generated at runtime by `rosec enable`
     # with the correct binary paths — no static copies shipped.
 
+    # Shell completions
+    install -Dm644 contrib/bash/rosec.bash \
+        "${pkgdir}/usr/share/bash-completion/completions/rosec"
+    install -Dm644 contrib/zsh/_rosec \
+        "${pkgdir}/usr/share/zsh/site-functions/_rosec"
+
     # Docs
     install -Dm644 README.md \
         "${pkgdir}/usr/share/doc/rosec/README.md"
