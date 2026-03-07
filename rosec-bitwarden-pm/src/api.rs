@@ -484,7 +484,11 @@ struct LoginErrorResponse {
     error: Option<String>,
     #[serde(alias = "error_description")]
     error_description: Option<String>,
-    #[serde(alias = "TwoFactorProviders", deserialize_with = "deser_two_factor_providers")]
+    #[serde(
+        alias = "TwoFactorProviders",
+        default,
+        deserialize_with = "deser_two_factor_providers"
+    )]
     two_factor_providers: Option<Vec<u8>>,
     /// Per-provider metadata.  Keyed by provider code (as a string).
     /// Provider 1 (email) has `{ "Email": "j***@example.com" }`.
@@ -492,11 +496,15 @@ struct LoginErrorResponse {
     two_factor_providers2: Option<HashMap<String, serde_json::Value>>,
 }
 
-/// Deserialize TwoFactorProviders from either numeric or string provider codes.
+/// Bitwarden SaaS returns `TwoFactorProviders` as `["0","7","3"]` (strings),
+/// while Vaultwarden / older API versions may return `[0,7,3]` (numbers).
+/// Accept both forms.
 fn deser_two_factor_providers<'de, D>(de: D) -> Result<Option<Vec<u8>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
+    use serde::de::Deserialize;
+
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum ProviderCode {
@@ -504,23 +512,18 @@ where
         Str(String),
     }
 
-    let raw = Option::<Vec<ProviderCode>>::deserialize(de)?;
-    let Some(raw) = raw else {
+    let Some(codes) = Option::<Vec<ProviderCode>>::deserialize(de)? else {
         return Ok(None);
     };
 
-    let mut out = Vec::with_capacity(raw.len());
-    for code in raw {
-        match code {
-            ProviderCode::Num(v) => out.push(v),
-            ProviderCode::Str(s) => {
-                let parsed = s.parse::<u8>().map_err(serde::de::Error::custom)?;
-                out.push(parsed);
-            }
-        }
-    }
-
-    Ok(Some(out))
+    codes
+        .into_iter()
+        .map(|c| match c {
+            ProviderCode::Num(n) => Ok(n),
+            ProviderCode::Str(s) => s.parse::<u8>().map_err(serde::de::Error::custom),
+        })
+        .collect::<Result<Vec<u8>, _>>()
+        .map(Some)
 }
 
 /// Refresh response — tokens are sensitive.
@@ -751,4 +754,185 @@ pub struct SyncField {
     pub name: Option<String>,
     #[serde(alias = "Value")]
     pub value: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoginErrorResponse;
+
+    /// Bitwarden SaaS returns provider codes as JSON strings: `["0","7","3"]`.
+    #[test]
+    fn login_error_parses_two_factor_providers_as_strings() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Two factor required.",
+            "TwoFactorProviders": ["0", "7", "3"]
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.two_factor_providers, Some(vec![0, 7, 3]));
+    }
+
+    /// Vaultwarden / older API versions may return numeric codes: `[0,7,3]`.
+    #[test]
+    fn login_error_parses_two_factor_providers_as_numbers() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Two factor required.",
+            "TwoFactorProviders": [0, 7, 3]
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.two_factor_providers, Some(vec![0, 7, 3]));
+    }
+
+    /// Missing TwoFactorProviders field should deserialize as None.
+    #[test]
+    fn login_error_parses_without_two_factor_providers() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Some other error."
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.two_factor_providers, None);
+    }
+
+    /// Real-world Bitwarden SaaS response with TwoFactorProviders2 metadata.
+    #[test]
+    fn login_error_parses_full_two_factor_response() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Two factor required.",
+            "TwoFactorProviders": ["0", "7", "3"],
+            "TwoFactorProviders2": {
+                "0": null,
+                "7": {"challenge": "abc", "timeout": 60000},
+                "3": {"Nfc": true}
+            },
+            "MasterPasswordPolicy": {"Object": "masterPasswordPolicy"}
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.two_factor_providers, Some(vec![0, 7, 3]));
+        let p2 = parsed.two_factor_providers2.unwrap();
+        assert!(p2.contains_key("0"));
+        assert!(p2.contains_key("7"));
+        assert!(p2.contains_key("3"));
+    }
+
+    /// Empty TwoFactorProviders array should parse as Some(vec![]).
+    #[test]
+    fn login_error_parses_empty_two_factor_providers_array() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Two factor required.",
+            "TwoFactorProviders": []
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.two_factor_providers, Some(vec![]));
+    }
+
+    /// Single TOTP provider as string.
+    #[test]
+    fn login_error_parses_single_provider_string() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Two factor required.",
+            "TwoFactorProviders": ["0"]
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.two_factor_providers, Some(vec![0]));
+    }
+
+    /// Mixed string and number provider codes — Bitwarden's API should not do
+    /// this, but our deserializer handles each element independently.
+    #[test]
+    fn login_error_parses_mixed_string_and_number_providers() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Two factor required.",
+            "TwoFactorProviders": ["0", 3, "1"]
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.two_factor_providers, Some(vec![0, 3, 1]));
+    }
+
+    /// TwoFactorProviders with only an unrecognised provider code (7 = WebAuthn
+    /// in some Bitwarden versions) — should still parse, even though the guest
+    /// plugin will later filter it out.
+    #[test]
+    fn login_error_parses_unrecognised_provider_codes() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Two factor required.",
+            "TwoFactorProviders": ["7", "99"]
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.two_factor_providers, Some(vec![7, 99]));
+    }
+
+    /// TwoFactorProviders set to null (not missing — explicitly null).
+    #[test]
+    fn login_error_parses_null_two_factor_providers() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Some error.",
+            "TwoFactorProviders": null
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.two_factor_providers, None);
+    }
+
+    /// Non-2FA error response — no TwoFactorProviders, different error description.
+    #[test]
+    fn login_error_parses_plain_auth_failure() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Username or password is incorrect."
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed.two_factor_providers, None);
+        assert_eq!(parsed.two_factor_providers2, None);
+        assert_eq!(
+            parsed.error_description,
+            Some("Username or password is incorrect.".to_string())
+        );
+    }
+
+    /// Email hint extraction from TwoFactorProviders2 for provider 1.
+    #[test]
+    fn login_error_extracts_email_hint_from_providers2() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Two factor required.",
+            "TwoFactorProviders": ["1"],
+            "TwoFactorProviders2": {
+                "1": {"Email": "j***@example.com"}
+            }
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        let p2 = parsed.two_factor_providers2.unwrap();
+        let email = p2
+            .get("1")
+            .and_then(|v| v.get("Email"))
+            .and_then(|v| v.as_str());
+        assert_eq!(email, Some("j***@example.com"));
+    }
+
+    /// TwoFactorProviders2 with provider 1 but no Email field.
+    #[test]
+    fn login_error_providers2_missing_email_field() {
+        let payload = r#"{
+            "error": "invalid_grant",
+            "error_description": "Two factor required.",
+            "TwoFactorProviders": ["1"],
+            "TwoFactorProviders2": {
+                "1": {}
+            }
+        }"#;
+        let parsed: LoginErrorResponse = serde_json::from_str(payload).unwrap();
+        let p2 = parsed.two_factor_providers2.unwrap();
+        let email = p2
+            .get("1")
+            .and_then(|v| v.get("Email"))
+            .and_then(|v| v.as_str());
+        assert_eq!(email, None);
+    }
 }

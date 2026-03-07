@@ -996,3 +996,265 @@ fn leak_auth_field(w: crate::protocol::WasmAuthField) -> AuthField {
         kind,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ErrorKind, TwoFactorMethod as ProtoTwoFactorMethod};
+
+    // ── map_guest_2fa_error: happy paths ──────────────────────────
+
+    #[test]
+    fn map_2fa_totp_method() {
+        let methods = vec![ProtoTwoFactorMethod {
+            id: "0".into(),
+            label: "Authenticator app (TOTP)".into(),
+            prompt_kind: "text".into(),
+            challenge: None,
+        }];
+        let err = map_guest_2fa_error(Some("two-factor required".into()), Some(methods));
+        let ProviderError::TwoFactorRequired { methods } = err else {
+            panic!("expected TwoFactorRequired, got {err:?}");
+        };
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].id, "0");
+        assert_eq!(methods[0].label, "Authenticator app (TOTP)");
+        assert_eq!(methods[0].prompt_kind, "text");
+        assert!(methods[0].challenge.is_none());
+    }
+
+    #[test]
+    fn map_2fa_email_method_with_hint() {
+        let methods = vec![ProtoTwoFactorMethod {
+            id: "1".into(),
+            label: "Email code (j***@example.com)".into(),
+            prompt_kind: "text".into(),
+            challenge: None,
+        }];
+        let err = map_guest_2fa_error(None, Some(methods));
+        let ProviderError::TwoFactorRequired { methods } = err else {
+            panic!("expected TwoFactorRequired, got {err:?}");
+        };
+        assert_eq!(methods[0].id, "1");
+        assert!(methods[0].label.contains("j***@example.com"));
+    }
+
+    #[test]
+    fn map_2fa_duo_method() {
+        let methods = vec![ProtoTwoFactorMethod {
+            id: "2".into(),
+            label: "Duo (passcode)".into(),
+            prompt_kind: "text".into(),
+            challenge: None,
+        }];
+        let err = map_guest_2fa_error(None, Some(methods));
+        let ProviderError::TwoFactorRequired { methods } = err else {
+            panic!("expected TwoFactorRequired, got {err:?}");
+        };
+        assert_eq!(methods[0].id, "2");
+        assert_eq!(methods[0].prompt_kind, "text");
+    }
+
+    #[test]
+    fn map_2fa_yubikey_method() {
+        let methods = vec![ProtoTwoFactorMethod {
+            id: "3".into(),
+            label: "YubiKey OTP (touch your key)".into(),
+            prompt_kind: "text".into(),
+            challenge: None,
+        }];
+        let err = map_guest_2fa_error(None, Some(methods));
+        let ProviderError::TwoFactorRequired { methods } = err else {
+            panic!("expected TwoFactorRequired, got {err:?}");
+        };
+        assert_eq!(methods[0].id, "3");
+        assert_eq!(methods[0].prompt_kind, "text");
+    }
+
+    #[test]
+    fn map_2fa_fido2_method() {
+        let methods = vec![ProtoTwoFactorMethod {
+            id: "4".into(),
+            label: "FIDO2 / WebAuthn security key".into(),
+            prompt_kind: "fido2".into(),
+            challenge: Some(r#"{"publicKey":{}}"#.into()),
+        }];
+        let err = map_guest_2fa_error(None, Some(methods));
+        let ProviderError::TwoFactorRequired { methods } = err else {
+            panic!("expected TwoFactorRequired, got {err:?}");
+        };
+        assert_eq!(methods[0].id, "4");
+        assert_eq!(methods[0].prompt_kind, "fido2");
+        assert_eq!(methods[0].challenge.as_deref(), Some(r#"{"publicKey":{}}"#));
+    }
+
+    #[test]
+    fn map_2fa_org_duo_method() {
+        let methods = vec![ProtoTwoFactorMethod {
+            id: "6".into(),
+            label: "Organization Duo (passcode)".into(),
+            prompt_kind: "text".into(),
+            challenge: None,
+        }];
+        let err = map_guest_2fa_error(None, Some(methods));
+        let ProviderError::TwoFactorRequired { methods } = err else {
+            panic!("expected TwoFactorRequired, got {err:?}");
+        };
+        assert_eq!(methods[0].id, "6");
+        assert_eq!(methods[0].prompt_kind, "text");
+    }
+
+    #[test]
+    fn map_2fa_multiple_methods_preserves_order() {
+        let methods = vec![
+            ProtoTwoFactorMethod {
+                id: "0".into(),
+                label: "TOTP".into(),
+                prompt_kind: "text".into(),
+                challenge: None,
+            },
+            ProtoTwoFactorMethod {
+                id: "1".into(),
+                label: "Email".into(),
+                prompt_kind: "text".into(),
+                challenge: None,
+            },
+            ProtoTwoFactorMethod {
+                id: "4".into(),
+                label: "FIDO2".into(),
+                prompt_kind: "fido2".into(),
+                challenge: None,
+            },
+        ];
+        let err = map_guest_2fa_error(None, Some(methods));
+        let ProviderError::TwoFactorRequired { methods } = err else {
+            panic!("expected TwoFactorRequired, got {err:?}");
+        };
+        assert_eq!(methods.len(), 3);
+        assert_eq!(methods[0].id, "0");
+        assert_eq!(methods[1].id, "1");
+        assert_eq!(methods[2].id, "4");
+    }
+
+    // ── map_guest_2fa_error: unhappy paths ────────────────────────
+
+    #[test]
+    fn map_2fa_empty_methods_list() {
+        let err = map_guest_2fa_error(Some("2fa required".into()), Some(vec![]));
+        let ProviderError::TwoFactorRequired { methods } = err else {
+            panic!("expected TwoFactorRequired, got {err:?}");
+        };
+        assert!(methods.is_empty());
+    }
+
+    #[test]
+    fn map_2fa_none_methods() {
+        let err = map_guest_2fa_error(Some("2fa required".into()), None);
+        let ProviderError::TwoFactorRequired { methods } = err else {
+            panic!("expected TwoFactorRequired, got {err:?}");
+        };
+        assert!(methods.is_empty());
+    }
+
+    #[test]
+    fn map_2fa_none_message_and_methods() {
+        let err = map_guest_2fa_error(None, None);
+        let ProviderError::TwoFactorRequired { methods } = err else {
+            panic!("expected TwoFactorRequired, got {err:?}");
+        };
+        assert!(methods.is_empty());
+    }
+
+    // ── map_guest_error: TwoFactorRequired fallback ───────────────
+
+    #[test]
+    fn map_error_twofactor_fallback_has_empty_methods() {
+        let err = map_guest_error(
+            Some("two-factor required".into()),
+            Some(ErrorKind::TwoFactorRequired),
+        );
+        let ProviderError::TwoFactorRequired { methods } = err else {
+            panic!("expected TwoFactorRequired, got {err:?}");
+        };
+        // Fallback path produces empty methods — caller should have
+        // used map_guest_2fa_error() instead.
+        assert!(methods.is_empty());
+    }
+
+    // ── map_guest_error: non-2FA variants ─────────────────────────
+
+    #[test]
+    fn map_error_auth_failed() {
+        let err = map_guest_error(Some("bad creds".into()), Some(ErrorKind::AuthFailed));
+        assert!(matches!(err, ProviderError::AuthFailed));
+    }
+
+    #[test]
+    fn map_error_locked() {
+        let err = map_guest_error(None, Some(ErrorKind::Locked));
+        assert!(matches!(err, ProviderError::Locked));
+    }
+
+    #[test]
+    fn map_error_not_found() {
+        let err = map_guest_error(None, Some(ErrorKind::NotFound));
+        assert!(matches!(err, ProviderError::NotFound));
+    }
+
+    #[test]
+    fn map_error_not_supported() {
+        let err = map_guest_error(None, Some(ErrorKind::NotSupported));
+        assert!(matches!(err, ProviderError::NotSupported));
+    }
+
+    #[test]
+    fn map_error_unavailable_carries_message() {
+        let err = map_guest_error(Some("server down".into()), Some(ErrorKind::Unavailable));
+        match err {
+            ProviderError::Unavailable(msg) => assert_eq!(msg, "server down"),
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_error_already_exists() {
+        let err = map_guest_error(None, Some(ErrorKind::AlreadyExists));
+        assert!(matches!(err, ProviderError::AlreadyExists));
+    }
+
+    #[test]
+    fn map_error_invalid_input() {
+        let err = map_guest_error(Some("bad field".into()), Some(ErrorKind::InvalidInput));
+        assert!(matches!(err, ProviderError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn map_error_registration_required() {
+        let err = map_guest_error(None, Some(ErrorKind::RegistrationRequired));
+        assert!(matches!(err, ProviderError::RegistrationRequired));
+    }
+
+    #[test]
+    fn map_error_other_with_message() {
+        let err = map_guest_error(Some("something broke".into()), Some(ErrorKind::Other));
+        match err {
+            ProviderError::Other(e) => assert!(e.to_string().contains("something broke")),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_error_none_kind_falls_to_other() {
+        let err = map_guest_error(Some("mystery".into()), None);
+        assert!(matches!(err, ProviderError::Other(_)));
+    }
+
+    #[test]
+    fn map_error_none_kind_none_message_uses_default() {
+        let err = map_guest_error(None, None);
+        match err {
+            ProviderError::Other(e) => assert_eq!(e.to_string(), "unknown plugin error"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+}
