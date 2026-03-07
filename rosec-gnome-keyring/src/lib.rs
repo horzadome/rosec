@@ -34,7 +34,7 @@ mod keyring;
 mod protocol;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use extism_pdk::*;
@@ -45,7 +45,30 @@ use crate::protocol::*;
 
 // ── Global state ──────────────────────────────────────────────────────────────
 
-static STATE: Mutex<Option<GuestState>> = Mutex::new(None);
+/// A `Mutex` wrapper that ignores poison.
+///
+/// WASM guests are **single-threaded** — there are no concurrent mutations.
+/// The only way the inner `Mutex` becomes poisoned is when an Extism timeout
+/// fires a WASM trap that kills execution without unwinding Rust destructors
+/// (so `MutexGuard::drop` never runs).  Because the guest is single-threaded,
+/// the data behind the lock is always in a consistent state after such a trap
+/// — there was never a second thread racing to observe a half-written value.
+///
+/// `WasmCell::lock()` therefore returns the guard directly (no `Result`),
+/// recovering from poison via `unwrap_or_else(|e| e.into_inner())`.
+struct WasmCell<T>(Mutex<T>);
+
+impl<T> WasmCell<T> {
+    const fn new(val: T) -> Self {
+        Self(Mutex::new(val))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+static STATE: WasmCell<Option<GuestState>> = WasmCell::new(None);
 
 // ── State types ───────────────────────────────────────────────────────────────
 
@@ -251,9 +274,7 @@ pub fn init(Json(req): Json<InitRequest>) -> FnResult<Json<InitResponse>> {
         keyrings,
     };
 
-    let mut guard = STATE
-        .lock()
-        .map_err(|_| extism_pdk::Error::msg("state lock poisoned"))?;
+    let mut guard = STATE.lock();
     *guard = Some(GuestState { config, auth: None });
 
     Ok(Json(InitResponse {
@@ -266,9 +287,7 @@ pub fn init(Json(req): Json<InitRequest>) -> FnResult<Json<InitResponse>> {
 
 #[plugin_fn]
 pub fn status(_: ()) -> FnResult<Json<StatusResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|_| extism_pdk::Error::msg("state lock poisoned"))?;
+    let guard = STATE.lock();
     let locked = guard.as_ref().map(|s| s.auth.is_none()).unwrap_or(true);
     Ok(Json(StatusResponse {
         locked,
@@ -282,9 +301,7 @@ pub fn status(_: ()) -> FnResult<Json<StatusResponse>> {
 pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> {
     let mut password = Zeroizing::new(req.password);
 
-    let mut guard = STATE
-        .lock()
-        .map_err(|_| extism_pdk::Error::msg("state lock poisoned"))?;
+    let mut guard = STATE.lock();
 
     let Some(state) = guard.as_mut() else {
         password.zeroize();
@@ -377,9 +394,7 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
 
 #[plugin_fn]
 pub fn lock(_: ()) -> FnResult<Json<SimpleResponse>> {
-    let mut guard = STATE
-        .lock()
-        .map_err(|_| extism_pdk::Error::msg("state lock poisoned"))?;
+    let mut guard = STATE.lock();
     if let Some(state) = guard.as_mut() {
         // Drop AuthState — triggers Zeroizing drops on all secrets.
         state.auth = None;
@@ -396,9 +411,7 @@ pub fn lock(_: ()) -> FnResult<Json<SimpleResponse>> {
 
 #[plugin_fn]
 pub fn list_items(_: ()) -> FnResult<Json<ItemListResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|_| extism_pdk::Error::msg("state lock poisoned"))?;
+    let guard = STATE.lock();
     let Some(state) = guard.as_ref() else {
         return Ok(Json(ItemListResponse {
             ok: false,
@@ -439,9 +452,7 @@ pub fn list_items(_: ()) -> FnResult<Json<ItemListResponse>> {
 
 #[plugin_fn]
 pub fn search(Json(req): Json<SearchRequest>) -> FnResult<Json<ItemListResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|_| extism_pdk::Error::msg("state lock poisoned"))?;
+    let guard = STATE.lock();
     let Some(state) = guard.as_ref() else {
         return Ok(Json(ItemListResponse {
             ok: false,
@@ -489,9 +500,7 @@ pub fn search(Json(req): Json<SearchRequest>) -> FnResult<Json<ItemListResponse>
 pub fn get_item_attributes(
     Json(req): Json<ItemIdRequest>,
 ) -> FnResult<Json<ItemAttributesResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|_| extism_pdk::Error::msg("state lock poisoned"))?;
+    let guard = STATE.lock();
     let Some(state) = guard.as_ref() else {
         return Ok(Json(ItemAttributesResponse {
             ok: false,
@@ -553,9 +562,7 @@ pub fn get_item_attributes(
 
 #[plugin_fn]
 pub fn get_secret_attr(Json(req): Json<SecretAttrRequest>) -> FnResult<Json<SecretAttrResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|_| extism_pdk::Error::msg("state lock poisoned"))?;
+    let guard = STATE.lock();
     let Some(state) = guard.as_ref() else {
         return Ok(Json(SecretAttrResponse {
             ok: false,

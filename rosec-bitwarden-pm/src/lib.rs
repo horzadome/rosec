@@ -24,7 +24,7 @@ mod protocol;
 mod vault;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
 
 use extism_pdk::*;
@@ -39,10 +39,37 @@ use crate::vault::{CipherType, DecryptedCipher, DecryptedField, VaultState};
 // Global state
 // ═══════════════════════════════════════════════════════════════════
 
-/// Global guest state behind a mutex.
+/// A `Mutex` wrapper that ignores poison.
+///
+/// WASM guests are **single-threaded** — there are no concurrent mutations.
+/// The only way the inner `Mutex` becomes poisoned is when an Extism timeout
+/// fires a WASM trap that kills execution without unwinding Rust destructors
+/// (so `MutexGuard::drop` never runs).  Because the guest is single-threaded,
+/// the data behind the lock is always in a consistent state after such a trap
+/// — there was never a second thread racing to observe a half-written value.
+///
+/// `WasmCell::lock()` therefore returns the guard directly (no `Result`),
+/// recovering from poison via `unwrap_or_else(|e| e.into_inner())`.
+struct WasmCell<T>(Mutex<T>);
+
+// SAFETY (not `unsafe`, but worth justifying): We are only ignoring poison,
+// not bypassing any synchronisation.  The `Mutex` still provides interior
+// mutability for a `static`.  On a single-threaded WASM target poison is a
+// false-positive — the data is always valid.
+impl<T> WasmCell<T> {
+    const fn new(val: T) -> Self {
+        Self(Mutex::new(val))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, T> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Global guest state behind a `WasmCell`.
 ///
 /// `None` before `init` is called; `Some(GuestState)` after.
-static STATE: Mutex<Option<GuestState>> = Mutex::new(None);
+static STATE: WasmCell<Option<GuestState>> = WasmCell::new(None);
 
 /// Top-level guest state.
 struct GuestState {
@@ -975,9 +1002,7 @@ pub fn init(Json(req): Json<InitRequest>) -> FnResult<Json<InitResponse>> {
         config.provider_id
     );
 
-    let mut guard = STATE
-        .lock()
-        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    let mut guard = STATE.lock();
     *guard = Some(GuestState { config, auth: None });
 
     Ok(Json(InitResponse {
@@ -989,9 +1014,7 @@ pub fn init(Json(req): Json<InitRequest>) -> FnResult<Json<InitResponse>> {
 /// Return the current provider status (locked/unlocked + last sync time).
 #[plugin_fn]
 pub fn status(_input: ()) -> FnResult<Json<StatusResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    let guard = STATE.lock();
 
     let Some(state) = guard.as_ref() else {
         // Not yet initialised — report as locked
@@ -1016,9 +1039,7 @@ pub fn status(_input: ()) -> FnResult<Json<StatusResponse>> {
 /// Unlock the vault with a master password (and optional registration/auth fields).
 #[plugin_fn]
 pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> {
-    let mut guard = STATE
-        .lock()
-        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    let mut guard = STATE.lock();
 
     let Some(state) = guard.as_mut() else {
         return Ok(Json(SimpleResponse {
@@ -1127,9 +1148,7 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
 /// Lock the vault — drop all sensitive state.
 #[plugin_fn]
 pub fn lock(_input: ()) -> FnResult<Json<SimpleResponse>> {
-    let mut guard = STATE
-        .lock()
-        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    let mut guard = STATE.lock();
 
     if let Some(state) = guard.as_mut() {
         state.auth = None;
@@ -1142,9 +1161,7 @@ pub fn lock(_input: ()) -> FnResult<Json<SimpleResponse>> {
 /// Re-sync the vault with the Bitwarden server.
 #[plugin_fn]
 pub fn sync(_input: ()) -> FnResult<Json<SimpleResponse>> {
-    let mut guard = STATE
-        .lock()
-        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    let mut guard = STATE.lock();
 
     let Some(state) = guard.as_mut() else {
         return Ok(Json(SimpleResponse {
@@ -1176,9 +1193,7 @@ pub fn sync(_input: ()) -> FnResult<Json<SimpleResponse>> {
 /// List all items in the vault.
 #[plugin_fn]
 pub fn list_items(_input: ()) -> FnResult<Json<ItemListResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    let guard = STATE.lock();
 
     let Some(state) = guard.as_ref() else {
         return Ok(Json(ItemListResponse {
@@ -1217,9 +1232,7 @@ pub fn list_items(_input: ()) -> FnResult<Json<ItemListResponse>> {
 /// Search for items matching the given attributes.
 #[plugin_fn]
 pub fn search(Json(req): Json<SearchRequest>) -> FnResult<Json<ItemListResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    let guard = STATE.lock();
 
     let Some(state) = guard.as_ref() else {
         return Ok(Json(ItemListResponse {
@@ -1271,9 +1284,7 @@ pub fn search(Json(req): Json<SearchRequest>) -> FnResult<Json<ItemListResponse>
 pub fn get_item_attributes(
     Json(req): Json<ItemIdRequest>,
 ) -> FnResult<Json<ItemAttributesResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    let guard = STATE.lock();
 
     let Some(state) = guard.as_ref() else {
         return Ok(Json(ItemAttributesResponse {
@@ -1321,9 +1332,7 @@ pub fn get_item_attributes(
 /// Returns the secret bytes base64-encoded.
 #[plugin_fn]
 pub fn get_secret_attr(Json(req): Json<SecretAttrRequest>) -> FnResult<Json<SecretAttrResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    let guard = STATE.lock();
 
     let Some(state) = guard.as_ref() else {
         return Ok(Json(SecretAttrResponse {
@@ -1375,9 +1384,7 @@ pub fn get_secret_attr(Json(req): Json<SecretAttrRequest>) -> FnResult<Json<Secr
 /// List all SSH keys in the vault.
 #[plugin_fn]
 pub fn list_ssh_keys(_input: ()) -> FnResult<Json<SshKeyListResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    let guard = STATE.lock();
 
     let Some(state) = guard.as_ref() else {
         return Ok(Json(SshKeyListResponse {
@@ -1418,9 +1425,7 @@ pub fn list_ssh_keys(_input: ()) -> FnResult<Json<SshKeyListResponse>> {
 pub fn get_ssh_private_key(
     Json(req): Json<SshPrivateKeyRequest>,
 ) -> FnResult<Json<SshPrivateKeyResponse>> {
-    let guard = STATE
-        .lock()
-        .map_err(|e| extism_pdk::Error::msg(format!("state lock poisoned: {e}")))?;
+    let guard = STATE.lock();
 
     let Some(state) = guard.as_ref() else {
         return Ok(Json(SshPrivateKeyResponse {
