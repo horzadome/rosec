@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
 use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
@@ -3694,6 +3694,8 @@ async fn cmd_item(args: &[String]) -> Result<()> {
         "add" | "new" | "create" => cmd_item_add(&args[1..]).await,
         "edit" => cmd_item_edit(&args[1..]).await,
         "delete" | "rm" | "remove" => cmd_item_delete(&args[1..]).await,
+        "export" => cmd_item_export(&args[1..]).await,
+        "import" => cmd_item_import(&args[1..]).await,
         "help" | "--help" | "-h" => {
             print_item_help();
             Ok(())
@@ -3718,6 +3720,8 @@ SUBCOMMANDS:
     add [flags]                         Create a new item via $EDITOR
     edit [flags] <item>                 Edit an existing item via $EDITOR
     delete [flags] <item>               Delete an item (with confirmation)
+    export [flags] <item>               Export an item as TOML to stdout
+    import [flags]                      Import an item from TOML on stdin
 
 LIST FLAGS:
     --provider=<id>                     Only items from this provider
@@ -3739,6 +3743,12 @@ DELETE FLAGS:
     --sync, -s                          Sync/unlock providers before deleting
     --yes, -y                           Skip confirmation prompt
 
+EXPORT FLAGS:
+    --sync, -s                          Sync/unlock providers before exporting
+
+IMPORT FLAGS:
+    --provider=<id>                     Target provider (default: first write-capable)
+
 ITEM IDENTIFIERS (<item>):
     16-char hex item ID                 a1b2c3d4e5f60718
     key=value attribute filter          name=My Login
@@ -3755,7 +3765,12 @@ EXAMPLES:
     rosec item edit a1b2c3d4e5f60718                         # edit item by ID
     rosec item edit name=My\\ Login                           # edit item by name
     rosec item delete a1b2c3d4e5f60718                       # delete with confirmation
-    rosec item delete -y a1b2c3d4e5f60718                    # delete without confirmation"
+    rosec item delete -y a1b2c3d4e5f60718                    # delete without confirmation
+    rosec item export a1b2c3d4e5f60718                       # export item as TOML
+    rosec item export a1b2c3d4e5f60718 > backup.toml         # export to file
+    rosec item import < backup.toml                          # import from file
+    rosec item import --provider=my-vault < backup.toml      # import into specific provider
+    rosec item export <bitwarden-item> | rosec item import   # copy between providers"
     );
 }
 
@@ -4346,6 +4361,71 @@ async fn cmd_item_add(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Data fetched from an existing item via D-Bus.
+struct FetchedItemData {
+    label: String,
+    item_type: String,
+    pub_attrs: HashMap<String, String>,
+    secrets: Vec<(String, String)>,
+}
+
+/// Fetch a full item's data (label, public attributes, secret names + values)
+/// from D-Bus.  Unlike `fetch_item_data` (which returns only public metadata),
+/// this also retrieves all secret attributes via the `org.rosec.Secrets`
+/// extension interface.
+async fn fetch_full_item(conn: &zbus::Connection, item_path: &str) -> Result<FetchedItemData> {
+    let item_proxy = zbus::Proxy::new(
+        conn,
+        "org.freedesktop.secrets",
+        item_path,
+        "org.freedesktop.Secret.Item",
+    )
+    .await?;
+
+    let label: String = item_proxy.get_property("Label").await?;
+    let pub_attrs: HashMap<String, String> = item_proxy.get_property("Attributes").await?;
+
+    let item_type = pub_attrs
+        .get(rosec_core::ATTR_TYPE)
+        .map(String::as_str)
+        .unwrap_or("generic")
+        .to_string();
+
+    // Fetch secret attribute names and values via rosec extension.
+    let secrets_proxy = zbus::Proxy::new(
+        conn,
+        "org.freedesktop.secrets",
+        "/org/rosec/Secrets",
+        "org.rosec.Secrets",
+    )
+    .await?;
+
+    let item_obj_path = OwnedObjectPath::try_from(item_path.to_string())
+        .map_err(|e| anyhow::anyhow!("invalid item path: {e}"))?;
+
+    let secret_names: Vec<String> = secrets_proxy
+        .call("GetSecretAttributeNames", &(&item_obj_path,))
+        .await
+        .unwrap_or_default();
+
+    let mut secrets: Vec<(String, String)> = Vec::new();
+    for name in &secret_names {
+        let bytes: Vec<u8> = secrets_proxy
+            .call("GetSecretAttribute", &(&item_obj_path, name.as_str()))
+            .await
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        secrets.push((name.clone(), text));
+    }
+
+    Ok(FetchedItemData {
+        label,
+        item_type,
+        pub_attrs,
+        secrets,
+    })
+}
+
 /// Build a TOML document from an existing item's data, suitable for editing.
 ///
 /// The document mirrors the template format: `[item]`, `[attributes]`,
@@ -4466,52 +4546,15 @@ async fn cmd_item_edit(args: &[String]) -> Result<()> {
     }
 
     // Fetch current item data.
-    let item_proxy = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.secrets",
-        path.as_str(),
-        "org.freedesktop.Secret.Item",
-    )
-    .await?;
-
-    let label: String = item_proxy.get_property("Label").await?;
-    let pub_attrs: HashMap<String, String> = item_proxy.get_property("Attributes").await?;
-
-    let item_type = pub_attrs
-        .get(rosec_core::ATTR_TYPE)
-        .map(String::as_str)
-        .unwrap_or("generic")
-        .to_string();
-
-    // Fetch secret attribute names and values via rosec extension.
-    let secrets_proxy = zbus::Proxy::new(
-        &conn,
-        "org.freedesktop.secrets",
-        "/org/rosec/Secrets",
-        "org.rosec.Secrets",
-    )
-    .await?;
-
-    let item_obj_path = OwnedObjectPath::try_from(path.clone())
-        .map_err(|e| anyhow::anyhow!("invalid item path: {e}"))?;
-
-    let secret_names: Vec<String> = secrets_proxy
-        .call("GetSecretAttributeNames", &(&item_obj_path,))
-        .await
-        .unwrap_or_default();
-
-    let mut secrets: Vec<(String, String)> = Vec::new();
-    for name in &secret_names {
-        let bytes: Vec<u8> = secrets_proxy
-            .call("GetSecretAttribute", &(&item_obj_path, name.as_str()))
-            .await
-            .unwrap_or_default();
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        secrets.push((name.clone(), text));
-    }
+    let fetched = fetch_full_item(&conn, &path).await?;
 
     // Build the TOML document.
-    let toml_content = build_item_toml(&label, &item_type, &pub_attrs, &secrets);
+    let toml_content = build_item_toml(
+        &fetched.label,
+        &fetched.item_type,
+        &fetched.pub_attrs,
+        &fetched.secrets,
+    );
 
     // Open editor.
     let edited = open_editor(&toml_content)?;
@@ -4662,5 +4705,178 @@ async fn cmd_item_delete(args: &[String]) -> Result<()> {
     let _: () = items_proxy.call("DeleteItem", &(path.as_str(),)).await?;
 
     println!("Deleted item: {} ({})", label, display_id);
+    Ok(())
+}
+
+/// `rosec item export` — export an item as TOML to stdout.
+///
+/// The output uses the same `[item]`/`[attributes]`/`[secrets]` format as
+/// the editor workflow, so it can be piped into `rosec item import` or
+/// redirected to a file for backup.
+async fn cmd_item_export(args: &[String]) -> Result<()> {
+    let mut sync = false;
+    let mut raw: Option<&str> = None;
+
+    for arg in args {
+        match arg.as_str() {
+            "--sync" | "-s" => sync = true,
+            "--help" | "-h" => {
+                print_item_help();
+                return Ok(());
+            }
+            a if a.starts_with('-') => {
+                bail!("unknown flag: {a}  (try `rosec item export --help`)");
+            }
+            a => {
+                if raw.is_some() {
+                    bail!("unexpected argument: {a}  (try `rosec item export --help`)");
+                }
+                raw = Some(a);
+            }
+        }
+    }
+
+    let raw =
+        raw.ok_or_else(|| anyhow::anyhow!("missing item ID  (try `rosec item export --help`)"))?;
+
+    let conn = conn().await?;
+    if !is_rosecd(&conn).await {
+        bail!("rosec item export requires rosecd (the rosec daemon) to be running");
+    }
+
+    if sync {
+        preemptive_sync(&conn).await?;
+    }
+
+    // Resolve the item path.
+    let (path, is_locked) = match resolve_item_path(&conn, raw).await {
+        Ok(result) => result,
+        Err(e) if sync => {
+            trigger_unlock(&conn).await?;
+            preemptive_sync(&conn).await?;
+            resolve_item_path(&conn, raw).await.map_err(|_| e)?
+        }
+        Err(e) => return Err(e),
+    };
+
+    if is_locked {
+        trigger_unlock(&conn).await?;
+        if sync {
+            preemptive_sync(&conn).await?;
+        }
+    }
+
+    // Fetch item data including secrets.
+    let fetched = fetch_full_item(&conn, &path).await?;
+
+    // Build TOML and write to stdout.
+    let toml_content = build_item_toml(
+        &fetched.label,
+        &fetched.item_type,
+        &fetched.pub_attrs,
+        &fetched.secrets,
+    );
+    print!("{toml_content}");
+
+    Ok(())
+}
+
+/// `rosec item import` — import an item from TOML on stdin.
+///
+/// Reads the same `[item]`/`[attributes]`/`[secrets]` TOML format produced
+/// by `rosec item export`.  Creates the item via `CreateItemExtended` on
+/// the specified (or default write-capable) provider.
+async fn cmd_item_import(args: &[String]) -> Result<()> {
+    let mut provider_id = String::new();
+
+    for arg in args {
+        if let Some(prov) = arg.strip_prefix("--provider=") {
+            provider_id = prov.to_string();
+        } else if arg == "--provider" {
+            bail!("--provider requires a value: --provider=<id>");
+        } else if arg == "--help" || arg == "-h" {
+            print_item_help();
+            return Ok(());
+        } else if arg.starts_with('-') {
+            bail!("unknown flag: {arg}  (try `rosec item import --help`)");
+        } else {
+            bail!("unexpected argument: {arg}  (try `rosec item import --help`)");
+        }
+    }
+
+    // Read TOML from stdin.
+    let mut content = String::new();
+    io::stdin().lock().read_to_string(&mut content)?;
+
+    if content.trim().is_empty() {
+        bail!("no input on stdin — pipe a TOML document or redirect a file");
+    }
+
+    let parsed = parse_item_toml(&content)?;
+
+    if parsed.secrets.is_empty() && parsed.attributes.is_empty() {
+        bail!("item has no attributes or secrets — nothing to store");
+    }
+
+    let conn = conn().await?;
+    if !is_rosecd(&conn).await {
+        bail!("rosec item import requires rosecd (the rosec daemon) to be running");
+    }
+
+    // Verify the provider supports Write capability.
+    let items_proxy = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.secrets",
+        "/org/rosec/Items",
+        "org.rosec.Items",
+    )
+    .await?;
+
+    let caps: Vec<String> = items_proxy
+        .call("GetCapabilities", &(&provider_id,))
+        .await?;
+    if !caps.iter().any(|c| c == "Write") {
+        if provider_id.is_empty() {
+            bail!("no write-capable provider available — add a local vault first");
+        } else {
+            bail!("provider '{provider_id}' does not support writes");
+        }
+    }
+
+    // Verify the provider supports the item type.
+    let supported_types: Vec<String> = items_proxy
+        .call("GetSupportedItemTypes", &(&provider_id,))
+        .await?;
+    if !supported_types.is_empty() && !supported_types.contains(&parsed.item_type) {
+        bail!(
+            "provider does not support item type '{}'\nsupported: {}",
+            parsed.item_type,
+            supported_types.join(", ")
+        );
+    }
+
+    // Call CreateItemExtended via D-Bus.
+    let item_path: String = items_proxy
+        .call(
+            "CreateItemExtended",
+            &(
+                &parsed.label,
+                &parsed.item_type,
+                &parsed.attributes,
+                &parsed.secrets,
+                false, // replace
+            ),
+        )
+        .await?;
+
+    // Extract the display ID from the path.
+    let display_id = item_path
+        .rsplit('/')
+        .next()
+        .and_then(|seg| seg.rsplit('_').next())
+        .unwrap_or(&item_path);
+
+    // Print to stderr so stdout stays clean for piping.
+    eprintln!("Imported item: {} ({})", parsed.label, display_id);
     Ok(())
 }
