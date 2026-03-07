@@ -181,6 +181,7 @@ USAGE:
 
 FLAGS:
     -s, --sync          Sync providers before searching; also unlocks if needed
+    --no-unlock         Never prompt for credentials — only show cached/unlocked items
     --format=<fmt>      Output format: table (default), kv, json
     --show-path         Include the full D-Bus object path in output
     --help, -h          Show this help
@@ -193,6 +194,7 @@ SEARCH FILTERS:
 EXAMPLES:
     rosec search                                    list all items
     rosec search -s                                 sync first, then list all
+    rosec search --no-unlock                        search without prompting
     rosec search type=login                         only login items
     rosec search username=alice                     items with username 'alice'
     rosec search rosec:provider=personal            items from 'personal' provider
@@ -948,55 +950,114 @@ async fn cmd_provider_list() -> Result<()> {
         let id_w = all_ids.iter().map(|s| s.len()).max().unwrap_or(2).max(2);
         let name_w = all_names.iter().map(|s| s.len()).max().unwrap_or(4).max(4);
         let kind_w = all_kinds.iter().map(|s| s.len()).max().unwrap_or(4).max(4);
+        let state_w = "unlocked".len().max("STATE".len());
+
+        // Priority: ID > NAME > KIND > STATE (fit to terminal).
+        let mut cols = [
+            ColSpec {
+                natural: id_w,
+                min: 2,
+                allocated: 0,
+            },
+            ColSpec {
+                natural: name_w,
+                min: 4,
+                allocated: 0,
+            },
+            ColSpec {
+                natural: kind_w,
+                min: 4,
+                allocated: 0,
+            },
+            ColSpec {
+                natural: state_w,
+                min: "STATE".len(),
+                allocated: 0,
+            },
+        ];
+        fit_columns(&mut cols, 2, terminal_width());
+        let id_w = cols[0].allocated;
+        let name_w = cols[1].allocated;
+        let kind_w = cols[2].allocated;
 
         println!(
             "{:<id_w$}  {:<name_w$}  {:<kind_w$}  STATE",
             "ID", "NAME", "KIND",
         );
-        println!("{}", "-".repeat(id_w + name_w + kind_w + 14));
+        let sep_w = id_w + 2 + name_w + 2 + kind_w + 2 + state_w;
+        println!("{}", "-".repeat(sep_w));
         for (id, name, kind, locked) in &entries {
             println!(
                 "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {}",
-                id,
-                name,
-                kind,
+                trunc(id, id_w),
+                trunc(name, name_w),
+                trunc(kind, kind_w),
                 if *locked { "locked" } else { "unlocked" },
             );
         }
         for entry in &disabled {
             println!(
                 "{:<id_w$}  {:<name_w$}  {:<kind_w$}  disabled",
-                entry.id, entry.id, entry.kind,
+                trunc(&entry.id, id_w),
+                trunc(&entry.id, name_w),
+                trunc(&entry.kind, kind_w),
             );
         }
         return Ok(());
     }
 
     // Fallback: read config directly (daemon not running).
-    let id_w = cfg
+    let nat_id = cfg
         .provider
         .iter()
         .map(|p| p.id.len())
         .max()
         .unwrap_or(2)
         .max(2);
-    let kind_w = cfg
+    let nat_kind = cfg
         .provider
         .iter()
         .map(|p| p.kind.len())
         .max()
         .unwrap_or(4)
         .max(4);
+    let state_w = "(daemon not running)".len().max("STATE".len());
+
+    let mut cols = [
+        ColSpec {
+            natural: nat_id,
+            min: 2,
+            allocated: 0,
+        },
+        ColSpec {
+            natural: nat_kind,
+            min: 4,
+            allocated: 0,
+        },
+        ColSpec {
+            natural: state_w,
+            min: "STATE".len(),
+            allocated: 0,
+        },
+    ];
+    fit_columns(&mut cols, 2, terminal_width());
+    let id_w = cols[0].allocated;
+    let kind_w = cols[1].allocated;
 
     println!("{:<id_w$}  {:<kind_w$}  STATE", "ID", "KIND");
-    println!("{}", "-".repeat(id_w + kind_w + 12));
+    let sep_w = id_w + 2 + kind_w + 2 + state_w;
+    println!("{}", "-".repeat(sep_w));
     for entry in &cfg.provider {
         let state = if entry.enabled {
             "(daemon not running)"
         } else {
             "disabled"
         };
-        println!("{:<id_w$}  {:<kind_w$}  {state}", entry.id, entry.kind,);
+        println!(
+            "{:<id_w$}  {:<kind_w$}  {state}",
+            trunc(&entry.id, id_w),
+            trunc(&entry.kind, kind_w),
+        );
     }
     Ok(())
 }
@@ -1994,10 +2055,11 @@ fn is_glob(s: &str) -> bool {
 }
 
 /// Spec-compliant exact-match search via `org.freedesktop.Secret.Service.SearchItems`.
-/// Handles lazy-unlock automatically.
+/// Handles lazy-unlock automatically unless `no_unlock` is set.
 async fn search_exact(
     conn: &Connection,
     attrs: &HashMap<String, String>,
+    no_unlock: bool,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let proxy = zbus::Proxy::new(
         conn,
@@ -2017,7 +2079,7 @@ async fn search_exact(
 
     match proxy.call("SearchItems", &(attrs,)).await {
         Ok(result) => Ok(convert(result)),
-        Err(ref e) if try_lazy_unlock(conn, e).await? => {
+        Err(ref e) if !no_unlock && try_lazy_unlock(conn, e).await? => {
             Ok(convert(proxy.call("SearchItems", &(attrs,)).await?))
         }
         Err(e) => Err(e.into()),
@@ -2079,10 +2141,13 @@ async fn warn_if_no_providers(conn: &Connection) {
 /// `SearchItems({})` to retrieve all items, then applies glob matching
 /// client-side.  This keeps `rosec search name=John*` working against GNOME
 /// Keyring, KWallet, or any other spec-compliant Secret Service daemon.
+///
+/// When `no_unlock` is true, the lazy-unlock retry is suppressed.
 async fn search_with_glob_fallback(
     conn: &Connection,
     attrs: &HashMap<String, String>,
     is_rosecd: bool,
+    no_unlock: bool,
 ) -> Result<(Vec<String>, Vec<String>)> {
     if is_rosecd {
         // Use the rosec Search extension — zero client-side work.
@@ -2106,7 +2171,7 @@ async fn search_with_glob_fallback(
         // returns locked::<id>, prompt the user then retry once.
         match search_proxy.call("SearchItemsGlob", &(attrs,)).await {
             Ok(result) => return Ok(convert(result)),
-            Err(ref e) if try_lazy_unlock(conn, e).await? => {
+            Err(ref e) if !no_unlock && try_lazy_unlock(conn, e).await? => {
                 return Ok(convert(
                     search_proxy.call("SearchItemsGlob", &(attrs,)).await?,
                 ));
@@ -2116,7 +2181,7 @@ async fn search_with_glob_fallback(
     }
 
     // Fallback for non-rosecd providers: fetch all items then filter client-side.
-    let (unlocked, locked) = search_exact(conn, &HashMap::new()).await?;
+    let (unlocked, locked) = search_exact(conn, &HashMap::new(), no_unlock).await?;
 
     let mut filtered_unlocked = Vec::new();
     let mut filtered_locked = Vec::new();
@@ -2156,10 +2221,11 @@ fn glob_matches(item: &ItemSummary, attrs: &HashMap<String, String>) -> bool {
 }
 
 async fn cmd_search(args: &[String]) -> Result<()> {
-    // Parse --format flag, --show-path flag, --sync flag, and k=v filters.
+    // Parse --format flag, --show-path flag, --sync flag, --no-unlock flag, and k=v filters.
     let mut format = OutputFormat::Table;
     let mut show_path = false;
     let mut sync = false;
+    let mut no_unlock = false;
     let mut all_attrs: HashMap<String, String> = HashMap::new();
 
     for arg in args {
@@ -2176,6 +2242,8 @@ async fn cmd_search(args: &[String]) -> Result<()> {
             show_path = true;
         } else if arg == "--sync" || arg == "-s" {
             sync = true;
+        } else if arg == "--no-unlock" {
+            no_unlock = true;
         } else if arg == "--help" || arg == "-h" {
             print_search_help();
             return Ok(());
@@ -2184,6 +2252,10 @@ async fn cmd_search(args: &[String]) -> Result<()> {
         } else {
             bail!("invalid argument: {arg}");
         }
+    }
+
+    if sync && no_unlock {
+        bail!("--sync and --no-unlock are mutually exclusive");
     }
 
     let conn = conn().await?;
@@ -2209,9 +2281,9 @@ async fn cmd_search(args: &[String]) -> Result<()> {
         let all_attrs = all_attrs.clone();
         async move {
             if has_globs {
-                search_with_glob_fallback(&conn, &all_attrs, rosecd).await
+                search_with_glob_fallback(&conn, &all_attrs, rosecd, no_unlock).await
             } else {
-                search_exact(&conn, &all_attrs).await
+                search_exact(&conn, &all_attrs, no_unlock).await
             }
         }
     };
@@ -2232,7 +2304,10 @@ async fn cmd_search(args: &[String]) -> Result<()> {
     //   (b) both lists are empty AND the daemon has locked providers — the
     //       metadata cache is cold (never synced) because all providers started
     //       locked and preemptive_sync skipped them.
-    let needs_unlock = sync
+    // Skipped entirely when --no-unlock is set (no_unlock implies !sync, but
+    // belt-and-suspenders guard here for clarity).
+    let needs_unlock = !no_unlock
+        && sync
         && ((!locked.is_empty() && unlocked.is_empty())
             || (unlocked.is_empty() && locked.is_empty() && any_providers_locked(&conn).await?));
     let (unlocked, locked) = if needs_unlock {
@@ -2321,9 +2396,73 @@ fn trunc(s: &str, max: usize) -> String {
     }
 }
 
+/// Detect the terminal width via `TIOCGWINSZ` ioctl, falling back to 120.
+fn terminal_width() -> usize {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: ioctl with TIOCGWINSZ on stdout is a standard POSIX operation
+    // that writes into a stack-allocated winsize struct.
+    let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) };
+    if ret == 0 && ws.ws_col > 0 {
+        ws.ws_col as usize
+    } else {
+        120
+    }
+}
+
+/// Column descriptor for adaptive table layout.
+struct ColSpec {
+    /// Natural width: max(content_width, header_width).
+    natural: usize,
+    /// Minimum width the column can be shrunk to (header width).
+    min: usize,
+    /// Allocated width after fitting to terminal.
+    allocated: usize,
+}
+
+/// Fit columns into `avail` characters.
+///
+/// Each column starts at its natural (content-driven) width and is never
+/// expanded beyond that.  When the total exceeds `avail`, columns are shrunk
+/// starting from the **end** of the `cols` slice — so put the highest-priority
+/// (last-to-shrink) columns first.
+///
+/// Returns `true` if everything fit without any truncation.
+fn fit_columns(cols: &mut [ColSpec], gap: usize, avail: usize) -> bool {
+    let gaps_total = gap * cols.len().saturating_sub(1);
+
+    // Start with natural widths.
+    for c in cols.iter_mut() {
+        c.allocated = c.natural;
+    }
+
+    let total = |cols: &[ColSpec]| -> usize {
+        cols.iter().map(|c| c.allocated).sum::<usize>() + gaps_total
+    };
+
+    if total(cols) <= avail {
+        return true;
+    }
+
+    // Shrink from the end (lowest priority) towards the front.
+    for i in (0..cols.len()).rev() {
+        let over = total(cols).saturating_sub(avail);
+        if over == 0 {
+            break;
+        }
+        let can_shrink = cols[i].allocated.saturating_sub(cols[i].min);
+        let shrink = can_shrink.min(over);
+        cols[i].allocated -= shrink;
+    }
+    total(cols) <= avail
+}
+
 /// Print results as an aligned table.
 ///
 /// Columns: TYPE | PROVIDER | NAME | USERNAME | URI | ID [| PATH]
+///
+/// Column widths adapt to the terminal width.  When the table is too wide,
+/// columns are shrunk in reverse priority order (URI first, then USERNAME,
+/// NAME, PROVIDER, ID, TYPE last).
 fn print_search_table(items: &[ItemSummary], show_path: bool) {
     const H_TYPE: &str = "TYPE";
     const H_PROV: &str = "PROVIDER";
@@ -2331,89 +2470,113 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
     const H_USER: &str = "USERNAME";
     const H_URI: &str = "URI";
     const H_ID: &str = "ID";
+    const GAP: usize = 2; // spaces between columns
 
-    // Hard caps keep the table usable on a standard 120-column terminal.
-    const MAX_TYPE: usize = 10;
-    const MAX_PROV: usize = 20;
-    const MAX_NAME: usize = 30;
-    const MAX_USER: usize = 30;
-    const MAX_URI: usize = 40;
-    const W_ID: usize = 16; // always exactly 16 hex chars
-
-    let w_type = items
+    // Natural widths: max(data_length, header_length) per column.
+    let nat_type = items
         .iter()
         .map(|i| {
             i.attrs
                 .get(rosec_core::ATTR_TYPE)
                 .map(String::len)
                 .unwrap_or(0)
-                .min(MAX_TYPE)
         })
         .max()
         .unwrap_or(0)
         .max(H_TYPE.len());
-    let w_prov = items
+    let nat_id = 16_usize.max(H_ID.len()); // always 16 hex chars
+    let nat_prov = items
         .iter()
         .map(|i| {
             i.attrs
                 .get(rosec_core::ATTR_PROVIDER)
                 .map(String::len)
                 .unwrap_or(0)
-                .min(MAX_PROV)
         })
         .max()
         .unwrap_or(0)
         .max(H_PROV.len());
-    let w_name = items
+    let nat_name = items
         .iter()
-        .map(|i| i.label.len().min(MAX_NAME))
+        .map(|i| i.label.len())
         .max()
         .unwrap_or(0)
         .max(H_NAME.len());
-    let w_user = items
+    let nat_user = items
         .iter()
-        .map(|i| {
-            i.attrs
-                .get("username")
-                .map(String::len)
-                .unwrap_or(0)
-                .min(MAX_USER)
-        })
+        .map(|i| i.attrs.get("username").map(String::len).unwrap_or(0))
         .max()
         .unwrap_or(0)
         .max(H_USER.len());
-    let w_uri = items
+    let nat_uri = items
         .iter()
-        .map(|i| {
-            i.attrs
-                .get("uri")
-                .map(String::len)
-                .unwrap_or(0)
-                .min(MAX_URI)
-        })
+        .map(|i| i.attrs.get("uri").map(String::len).unwrap_or(0))
         .max()
         .unwrap_or(0)
         .max(H_URI.len());
 
-    // Separator width: columns + 2-char gaps between each pair + ID column.
-    // The ID header text is 2 chars ("ID") but data is always 16 hex chars.
-    let w_id_col = W_ID.max(H_ID.len());
-    let sep_w = w_type
-        + 2
-        + w_prov
-        + 2
-        + w_name
-        + 2
-        + w_user
-        + 2
-        + w_uri
-        + 2
-        + w_id_col
-        + if show_path { 2 + "PATH".len() } else { 0 };
+    // Priority order (highest first): TYPE, ID, PROVIDER, NAME, USERNAME, URI.
+    // Indices into this priority array:
+    const P_TYPE: usize = 0;
+    const P_ID: usize = 1;
+    const P_PROV: usize = 2;
+    const P_NAME: usize = 3;
+    const P_USER: usize = 4;
+    const P_URI: usize = 5;
 
+    let mut cols = [
+        ColSpec {
+            natural: nat_type,
+            min: H_TYPE.len(),
+            allocated: 0,
+        },
+        ColSpec {
+            natural: nat_id,
+            min: H_ID.len(),
+            allocated: 0,
+        },
+        ColSpec {
+            natural: nat_prov,
+            min: H_PROV.len(),
+            allocated: 0,
+        },
+        ColSpec {
+            natural: nat_name,
+            min: H_NAME.len(),
+            allocated: 0,
+        },
+        ColSpec {
+            natural: nat_user,
+            min: H_USER.len(),
+            allocated: 0,
+        },
+        ColSpec {
+            natural: nat_uri,
+            min: H_URI.len(),
+            allocated: 0,
+        },
+    ];
+
+    let mut term_w = terminal_width();
+    // PATH column (when shown) is not shrinkable — subtract it from budget.
+    if show_path {
+        // PATH has no max width; reserve header + gap.
+        term_w = term_w.saturating_sub(GAP + "PATH".len());
+    }
+
+    fit_columns(&mut cols, GAP, term_w);
+
+    let w_type = cols[P_TYPE].allocated;
+    let w_id = cols[P_ID].allocated;
+    let w_prov = cols[P_PROV].allocated;
+    let w_name = cols[P_NAME].allocated;
+    let w_user = cols[P_USER].allocated;
+    let w_uri = cols[P_URI].allocated;
+
+    // --- Header ---
     if show_path {
         println!(
-            "{:<w_type$}  {:<w_prov$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {:<w_id_col$}  PATH",
+            "{:<w_type$}  {:<w_prov$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {:<w_id$}  PATH",
             H_TYPE, H_PROV, H_NAME, H_USER, H_URI, H_ID,
         );
     } else {
@@ -2422,8 +2585,22 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
             H_TYPE, H_PROV, H_NAME, H_USER, H_URI, H_ID,
         );
     }
+
+    let sep_w = w_type
+        + GAP
+        + w_prov
+        + GAP
+        + w_name
+        + GAP
+        + w_user
+        + GAP
+        + w_uri
+        + GAP
+        + w_id
+        + if show_path { GAP + "PATH".len() } else { 0 };
     println!("{}", "-".repeat(sep_w));
 
+    // --- Rows ---
     for item in items {
         let item_type = item
             .attrs
@@ -2438,35 +2615,23 @@ fn print_search_table(items: &[ItemSummary], show_path: bool) {
         let username = item.attrs.get("username").map(String::as_str).unwrap_or("");
         let uri = item.attrs.get("uri").map(String::as_str).unwrap_or("");
 
-        let t = trunc(item_type, MAX_TYPE);
-        let p = trunc(provider, MAX_PROV);
-        let n = trunc(&item.label, MAX_NAME);
-        let u = trunc(username, MAX_USER);
-        let r = trunc(uri, MAX_URI);
+        let t = trunc(item_type, w_type);
+        let p = trunc(provider, w_prov);
+        let n = trunc(&item.label, w_name);
+        let u = trunc(username, w_user);
+        let r = trunc(uri, w_uri);
+        let id = trunc(item.display_id(), w_id);
         let lock_indicator = if item.locked { " [locked]" } else { "" };
 
         if show_path {
             println!(
-                "{:<w_type$}  {:<w_prov$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {:<w_id_col$}  {}{}",
-                t,
-                p,
-                n,
-                u,
-                r,
-                item.display_id(),
-                item.path,
-                lock_indicator,
+                "{:<w_type$}  {:<w_prov$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {:<w_id$}  {}{}",
+                t, p, n, u, r, id, item.path, lock_indicator,
             );
         } else {
             println!(
                 "{:<w_type$}  {:<w_prov$}  {:<w_name$}  {:<w_user$}  {:<w_uri$}  {}{}",
-                t,
-                p,
-                n,
-                u,
-                r,
-                item.display_id(),
-                lock_indicator,
+                t, p, n, u, r, id, lock_indicator,
             );
         }
     }
@@ -2628,9 +2793,9 @@ async fn resolve_item_by_attrs(conn: &Connection, raw: &str) -> Result<(String, 
     let has_globs = attrs.values().any(|v| is_glob(v)) || attrs.contains_key("name");
 
     let (unlocked, locked) = if has_globs {
-        search_with_glob_fallback(conn, &attrs, rosecd).await?
+        search_with_glob_fallback(conn, &attrs, rosecd, false).await?
     } else {
-        search_exact(conn, &attrs).await?
+        search_exact(conn, &attrs, false).await?
     };
 
     let total = unlocked.len() + locked.len();
@@ -2659,9 +2824,10 @@ async fn resolve_item_by_attrs(conn: &Connection, raw: &str) -> Result<(String, 
 }
 
 async fn cmd_get(args: &[String]) -> Result<()> {
-    // Parse flags: --help / -h, --attr <name> / --attr=<name>, --sync
+    // Parse flags: --help / -h, --attr <name> / --attr=<name>, --sync, --no-unlock
     let mut attr: Option<String> = None;
     let mut sync = false;
+    let mut no_unlock = false;
     let mut id: Option<&str> = None;
 
     let mut i = 0;
@@ -2673,6 +2839,9 @@ async fn cmd_get(args: &[String]) -> Result<()> {
             }
             "--sync" | "-s" => {
                 sync = true;
+            }
+            "--no-unlock" => {
+                no_unlock = true;
             }
             "--attr" => {
                 i += 1;
@@ -2698,6 +2867,10 @@ async fn cmd_get(args: &[String]) -> Result<()> {
         i += 1;
     }
 
+    if sync && no_unlock {
+        bail!("--sync and --no-unlock are mutually exclusive");
+    }
+
     let raw =
         id.ok_or_else(|| anyhow::anyhow!("missing item path or ID  (try `rosec get --help`)"))?;
 
@@ -2714,9 +2887,10 @@ async fn cmd_get(args: &[String]) -> Result<()> {
     // With --sync, if the item wasn't found at all we attempt unlock + re-sync
     // before giving up — the item may live in a provider that hasn't been
     // unlocked yet (so the metadata cache has no knowledge of it).
+    // With --no-unlock, skip all unlock attempts.
     let (path, is_locked) = match resolve_result {
         Ok(result) => result,
-        Err(e) if sync => {
+        Err(e) if sync && !no_unlock => {
             // Item not found — try unlocking, syncing, and re-resolving.
             trigger_unlock(&conn).await?;
             preemptive_sync(&conn).await?;
@@ -2726,8 +2900,12 @@ async fn cmd_get(args: &[String]) -> Result<()> {
     };
 
     // If the item was in the locked partition, trigger the spec Unlock+Prompt
-    // flow before attempting to fetch the secret.
+    // flow before attempting to fetch the secret.  With --no-unlock, bail
+    // instead of prompting.
     if is_locked {
+        if no_unlock {
+            bail!("item is locked — use --sync to unlock the provider first");
+        }
         trigger_unlock(&conn).await?;
         // Re-sync the just-unlocked providers so the freshly-available items
         // are pulled from the remote and the metadata cache is populated.
@@ -2737,11 +2915,13 @@ async fn cmd_get(args: &[String]) -> Result<()> {
     }
 
     // Try once; if provider is locked, prompt for credentials and retry.
+    // With --no-unlock, skip the lazy-unlock retry.
     match cmd_get_inner(&conn, &path, attr.as_deref()).await {
         Ok(()) => Ok(()),
         Err(e) => {
             let zbus_err = e.downcast_ref::<zbus::Error>();
-            if let Some(ze) = zbus_err
+            if !no_unlock
+                && let Some(ze) = zbus_err
                 && try_lazy_unlock(&conn, ze).await?
             {
                 cmd_get_inner(&conn, &path, attr.as_deref()).await
@@ -2758,7 +2938,7 @@ fn print_get_help() {
 rosec get - print a secret value
 
 USAGE:
-    rosec get [--sync] [--attr <name>] <item>
+    rosec get [flags] [--attr <name>] <item>
 
 ARGUMENTS:
     <item>          One of:
@@ -2772,6 +2952,8 @@ ARGUMENTS:
 FLAGS:
     -s, --sync      Sync providers before fetching if the cache is stale (>60 s).
                     Skips the network call when data is already fresh.
+    --no-unlock     Never prompt for credentials — only use cached/unlocked items.
+                    Mutually exclusive with --sync.
     --attr <name>   Print the named public attribute instead of the primary secret
                     (e.g. username, uri, folder, sm.project).
                     Use `rosec inspect <id>` to see all available attributes.
@@ -2783,6 +2965,7 @@ EXAMPLES:
     rosec get 'name=*prod*'                       # by name glob
     rosec get uri=github.com                      # by URI attribute
     rosec get --sync name=MY_API_KEY              # sync first, then fetch
+    rosec get --no-unlock a1b2c3d4e5f60718        # no prompting
     rosec get a1b2c3d4e5f60718 | xclip -sel clip  # pipe to clipboard
     rosec get --attr username name=MY_API_KEY     # print username attribute"
     );
