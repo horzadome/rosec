@@ -49,8 +49,9 @@ package() {
     srcdir_inner=$(find "${srcdir}" -maxdepth 1 -type d -name '*-linux-gnu' | head -1)
 
     # Binaries
-    install -Dm755 "${srcdir_inner}/rosecd" "${pkgdir}/usr/bin/rosecd"
-    install -Dm755 "${srcdir_inner}/rosec"  "${pkgdir}/usr/bin/rosec"
+    install -Dm755 "${srcdir_inner}/rosecd"       "${pkgdir}/usr/bin/rosecd"
+    install -Dm755 "${srcdir_inner}/rosec"        "${pkgdir}/usr/bin/rosec"
+    install -Dm755 "${srcdir_inner}/rosec-prompt" "${pkgdir}/usr/bin/rosec-prompt"
 
     # PAM helper binary — talks to rosecd over D-Bus to unlock providers
     install -Dm755 "${srcdir_inner}/rosec-pam-unlock" \

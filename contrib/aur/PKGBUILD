@@ -107,10 +107,10 @@ prepare() {
 }
 
 build() {
-    # Build native binaries (rosecd, rosec, rosec-pam-unlock)
+    # Build native binaries (rosecd, rosec, rosec-prompt, rosec-pam-unlock)
     cd "${srcdir}/${pkgname}"
-    cargo build --release --locked --bin rosecd --bin rosec --bin rosec-pam-unlock 2>/dev/null || \
-    cargo build --release         --bin rosecd --bin rosec --bin rosec-pam-unlock
+    cargo build --release --locked --bin rosecd --bin rosec --bin rosec-prompt --bin rosec-pam-unlock 2>/dev/null || \
+    cargo build --release         --bin rosecd --bin rosec --bin rosec-prompt --bin rosec-pam-unlock
 
     # Build PAM module (C, no Rust deps — tiny .so for libpam)
     cd "${srcdir}/${pkgname}/contrib/pam"
@@ -140,8 +140,9 @@ package() {
     cd "${srcdir}/${pkgname}"
 
     # Binaries
-    install -Dm755 target/release/rosecd "${pkgdir}/usr/bin/rosecd"
-    install -Dm755 target/release/rosec  "${pkgdir}/usr/bin/rosec"
+    install -Dm755 target/release/rosecd        "${pkgdir}/usr/bin/rosecd"
+    install -Dm755 target/release/rosec         "${pkgdir}/usr/bin/rosec"
+    install -Dm755 target/release/rosec-prompt  "${pkgdir}/usr/bin/rosec-prompt"
 
     # PAM helper binary — talks to rosecd over D-Bus to unlock providers
     install -Dm755 target/release/rosec-pam-unlock \
