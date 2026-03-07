@@ -9,7 +9,7 @@ use anyhow::Context as _;
 use signature::Signer as _;
 use ssh_agent_lib::agent::{Session, listen};
 use ssh_agent_lib::error::AgentError;
-use ssh_agent_lib::proto::{Identity, SignRequest};
+use ssh_agent_lib::proto::{Identity, Request, Response, SignRequest};
 use ssh_key::{HashAlg, Signature};
 use tracing::{debug, warn};
 
@@ -96,5 +96,31 @@ impl Session for SshAgent {
             .map_err(|e| other_err(format!("signing failed: {e}")))?;
 
         Ok(signature)
+    }
+
+    /// Override the default `handle()` to intercept extension requests.
+    ///
+    /// The default `Session::extension()` returns `Err(UnsupportedCommand)`,
+    /// which `handle_socket()` in `ssh_agent_lib` logs at ERROR level.
+    /// Extension probes (command 27 = `SSH_AGENTC_EXTENSION`) are normal —
+    /// SSH clients and forwarding tools send them to discover capabilities.
+    /// We return `SSH_AGENT_FAILURE` directly, bypassing the error log path.
+    async fn handle(&mut self, message: Request) -> Result<Response, AgentError> {
+        match message {
+            Request::Extension(ext) => {
+                debug!(
+                    extension = %ext.name,
+                    "extension request (unsupported, returning failure)"
+                );
+                Ok(Response::Failure)
+            }
+            Request::RequestIdentities => {
+                Ok(Response::IdentitiesAnswer(self.request_identities().await?))
+            }
+            Request::SignRequest(request) => Ok(Response::SignResponse(self.sign(request).await?)),
+            _ => Err(AgentError::from(
+                ssh_agent_lib::proto::ProtoError::UnsupportedCommand { command: 0 },
+            )),
+        }
     }
 }

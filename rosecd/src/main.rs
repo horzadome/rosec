@@ -29,6 +29,10 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    // Parse --version / --help before initialising tracing so that `--version`
+    // output is not polluted by log lines on stdout.
+    let config_path = parse_config_path();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -36,12 +40,13 @@ async fn run() -> Result<()> {
         )
         .init();
 
+    tracing::info!("rosecd v{}", env!("CARGO_PKG_VERSION"));
+
     // Security hardening: disable core dumps, lock memory pages.
     // Called immediately after logging is initialised so warnings are visible,
     // but before any providers are constructed or secrets are touched.
     bootstrap::secure_bootstrap();
 
-    let config_path = parse_config_path();
     let config = load_config(&config_path)?;
     tracing::info!("loaded config from {}", config_path.display());
     tracing::info!(
