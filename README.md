@@ -107,8 +107,9 @@ rosec provider add-password local --label pam
 Then add rosec to your local login PAM config (`/etc/pam.d/system-local-login`):
 
 ```
-auth     include   rosec
-session  include   rosec
+auth      include   rosec
+session   include   rosec
+password  include   rosec
 ```
 
 From your next login, the vault unlocks automatically. See [PAM auto-unlock](#pam-auto-unlock) for display manager setup and troubleshooting.
@@ -286,6 +287,11 @@ the `session` phase (when the D-Bus session bus is available).  This means
 your providers unlock automatically at both **initial login** and
 **screen unlock** — just like gnome-keyring does.
 
+The module also handles **password changes** (`passwd`): when the `password`
+PAM phase fires, it sends the old and new passwords to the daemon, which
+updates local vault wrapping entries automatically.  Your vaults stay
+unlockable with the new login password without manual intervention.
+
 The password is sent to `rosecd` via Unix pipe fd-passing (SCM_RIGHTS) — it
 never appears on the D-Bus wire.  Any provider with a matching password
 unlocks silently.  Providers without a match are skipped.  **Login is never
@@ -322,8 +328,9 @@ password, skip this step.
 
 ```
 # /etc/pam.d/system-local-login — add at the end:
-auth     include   rosec
-session  include   rosec
+auth      include   rosec
+session   include   rosec
+password  include   rosec
 ```
 
 This covers GDM, SDDM, console login, and screen lockers that include the
@@ -335,8 +342,9 @@ services where there is no D-Bus session bus.
 
 ```
 # /etc/pam.d/hyprlock — add after the existing auth line:
-auth     include   rosec
-session  include   rosec
+auth      include   rosec
+session   include   rosec
+password  include   rosec
 ```
 
 | Screen locker | PAM config |
