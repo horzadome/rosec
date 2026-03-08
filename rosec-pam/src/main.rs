@@ -71,6 +71,14 @@ fn debug_log(msg: &str) {
     }
 }
 
+/// Operating mode — determined by argv.
+enum Mode {
+    /// Default: unlock locked providers with a single password.
+    Unlock,
+    /// --chauthtok: change provider passwords (old\0new\0 on stdin).
+    Chauthtok,
+}
+
 fn main() -> ! {
     // Handle --version before anything else.
     if std::env::args().any(|a| a == "--version" || a == "-V") {
@@ -82,16 +90,34 @@ fn main() -> ! {
         std::process::exit(0);
     }
 
+    let mode = if std::env::args().any(|a| a == "--chauthtok") {
+        Mode::Chauthtok
+    } else {
+        Mode::Unlock
+    };
+
     debug_log("helper started");
-    let code = match run() {
-        Ok(()) => {
-            debug_log("helper exiting PAM_SUCCESS");
-            PAM_SUCCESS
-        }
-        Err(()) => {
-            debug_log("helper exiting PAM_IGNORE");
-            PAM_IGNORE
-        }
+    let code = match mode {
+        Mode::Unlock => match run() {
+            Ok(()) => {
+                debug_log("helper exiting PAM_SUCCESS");
+                PAM_SUCCESS
+            }
+            Err(()) => {
+                debug_log("helper exiting PAM_IGNORE");
+                PAM_IGNORE
+            }
+        },
+        Mode::Chauthtok => match run_chauthtok() {
+            Ok(()) => {
+                debug_log("chauthtok helper exiting PAM_SUCCESS");
+                PAM_SUCCESS
+            }
+            Err(()) => {
+                debug_log("chauthtok helper exiting PAM_IGNORE");
+                PAM_IGNORE
+            }
+        },
     };
     std::process::exit(code);
 }
@@ -372,5 +398,155 @@ async fn unlock_vaults_async(password: &[u8]) -> Result<(), ()> {
     } else {
         debug_log("no providers were unlocked");
         Err(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// chauthtok mode — password change
+// ═══════════════════════════════════════════════════════════════════
+
+/// Read two NUL-terminated password strings from stdin.
+///
+/// Protocol: `<old_password>\0<new_password>\0<EOF>`.
+fn read_two_passwords_from_stdin() -> Result<(Vec<u8>, Vec<u8>), ()> {
+    use std::io::Read as _;
+    let mut buf = Vec::with_capacity(512);
+    std::io::stdin().read_to_end(&mut buf).map_err(|_| ())?;
+
+    // Find the first NUL separator.
+    let sep = buf.iter().position(|&b| b == 0).ok_or(())?;
+    let old_pw = buf[..sep].to_vec();
+
+    // Everything after the first NUL is the new password (strip trailing NUL).
+    let rest = &buf[sep + 1..];
+    let new_pw = if rest.last() == Some(&0) {
+        rest[..rest.len() - 1].to_vec()
+    } else {
+        rest.to_vec()
+    };
+
+    // Strip trailing newlines.
+    let strip_trailing_nl = |mut v: Vec<u8>| -> Vec<u8> {
+        if v.last() == Some(&b'\n') {
+            v.pop();
+        }
+        v
+    };
+    let old_pw = strip_trailing_nl(old_pw);
+    let new_pw = strip_trailing_nl(new_pw);
+
+    if old_pw.is_empty() || new_pw.is_empty() {
+        return Err(());
+    }
+
+    Ok((old_pw, new_pw))
+}
+
+fn run_chauthtok() -> Result<(), ()> {
+    ensure_session_bus_env();
+
+    let (mut old_pw, mut new_pw) = read_two_passwords_from_stdin().map_err(|()| {
+        debug_log("failed to read old/new passwords from stdin");
+    })?;
+
+    debug_log(&format!(
+        "read old={} bytes, new={} bytes from stdin",
+        old_pw.len(),
+        new_pw.len()
+    ));
+
+    let result = change_vault_passwords(&old_pw, &new_pw);
+
+    old_pw.zeroize();
+    new_pw.zeroize();
+
+    result
+}
+
+fn change_vault_passwords(old_password: &[u8], new_password: &[u8]) -> Result<(), ()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| ())?;
+
+    rt.block_on(change_vault_passwords_async(old_password, new_password))
+}
+
+async fn change_vault_passwords_async(old_password: &[u8], new_password: &[u8]) -> Result<(), ()> {
+    debug_log("connecting to session bus (chauthtok)");
+    let conn = zbus::Connection::session().await.map_err(|e| {
+        debug_log(&format!("D-Bus session connect failed: {e}"));
+    })?;
+
+    let proxy = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.secrets",
+        "/org/rosec/Daemon",
+        "org.rosec.Daemon",
+    )
+    .await
+    .map_err(|e| {
+        debug_log(&format!("proxy creation failed: {e}"));
+    })?;
+
+    debug_log("calling ProviderList");
+    let providers: Vec<(String, String, String, bool)> =
+        proxy.call("ProviderList", &()).await.map_err(|e| {
+            debug_log(&format!("ProviderList call failed: {e}"));
+        })?;
+
+    // Only attempt password change on unlocked local vault providers.
+    // Locked providers can't have their password changed (they need to
+    // be unlocked first to re-wrap the vault key).
+    let targets: Vec<_> = providers
+        .iter()
+        .filter(|(_, _, kind, locked)| kind == "local" && !locked)
+        .collect();
+
+    if targets.is_empty() {
+        debug_log("no unlocked local vault providers found");
+        return Ok(());
+    }
+
+    debug_log(&format!(
+        "attempting password change on {} provider(s)",
+        targets.len()
+    ));
+
+    let mut any_changed = false;
+    for (id, name, _, _) in &targets {
+        let old_pipe = make_password_pipe(old_password).map_err(|_| {
+            debug_log("failed to create old password pipe");
+        })?;
+        let new_pipe = make_password_pipe(new_password).map_err(|_| {
+            debug_log("failed to create new password pipe");
+        })?;
+
+        debug_log(&format!("changing password for provider {name} ({id})"));
+        let result: Result<(), zbus::Error> = proxy
+            .call("ChangeProviderPassword", &(id.as_str(), old_pipe, new_pipe))
+            .await;
+
+        match &result {
+            Ok(()) => {
+                debug_log(&format!("provider {name} ({id}) password changed"));
+                any_changed = true;
+            }
+            Err(e) => {
+                // Not an error — the old password may not match this vault's
+                // wrapping entry.  Log and continue.
+                debug_log(&format!(
+                    "provider {name} ({id}) password change failed: {e}"
+                ));
+            }
+        }
+    }
+
+    if any_changed {
+        debug_log("at least one provider password changed");
+        Ok(())
+    } else {
+        debug_log("no provider passwords were changed");
+        Ok(())
     }
 }

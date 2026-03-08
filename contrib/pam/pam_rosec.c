@@ -7,9 +7,11 @@
  * bus becomes available between the two phases) and at screen unlock.
  *
  * The module follows the same pattern as pam_gnome_keyring.so:
- *   auth    phase: capture password via pam_get_item(PAM_AUTHTOK), stash it
- *   session phase: retrieve stash, fork/exec the unlock helper with password
- *                  on stdin, wait for exit
+ *   auth     phase: capture password via pam_get_item(PAM_AUTHTOK), stash it
+ *   session  phase: retrieve stash, fork/exec the unlock helper with password
+ *                   on stdin, wait for exit
+ *   password phase: on password change, pass old+new passwords to the helper
+ *                   in --chauthtok mode to update vault wrapping entries
  *
  * SAFETY PROPERTIES:
  *
@@ -46,8 +48,9 @@
  *   install -m755 pam_rosec.so /usr/lib/security/
  *
  * PAM config (/etc/pam.d/system-local-login or screen locker):
- *   auth     optional  pam_rosec.so
- *   session  optional  pam_rosec.so
+ *   auth      optional  pam_rosec.so
+ *   session   optional  pam_rosec.so
+ *   password  optional  pam_rosec.so
  *
  * Copyright (c) 2025 rosec contributors.  MIT license.
  */
@@ -435,5 +438,186 @@ pam_sm_close_session(pam_handle_t *ph, int flags, int argc, const char **argv)
     (void)flags;
     (void)argc;
     (void)argv;
+    return PAM_SUCCESS;
+}
+
+/* ── Password change ─────────────────────────────────────────────── */
+
+/*
+ * Write two NUL-terminated password strings to a pipe fd, then close it.
+ *
+ * The helper reads: <old_password>\0<new_password>\0<EOF>.
+ * Returns 0 on success, -1 on failure.  The fd is always closed.
+ */
+static int
+write_two_passwords_to_pipe(int write_fd, const char *old_pw, const char *new_pw)
+{
+    /* Write old password + NUL */
+    size_t old_len = strlen(old_pw);
+    const char nul = '\0';
+    ssize_t written;
+
+    while (old_len > 0) {
+        written = write(write_fd, old_pw, old_len);
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            close(write_fd);
+            return -1;
+        }
+        old_pw += written;
+        old_len -= (size_t)written;
+    }
+    while ((written = write(write_fd, &nul, 1)) < 0 && errno == EINTR)
+        ;
+    if (written != 1) {
+        close(write_fd);
+        return -1;
+    }
+
+    /* Write new password + NUL */
+    size_t new_len = strlen(new_pw);
+    while (new_len > 0) {
+        written = write(write_fd, new_pw, new_len);
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            close(write_fd);
+            return -1;
+        }
+        new_pw += written;
+        new_len -= (size_t)written;
+    }
+    while ((written = write(write_fd, &nul, 1)) < 0 && errno == EINTR)
+        ;
+
+    close(write_fd);
+    return (written == 1) ? 0 : -1;
+}
+
+/*
+ * Fork rosec-pam-unlock in --chauthtok mode, passing old and new
+ * passwords on stdin as two NUL-terminated strings.
+ *
+ * Protocol: the helper reads <old_password>\0<new_password>\0<EOF>.
+ */
+static void
+run_chauthtok_helper(const char *old_password, const char *new_password,
+                     const char *username)
+{
+    int pipe_fds[2] = { -1, -1 };
+    pid_t pid;
+    struct sigaction sa_ign, sa_old_pipe;
+
+    if (pipe(pipe_fds) < 0)
+        return;
+
+    memset(&sa_ign, 0, sizeof(sa_ign));
+    sa_ign.sa_handler = SIG_IGN;
+    sigemptyset(&sa_ign.sa_mask);
+    sigaction(SIGPIPE, &sa_ign, &sa_old_pipe);
+
+    pid = fork();
+
+    if (pid < 0) {
+        close_safe(pipe_fds[0]);
+        close_safe(pipe_fds[1]);
+        sigaction(SIGPIPE, &sa_old_pipe, NULL);
+        return;
+    }
+
+    if (pid == 0) {
+        /* ── Intermediate child — double-fork and exit ──────────── */
+        pid_t grandchild = fork();
+        if (grandchild < 0)
+            _exit(1);
+
+        if (grandchild > 0)
+            _exit(0);
+
+        /* ── Grandchild — becomes the actual helper ─────────────── */
+        setsid();
+        signal(SIGPIPE, SIG_DFL);
+        signal(SIGCHLD, SIG_DFL);
+
+        if (dup2(pipe_fds[0], STDIN_FILENO) < 0)
+            _exit(1);
+
+        for (int fd = STDERR_FILENO + 1; fd < 1024; fd++)
+            close(fd);
+
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO)
+                close(devnull);
+        }
+
+        if (username)
+            setenv("PAM_USER", username, 1);
+
+        execl(ROSEC_PAM_UNLOCK_PATH, "rosec-pam-unlock",
+              "--chauthtok", (char *)NULL);
+        _exit(127);
+    }
+
+    /* ── Parent process ────────────────────────────────────────── */
+    close_safe(pipe_fds[0]);
+    pipe_fds[0] = -1;
+
+    write_two_passwords_to_pipe(pipe_fds[1], old_password, new_password);
+    pipe_fds[1] = -1;  /* already closed */
+
+    waitpid(pid, NULL, 0);
+    sigaction(SIGPIPE, &sa_old_pipe, NULL);
+}
+
+/*
+ * pam_sm_chauthtok — `password` phase (password change).
+ *
+ * Called when the user changes their login password (e.g. via `passwd`).
+ * PAM calls this twice:
+ *   1. PAM_PRELIM_CHECK — validate the old password (we skip this).
+ *   2. PAM_UPDATE_AUTHTOK — perform the actual change.
+ *
+ * On PAM_UPDATE_AUTHTOK we retrieve both old and new passwords and
+ * pass them to the rosec-pam-unlock helper in --chauthtok mode, which
+ * calls ChangeProviderPassword on the daemon.  This updates the
+ * wrapping entry in local vaults so the new login password can unlock
+ * them.
+ *
+ * ALWAYS returns PAM_SUCCESS — never blocks password changes.
+ */
+PAM_EXTERN int
+pam_sm_chauthtok(pam_handle_t *ph, int flags, int argc, const char **argv)
+{
+    const char *old_password = NULL;
+    const char *new_password = NULL;
+    const char *username = NULL;
+
+    (void)argc;
+    (void)argv;
+
+    /* Only act on the update phase, not the preliminary check. */
+    if (flags & PAM_PRELIM_CHECK)
+        return PAM_SUCCESS;
+
+    /* Get the old password (PAM_OLDAUTHTOK) and new password (PAM_AUTHTOK). */
+    if (pam_get_item(ph, PAM_OLDAUTHTOK, (const void **)&old_password) != PAM_SUCCESS
+        || old_password == NULL || old_password[0] == '\0')
+        return PAM_SUCCESS;
+
+    if (pam_get_item(ph, PAM_AUTHTOK, (const void **)&new_password) != PAM_SUCCESS
+        || new_password == NULL || new_password[0] == '\0')
+        return PAM_SUCCESS;
+
+    pam_get_item(ph, PAM_USER, (const void **)&username);
+
+    syslog(LOG_DEBUG, "pam_rosec: chauthtok — launching helper for user=%s",
+           username ? username : "(null)");
+
+    run_chauthtok_helper(old_password, new_password, username);
+
     return PAM_SUCCESS;
 }

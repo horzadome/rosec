@@ -12,8 +12,13 @@
 # will pick this up automatically via the include chain:
 #   login -> system-local-login -> rosec
 #
-# Both lines are marked `optional` — pam_rosec.so CANNOT block login
-# or account lockout under any circumstances.
+# All lines are marked `optional` — pam_rosec.so CANNOT block login,
+# account lockout, or password changes under any circumstances.
+#
+# The `password` line handles password changes (e.g. via passwd):
+# when the user changes their login password, pam_rosec updates the
+# vault wrapping entry so the new password can unlock local vaults.
 
-auth     optional  pam_rosec.so
-session  optional  pam_rosec.so
+auth      optional  pam_rosec.so
+session   optional  pam_rosec.so
+password  optional  pam_rosec.so
