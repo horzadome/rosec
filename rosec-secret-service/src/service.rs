@@ -169,7 +169,11 @@ impl SecretService {
         #[zbus(header)] header: Header<'_>,
     ) -> Result<OwnedObjectPath, FdoError> {
         log_caller("ReadAlias", &header);
-        if name == "default" {
+        // Map "login" to "default" for gnome-keyring compatibility.
+        // Many applications (e.g. Chrome, NetworkManager) request the
+        // "login" alias which gnome-keyring uses for its auto-unlock
+        // keyring.
+        if name == "default" || name == "login" {
             Ok(to_object_path(
                 "/org/freedesktop/secrets/collection/default",
             ))
