@@ -338,13 +338,16 @@ This covers GDM, SDDM, console login, and screen lockers that include the
 `/etc/pam.d/system-login` — that file is also used by SSH and other remote
 services where there is no D-Bus session bus.
 
-**For a specific screen locker only** (if you don't want rosec on initial login):
+**For a specific screen locker only** (if you don't want rosec on initial login).
+Most screen lockers (hyprlock, swaylock, etc.) include `system-local-login`
+under the hood, so the above is usually sufficient.  If yours doesn't, add
+rosec directly to the locker's PAM config — only `auth` and `session` are
+needed here (screen lockers don't do password changes):
 
 ```
-# /etc/pam.d/hyprlock — add after the existing auth line:
-auth      include   rosec
-session   include   rosec
-password  include   rosec
+# /etc/pam.d/<locker> — add after the existing auth line:
+auth     include   rosec
+session  include   rosec
 ```
 
 | Screen locker | PAM config |
