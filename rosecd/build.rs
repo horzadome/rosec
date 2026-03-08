@@ -56,5 +56,17 @@ fn git_sha() -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    let dirty = std::process::Command::new("git")
+        .args(["diff", "--quiet", "HEAD"])
+        .status()
+        .ok()
+        .is_some_and(|s| !s.success());
+
+    if dirty {
+        Some(format!("{sha}*"))
+    } else {
+        Some(sha)
+    }
 }
