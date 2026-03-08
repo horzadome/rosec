@@ -4113,8 +4113,7 @@ struct ParsedItem {
 /// Expects sections `[item]` (with `label` and `type`), `[attributes]`, and
 /// `[secrets]`.  Empty string values in `[secrets]` are silently dropped.
 fn parse_item_toml(content: &str) -> Result<ParsedItem> {
-    let doc: toml::Value = content
-        .parse()
+    let doc: toml::Value = toml::from_str(content)
         .map_err(|e: toml::de::Error| anyhow::anyhow!("failed to parse TOML: {e}"))?;
 
     let item_table = doc
@@ -4132,16 +4131,17 @@ fn parse_item_toml(content: &str) -> Result<ParsedItem> {
         bail!("item label is required (set label = \"...\" in [item])");
     }
 
-    let item_type = item_table
+    let raw_type = item_table
         .get("type")
         .and_then(|v| v.as_str())
-        .unwrap_or("generic")
-        .to_string();
+        .unwrap_or("generic");
 
-    // Validate the item type early.
-    item_type
+    // Validate and normalize the item type (e.g. "sshkey" → "ssh-key").
+    let item_type = raw_type
         .parse::<rosec_core::ItemType>()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .as_str()
+        .to_string();
 
     let mut attributes = HashMap::new();
     if let Some(attrs_table) = doc.get("attributes").and_then(|v| v.as_table()) {
@@ -4385,10 +4385,9 @@ async fn fetch_full_item(conn: &zbus::Connection, item_path: &str) -> Result<Fet
     let label: String = item_proxy.get_property("Label").await?;
     let pub_attrs: HashMap<String, String> = item_proxy.get_property("Attributes").await?;
 
-    let item_type = pub_attrs
-        .get(rosec_core::ATTR_TYPE)
-        .map(String::as_str)
-        .unwrap_or("generic")
+    // Normalize through ItemType so legacy strings like "sshkey" become "ssh-key".
+    let item_type = rosec_core::ItemType::from_attributes(&pub_attrs)
+        .as_str()
         .to_string();
 
     // Fetch secret attribute names and values via rosec extension.

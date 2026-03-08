@@ -137,7 +137,7 @@ impl ItemType {
     pub fn from_attributes(attrs: &HashMap<String, String>) -> Self {
         match attrs.get(ATTR_TYPE).map(|s| s.as_str()) {
             Some("login") => Self::Login,
-            Some("ssh-key") => Self::SshKey,
+            Some("ssh-key" | "sshkey" | "ssh_key") => Self::SshKey,
             Some("note") => Self::Note,
             Some("card") => Self::Card,
             Some("identity") => Self::Identity,
@@ -181,7 +181,7 @@ impl std::str::FromStr for ItemType {
         match s {
             "generic" => Ok(Self::Generic),
             "login" => Ok(Self::Login),
-            "ssh-key" => Ok(Self::SshKey),
+            "ssh-key" | "sshkey" | "ssh_key" => Ok(Self::SshKey),
             "note" => Ok(Self::Note),
             "card" => Ok(Self::Card),
             "identity" => Ok(Self::Identity),
