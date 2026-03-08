@@ -75,6 +75,11 @@ static STATE: WasmCell<Option<GuestState>> = WasmCell::new(None);
 struct GuestState {
     config: GuestConfig,
     auth: Option<AuthState>,
+    /// Cached session from previous unlock — survives `lock()` so the next
+    /// `unlock()` can use a `refresh_token` grant instead of a full
+    /// `grant_type=password` login.  This prevents Bitwarden's server from
+    /// invalidating other clients' sessions on every lock/unlock cycle.
+    cached_session: Option<CachedSession>,
 }
 
 /// One-time configuration injected by `init`.
@@ -89,7 +94,21 @@ struct GuestConfig {
 struct AuthState {
     access_token: Zeroizing<String>,
     refresh_token: Option<Zeroizing<String>>,
+    /// The protected symmetric key from the login response.
+    /// Cached here so we can reconstruct the vault on refresh-based unlock.
+    protected_key: Zeroizing<String>,
     vault: VaultState,
+}
+
+/// Minimal session state preserved across lock/unlock cycles.
+///
+/// The `protected_key` is the server-encrypted vault key — it is useless
+/// without the password-derived master key, so caching it does not weaken
+/// the security model.  The user must still provide their password on
+/// every unlock to derive vault decryption keys.
+struct CachedSession {
+    refresh_token: Zeroizing<String>,
+    protected_key: Zeroizing<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -711,47 +730,99 @@ fn days_before_month(month: u64, leap: bool) -> u64 {
 // Auth flow helpers
 // ═══════════════════════════════════════════════════════════════════
 
-/// Perform the full authentication + sync flow (synchronous).
+/// Perform authentication + sync, preferring a cached refresh token when
+/// available to avoid a full `grant_type=password` login.
 ///
-/// Port of `BitwardenProvider::authenticate`.
+/// A full password login causes Bitwarden's server to establish a new device
+/// session, which can invalidate tokens held by other Bitwarden clients on
+/// the same account.  By reusing the refresh token from the previous session
+/// we keep the existing session alive and avoid deauthing other clients.
+///
+/// The password is **always** required — it derives the master key needed to
+/// decrypt the protected symmetric vault key, regardless of the auth path.
 fn authenticate(
     config: &GuestConfig,
     password: &str,
     two_factor: Option<TwoFactorSubmission>,
+    cached_session: Option<CachedSession>,
 ) -> Result<AuthState, BitwardenError> {
     let email = &config.email;
     let api = ApiClient::new(config.urls.clone(), config.device_id.clone());
 
-    // Step 1: Prelogin
+    // Step 1: Prelogin — always needed for KDF params.
     let kdf = api.prelogin(email)?;
     extism_pdk::debug!("got KDF params: {:?}", kdf);
 
-    // Step 2: Key derivation
+    // Step 2: Key derivation — always needed to decrypt vault.
     let master_key = crypto::derive_master_key(password.as_bytes(), email, &kdf)?;
-    let password_hash = crypto::derive_password_hash(&master_key, password.as_bytes());
     let identity_keys = crypto::expand_master_key(&master_key)?;
 
-    // Step 3: Login
+    // Step 3: Obtain access token + protected key.
+    //
+    // Try refresh_token grant first (no new device session).
+    // Fall back to full password login if refresh fails or isn't available.
+    let (access_token, refresh_token, protected_key) =
+        if two_factor.is_none() {
+            if let Some(cached) = cached_session {
+                match api.refresh_token(&cached.refresh_token) {
+                    Ok(resp) => {
+                        extism_pdk::info!("unlocked via refresh token (no new device session)");
+                        (
+                            resp.access_token,
+                            resp.refresh_token,
+                            cached.protected_key,
+                        )
+                    }
+                    Err(e) => {
+                        extism_pdk::info!(
+                            "refresh token expired or rejected, falling back to password login: {e}"
+                        );
+                        full_password_login(&api, email, password, &master_key, None)?
+                    }
+                }
+            } else {
+                full_password_login(&api, email, password, &master_key, None)?
+            }
+        } else {
+            // 2FA requires a full password login.
+            full_password_login(&api, email, password, &master_key, two_factor)?
+        };
+
+    // Step 4: Initialize vault state from protected key.
+    let mut vault_state = VaultState::new(&identity_keys, &protected_key)?;
+
+    // Step 5: Sync.
+    let sync = api.sync(&access_token)?;
+    vault_state.process_sync(&sync)?;
+
+    Ok(AuthState {
+        access_token,
+        refresh_token,
+        protected_key,
+        vault: vault_state,
+    })
+}
+
+/// Result of a password-based login: (access_token, refresh_token, protected_key).
+type LoginTokens = (Zeroizing<String>, Option<Zeroizing<String>>, Zeroizing<String>);
+
+/// Perform a full `grant_type=password` login.
+fn full_password_login(
+    api: &ApiClient,
+    email: &str,
+    password: &str,
+    master_key: &[u8],
+    two_factor: Option<TwoFactorSubmission>,
+) -> Result<LoginTokens, BitwardenError> {
+    let password_hash = crypto::derive_password_hash(master_key, password.as_bytes());
     let hash_b64 = crypto::b64_encode(&password_hash);
     let login_resp = api.login_password(email, &hash_b64, two_factor)?;
 
     let protected_key = login_resp
         .key
-        .as_deref()
         .ok_or_else(|| BitwardenError::Auth("no protected key in login response".to_string()))?;
 
-    // Step 4: Initialize vault state from protected key
-    let mut vault_state = VaultState::new(&identity_keys, protected_key)?;
-
-    // Step 5: Sync
-    let sync = api.sync(&login_resp.access_token)?;
-    vault_state.process_sync(&sync)?;
-
-    Ok(AuthState {
-        access_token: login_resp.access_token,
-        refresh_token: login_resp.refresh_token,
-        vault: vault_state,
-    })
+    Ok((login_resp.access_token, login_resp.refresh_token, protected_key))
 }
 
 /// Re-sync the vault using the existing access token.
@@ -1003,7 +1074,11 @@ pub fn init(Json(req): Json<InitRequest>) -> FnResult<Json<InitResponse>> {
     );
 
     let mut guard = STATE.lock();
-    *guard = Some(GuestState { config, auth: None });
+    *guard = Some(GuestState {
+        config,
+        auth: None,
+        cached_session: None,
+    });
 
     Ok(Json(InitResponse {
         ok: true,
@@ -1124,7 +1199,10 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
         _ => None,
     };
 
-    match authenticate(&state.config, &req.password, two_factor) {
+    // Take the cached session so it can be consumed by authenticate().
+    let cached_session = state.cached_session.take();
+
+    match authenticate(&state.config, &req.password, two_factor, cached_session) {
         Ok(auth) => {
             let ciphers = auth.vault.ciphers().len();
             state.auth = Some(auth);
@@ -1145,14 +1223,26 @@ pub fn unlock(Json(req): Json<UnlockRequest>) -> FnResult<Json<SimpleResponse>> 
     }
 }
 
-/// Lock the vault — drop all sensitive state.
+/// Lock the vault — drop decrypted secrets but preserve the refresh token
+/// so the next unlock can reuse the existing Bitwarden session instead of
+/// performing a full password login (which deauths other clients).
 #[plugin_fn]
 pub fn lock(_input: ()) -> FnResult<Json<SimpleResponse>> {
     let mut guard = STATE.lock();
 
     if let Some(state) = guard.as_mut() {
+        // Stash the refresh token + protected key before dropping auth.
+        // The protected key is server-encrypted and useless without the
+        // password-derived master key, so it's safe to hold in memory.
+        state.cached_session = state.auth.as_ref().and_then(|auth| {
+            auth.refresh_token.as_ref().map(|rt| CachedSession {
+                refresh_token: rt.clone(),
+                protected_key: auth.protected_key.clone(),
+            })
+        });
+        // Drop all decrypted vault data, keys, and access token.
         state.auth = None;
-        extism_pdk::info!("vault locked");
+        extism_pdk::info!("vault locked (session cached for refresh)");
     }
 
     Ok(Json(simple_ok()))

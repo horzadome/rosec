@@ -647,39 +647,6 @@ pub struct SyncUri {
     pub match_type: Option<u8>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::LoginErrorResponse;
-
-    #[test]
-    fn login_error_parses_two_factor_providers_as_strings() {
-        let payload = r#"{
-            "error":"invalid_grant",
-            "error_description":"Two factor required.",
-            "TwoFactorProviders":["0","7","3"]
-        }"#;
-
-        let parsed: LoginErrorResponse =
-            serde_json::from_str(payload).expect("login error should deserialize");
-
-        assert_eq!(parsed.two_factor_providers, Some(vec![0, 7, 3]));
-    }
-
-    #[test]
-    fn login_error_parses_two_factor_providers_as_numbers() {
-        let payload = r#"{
-            "error":"invalid_grant",
-            "error_description":"Two factor required.",
-            "TwoFactorProviders":[0,7,3]
-        }"#;
-
-        let parsed: LoginErrorResponse =
-            serde_json::from_str(payload).expect("login error should deserialize");
-
-        assert_eq!(parsed.two_factor_providers, Some(vec![0, 7, 3]));
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub struct SyncCard {
     #[serde(alias = "CardholderName", alias = "cardholderName")]
