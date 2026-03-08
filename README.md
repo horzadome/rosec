@@ -122,6 +122,10 @@ rosec status
 # Search and retrieve
 rosec search type=login
 rosec get name="My API Key"
+
+# Create, edit, export items (see Item management below)
+rosec item add --type=login
+rosec item export <id> > backup.toml
 ```
 
 ---
@@ -178,6 +182,98 @@ rosec provider attach --path /path/to/file.vault [--id <id>]
 
 # Detach from config without deleting the file
 rosec provider detach <id>
+```
+
+---
+
+## Item management
+
+`rosec item` provides CRUD operations for items in any write-capable provider. Items are edited as TOML documents in `$EDITOR`.
+
+### Creating items
+
+```bash
+# Create a generic item (opens $EDITOR with a template)
+rosec item add
+
+# Create a login in a specific provider
+rosec item add --type=login --provider=local
+
+# Generate an ed25519 SSH key pair and store it
+rosec item add --generate-ssh-key
+```
+
+### Editing and deleting
+
+```bash
+# Edit by item ID (16-char hex)
+rosec item edit a1b2c3d4e5f60718
+
+# Edit by attribute match
+rosec item edit name=My\ Login
+
+# Delete with confirmation
+rosec item delete a1b2c3d4e5f60718
+
+# Delete without confirmation
+rosec item delete -y a1b2c3d4e5f60718
+```
+
+### Export and import
+
+Items can be exported as TOML and imported into any write-capable provider. This enables backups, cross-provider transfers, and scripted workflows.
+
+```bash
+# Export an item to stdout
+rosec item export a1b2c3d4e5f60718
+
+# Export to a file
+rosec item export a1b2c3d4e5f60718 > backup.toml
+
+# Import from a file
+rosec item import < backup.toml
+
+# Import into a specific provider
+rosec item import --provider=local < backup.toml
+
+# Copy an item between providers (e.g. Bitwarden → local vault)
+rosec item export a1b2c3d4e5f60718 | rosec item import --provider=local
+```
+
+The TOML format uses three sections — `[item]`, `[attributes]`, `[secrets]` — and is the same format used by the editor workflow:
+
+```toml
+[item]
+label = "My SSH Key"
+type = "ssh-key"
+
+[attributes]
+public_key = "ssh-ed25519 AAAA..."
+fingerprint = "SHA256:..."
+
+[secrets]
+private_key = """
+-----BEGIN OPENSSH PRIVATE KEY-----
+...
+-----END OPENSSH PRIVATE KEY-----
+"""
+```
+
+### Listing items
+
+```bash
+# List all items
+rosec item list
+
+# Filter by provider or type
+rosec item list --provider=local
+rosec item list --type=ssh-key
+
+# Combine filters with attribute queries
+rosec item list --type=login username=alice
+
+# JSON output
+rosec item list --format=json
 ```
 
 ---
