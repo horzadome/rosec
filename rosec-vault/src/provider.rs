@@ -753,11 +753,21 @@ impl Provider for LocalVault {
             .items
             .iter()
             .filter(|item| {
-                // Must be an ssh-key item with a private_key secret present.
-                item.attributes
-                    .get(rosec_core::ATTR_TYPE)
-                    .is_some_and(|t| t == "ssh-key")
-                    && item.secrets.contains_key("private_key")
+                // Must have a private_key secret present.
+                if !item.secrets.contains_key("private_key") {
+                    return false;
+                }
+                // Prefer explicit type check (handles aliases like "sshkey").
+                let typed = rosec_core::ItemType::from_attributes(&item.attributes);
+                if typed == rosec_core::ItemType::SshKey {
+                    return true;
+                }
+                // Fallback: items without rosec:type that have SSH key
+                // attributes (fingerprint or public_key) are treated as SSH
+                // keys.  This covers items created before type stamping.
+                !item.attributes.contains_key(rosec_core::ATTR_TYPE)
+                    && (item.attributes.contains_key("fingerprint")
+                        || item.attributes.contains_key("public_key"))
             })
             .map(|item| {
                 let public_key_openssh = item
