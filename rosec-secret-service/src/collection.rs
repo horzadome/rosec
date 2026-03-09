@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rosec_core::{ATTR_PROVIDER, ItemMeta, NewItem, Provider, SecretBytes};
+use rosec_core::{ItemMeta, NewItem, Provider, SecretBytes};
 use tracing::{debug, info};
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
@@ -191,20 +191,7 @@ impl SecretCollection {
 
         let item_path = make_item_path(&provider_id, &id);
 
-        let mut attrs = item.attributes.clone();
-        attrs
-            .entry(ATTR_PROVIDER.to_string())
-            .or_insert_with(|| provider_id.clone());
-
-        let meta = ItemMeta {
-            id: id.clone(),
-            provider_id: provider_id.clone(),
-            label: item.label.clone(),
-            attributes: attrs,
-            created: Some(std::time::SystemTime::now()),
-            modified: Some(std::time::SystemTime::now()),
-            locked: false,
-        };
+        let meta = ItemMeta::from_new_item(id.clone(), provider_id.clone(), &item);
 
         self.state
             .service_state

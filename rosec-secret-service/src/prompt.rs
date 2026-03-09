@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use rosec_core::{ATTR_PROVIDER, ItemMeta, NewItem};
+use rosec_core::{ItemMeta, NewItem};
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
 use zeroize::Zeroizing;
@@ -539,20 +539,7 @@ async fn execute_deferred_create(
 
     let item_path = make_item_path(provider_id, &id);
 
-    let mut attrs = item.attributes;
-    attrs
-        .entry(ATTR_PROVIDER.to_string())
-        .or_insert_with(|| provider_id.to_string());
-
-    let meta = ItemMeta {
-        id,
-        provider_id: provider_id.to_string(),
-        label: item.label,
-        attributes: attrs,
-        created: Some(std::time::SystemTime::now()),
-        modified: Some(std::time::SystemTime::now()),
-        locked: false,
-    };
+    let meta = ItemMeta::from_new_item(id, provider_id.to_string(), &item);
 
     if let Err(e) = state.insert_created_item(&item_path, meta).await {
         tracing::warn!(error = %e, "failed to register deferred item in cache");
