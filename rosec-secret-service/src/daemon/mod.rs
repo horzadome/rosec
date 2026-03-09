@@ -21,3 +21,14 @@ pub use management::{
 };
 pub use search::RosecSearch;
 pub use secrets::RosecSecrets;
+
+use tracing::debug;
+use zbus::message::Header;
+
+/// Log the D-Bus caller at debug level.
+///
+/// Shared across all daemon sub-interfaces to avoid per-module copies.
+pub(crate) fn log_dbus_caller(context: &str, method: &str, header: &Header<'_>) {
+    let sender = header.sender().map(|s| s.as_str()).unwrap_or("<unknown>");
+    debug!(method, sender, context, "D-Bus call");
+}

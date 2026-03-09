@@ -2,20 +2,14 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use futures_util::StreamExt as _;
-use tracing::debug;
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
 use zbus::message::Header;
 use zvariant::OwnedFd;
 
+use super::log_dbus_caller;
 use crate::state::ServiceState;
 use crate::unlock::{auth_provider_with_tty, unlock_with_tty};
-
-/// Log the D-Bus caller at debug level for a management method.
-fn log_caller(method: &str, header: &Header<'_>) {
-    let sender = header.sender().map(|s| s.as_str()).unwrap_or("<unknown>");
-    debug!(method, sender, "D-Bus management call");
-}
 
 pub struct RosecManagement {
     pub(super) state: Arc<ServiceState>,
@@ -30,7 +24,7 @@ impl RosecManagement {
 #[interface(name = "org.rosec.Daemon")]
 impl RosecManagement {
     fn status(&self, #[zbus(header)] header: Header<'_>) -> Result<DaemonStatus, FdoError> {
-        log_caller("Status", &header);
+        log_dbus_caller("management", "Status", &header);
         let cache_size = self
             .state
             .items
@@ -67,7 +61,7 @@ impl RosecManagement {
     /// caller only asks for a cache refresh.  Uses `try_sync_provider` so
     /// concurrent in-flight syncs are skipped rather than serialised.
     async fn refresh(&self, #[zbus(header)] header: Header<'_>) -> Result<u32, FdoError> {
-        log_caller("Refresh", &header);
+        log_dbus_caller("management", "Refresh", &header);
 
         // Kick off a sync for every unlocked provider so that lifecycle callbacks
         // (SSH key rebuild, etc.) are triggered.  Errors are logged but do not
@@ -97,7 +91,7 @@ impl RosecManagement {
         provider_id: &str,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<u32, FdoError> {
-        log_caller("SyncProvider", &header);
+        log_dbus_caller("management", "SyncProvider", &header);
         self.state.sync_provider(provider_id).await
     }
 
@@ -110,7 +104,7 @@ impl RosecManagement {
         &self,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<ProviderListEntry>, FdoError> {
-        log_caller("ProviderList", &header);
+        log_dbus_caller("management", "ProviderList", &header);
         let providers = self.state.providers_ordered();
         let mut entries = Vec::with_capacity(providers.len());
         for p in providers {
@@ -145,7 +139,7 @@ impl RosecManagement {
         provider_id: &str,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<AuthFieldInfo>, FdoError> {
-        log_caller("GetAuthFields", &header);
+        log_dbus_caller("management", "GetAuthFields", &header);
         use rosec_core::AuthFieldKind;
 
         let provider = match self.state.provider_by_id(provider_id) {
@@ -187,7 +181,7 @@ impl RosecManagement {
         provider_id: &str,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(String, Vec<AuthFieldInfo>), FdoError> {
-        log_caller("GetRegistrationInfo", &header);
+        log_dbus_caller("management", "GetRegistrationInfo", &header);
         use rosec_core::AuthFieldKind;
 
         let provider = match self.state.provider_by_id(provider_id) {
@@ -236,7 +230,7 @@ impl RosecManagement {
         tty_fd: OwnedFd,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<UnlockResultEntry>, FdoError> {
-        log_caller("UnlockWithTty", &header);
+        log_dbus_caller("management", "UnlockWithTty", &header);
 
         // Duplicate the tty fd so it survives the move into the Tokio task.
         use std::os::unix::io::AsRawFd as _;
@@ -304,7 +298,7 @@ impl RosecManagement {
         force: bool,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(), FdoError> {
-        log_caller("AuthProviderWithTty", &header);
+        log_dbus_caller("management", "AuthProviderWithTty", &header);
 
         use std::os::unix::io::AsRawFd as _;
         let raw: libc::c_int = unsafe { libc::dup(tty_fd.as_raw_fd()) };
@@ -369,7 +363,7 @@ impl RosecManagement {
         pipe_fd: OwnedFd,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<bool, FdoError> {
-        log_caller("AuthProviderFromPipe", &header);
+        log_dbus_caller("management", "AuthProviderFromPipe", &header);
 
         use std::os::unix::io::AsRawFd as _;
         let raw: libc::c_int = unsafe { libc::dup(pipe_fd.as_raw_fd()) };
@@ -459,7 +453,7 @@ impl RosecManagement {
         label: String,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<String, FdoError> {
-        log_caller("AddPassword", &header);
+        log_dbus_caller("management", "AddPassword", &header);
 
         // Wrap in Zeroizing at the D-Bus boundary so the password is scrubbed on drop.
         let password = zeroize::Zeroizing::new(password);
@@ -495,7 +489,7 @@ impl RosecManagement {
         entry_id: String,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(), FdoError> {
-        log_caller("RemovePassword", &header);
+        log_dbus_caller("management", "RemovePassword", &header);
 
         let provider = self
             .state
@@ -521,7 +515,7 @@ impl RosecManagement {
         provider_id: String,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<PasswordEntry>, FdoError> {
-        log_caller("ListPasswords", &header);
+        log_dbus_caller("management", "ListPasswords", &header);
 
         let provider = self
             .state
@@ -560,7 +554,7 @@ impl RosecManagement {
         prompt_path: zvariant::ObjectPath<'_>,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<bool, FdoError> {
-        log_caller("CancelPrompt", &header);
+        log_dbus_caller("management", "CancelPrompt", &header);
         // cancel_prompt() sends SIGTERM to the child and removes it from the registry.
         // We check whether the path existed before calling it.
         let prompt_path = prompt_path.as_str();
@@ -593,7 +587,7 @@ impl RosecManagement {
         new_password_fd: OwnedFd,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(), FdoError> {
-        log_caller("ChangeProviderPassword", &header);
+        log_dbus_caller("management", "ChangeProviderPassword", &header);
 
         use std::os::unix::io::AsRawFd as _;
         let old_raw: libc::c_int = unsafe { libc::dup(old_password_fd.as_raw_fd()) };

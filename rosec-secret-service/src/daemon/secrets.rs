@@ -1,18 +1,12 @@
 use std::sync::Arc;
 
 use rosec_core::ProviderError;
-use tracing::debug;
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
 use zbus::message::Header;
 
+use super::log_dbus_caller;
 use crate::state::{ServiceState, map_provider_error};
-
-/// Log the D-Bus caller at debug level for a secrets-extension method.
-fn log_caller(method: &str, header: &Header<'_>) {
-    let sender = header.sender().map(|s| s.as_str()).unwrap_or("<unknown>");
-    debug!(method, sender, "D-Bus secrets-extension call");
-}
 
 pub struct RosecSecrets {
     pub(super) state: Arc<ServiceState>,
@@ -39,7 +33,7 @@ impl RosecSecrets {
         item_path: zvariant::ObjectPath<'_>,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<String>, FdoError> {
-        log_caller("GetSecretAttributeNames", &header);
+        log_dbus_caller("secrets", "GetSecretAttributeNames", &header);
         self.state.touch_activity();
 
         let (provider, item_id) = self.state.provider_and_id_for_path(item_path.as_str())?;
@@ -69,7 +63,7 @@ impl RosecSecrets {
         attr_name: &str,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<u8>, FdoError> {
-        log_caller("GetSecretAttribute", &header);
+        log_dbus_caller("secrets", "GetSecretAttribute", &header);
         self.state.touch_activity();
 
         let (provider, item_id) = self.state.provider_and_id_for_path(item_path.as_str())?;

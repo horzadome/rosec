@@ -9,6 +9,7 @@ use zbus::message::Header;
 use zvariant::OwnedObjectPath;
 
 use crate::crypto::aes128_cbc_encrypt;
+use crate::daemon::log_dbus_caller;
 use crate::prompt::SecretPrompt;
 use crate::session_iface::SecretSession;
 use crate::state::{ServiceState, map_provider_error, map_zbus_error};
@@ -18,12 +19,6 @@ use crate::state::{ServiceState, map_provider_error, map_zbus_error};
 ///
 /// Fields: `(session, parameters, value, content_type)`.
 pub(crate) type SecretStruct = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
-
-/// Log the D-Bus caller at debug level for a given method name.
-fn log_caller(method: &str, header: &Header<'_>) {
-    let sender = header.sender().map(|s| s.as_str()).unwrap_or("<unknown>");
-    debug!(method, sender, "D-Bus call");
-}
 
 /// Convert a string to an `OwnedObjectPath`, falling back to `"/"` on parse
 /// error.  `"/"` is always a valid D-Bus object path so the fallback cannot
@@ -60,7 +55,7 @@ impl SecretService {
         input: zvariant::Value<'_>,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(zvariant::Value<'static>, OwnedObjectPath), FdoError> {
-        log_caller("OpenSession", &header);
+        log_dbus_caller("service", "OpenSession", &header);
         let (output, path) = self
             .state
             .sessions
@@ -83,7 +78,7 @@ impl SecretService {
         attributes: HashMap<String, String>,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>), FdoError> {
-        log_caller("SearchItems", &header);
+        log_dbus_caller("service", "SearchItems", &header);
         self.state.touch_activity();
         // Per the Secret Service spec, SearchItems is a metadata-only operation
         // that MUST never error when providers are locked.  Items from locked
@@ -102,7 +97,7 @@ impl SecretService {
         session: zvariant::ObjectPath<'_>,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<HashMap<OwnedObjectPath, SecretStruct>, FdoError> {
-        log_caller("GetSecrets", &header);
+        log_dbus_caller("service", "GetSecrets", &header);
         self.state.touch_activity();
         let session = session.as_str();
         self.state.ensure_session(session)?;
@@ -156,7 +151,7 @@ impl SecretService {
         session: zvariant::ObjectPath<'_>,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(), FdoError> {
-        log_caller("CloseSession", &header);
+        log_dbus_caller("service", "CloseSession", &header);
         self.state
             .sessions
             .close_session(session.as_str())
@@ -168,7 +163,7 @@ impl SecretService {
         name: &str,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<OwnedObjectPath, FdoError> {
-        log_caller("ReadAlias", &header);
+        log_dbus_caller("service", "ReadAlias", &header);
         // Map "login" to "default" for gnome-keyring compatibility.
         // Many applications (e.g. Chrome, NetworkManager) request the
         // "login" alias which gnome-keyring uses for its auto-unlock
@@ -188,7 +183,7 @@ impl SecretService {
         _collection: zvariant::ObjectPath<'_>,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(), FdoError> {
-        log_caller("SetAlias", &header);
+        log_dbus_caller("service", "SetAlias", &header);
         // No-op: we always serve a single default collection and do not support
         // mutable aliases.  Returning NotSupported breaks clients (e.g. GNOME
         // apps) that call SetAlias as part of normal startup — silently succeed.
@@ -200,7 +195,7 @@ impl SecretService {
         objects: Vec<OwnedObjectPath>,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), FdoError> {
-        log_caller("Lock", &header);
+        log_dbus_caller("service", "Lock", &header);
         for provider in self.state.providers_ordered() {
             let pid = provider.id().to_string();
             self.state
@@ -219,7 +214,7 @@ impl SecretService {
         objects: Vec<OwnedObjectPath>,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath), FdoError> {
-        log_caller("Unlock", &header);
+        log_dbus_caller("service", "Unlock", &header);
 
         // Determine which providers are relevant based on the `objects` list.
         //
@@ -325,7 +320,7 @@ impl SecretService {
         alias: String,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), FdoError> {
-        log_caller("CreateCollection", &header);
+        log_dbus_caller("service", "CreateCollection", &header);
         // We don't support creating new collections, but returning NotSupported
         // breaks clients that call CreateCollection("", "default") at startup.
         // Return the existing default collection with no prompt needed, which
