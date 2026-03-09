@@ -271,6 +271,33 @@ pub struct ItemMeta {
     pub locked: bool,
 }
 
+impl ItemMeta {
+    /// Build cache-ready metadata from a newly created item.
+    ///
+    /// Stamps `rosec:provider` and (if present) `rosec:type` into the
+    /// attributes — these reserved attributes are managed by the service
+    /// layer, not supplied by callers.
+    pub fn from_new_item(id: String, provider_id: String, item: &NewItem) -> Self {
+        let mut attributes = item.attributes.clone();
+        attributes
+            .entry(ATTR_PROVIDER.to_string())
+            .or_insert_with(|| provider_id.clone());
+        if let Some(ref item_type) = item.item_type {
+            attributes.insert(ATTR_TYPE.to_string(), item_type.to_string());
+        }
+        let now = Some(SystemTime::now());
+        Self {
+            id,
+            provider_id,
+            label: item.label.clone(),
+            attributes,
+            created: now,
+            modified: now,
+            locked: false,
+        }
+    }
+}
+
 pub struct SecretBytes(Zeroizing<Vec<u8>>);
 
 impl SecretBytes {

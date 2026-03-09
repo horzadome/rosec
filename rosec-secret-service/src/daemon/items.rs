@@ -1,19 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rosec_core::{ATTR_PROVIDER, Capability, ItemMeta, ItemType, ItemUpdate, NewItem, SecretBytes};
-use tracing::{debug, info};
+use rosec_core::{ItemMeta, ItemType, ItemUpdate, NewItem, SecretBytes};
+use tracing::info;
 use zbus::fdo::Error as FdoError;
 use zbus::interface;
 use zbus::message::Header;
 
+use super::log_dbus_caller;
 use crate::state::{ServiceState, make_item_path, map_provider_error};
-
-/// Log the D-Bus caller at debug level for an items-extension method.
-fn log_caller(method: &str, header: &Header<'_>) {
-    let sender = header.sender().map(|s| s.as_str()).unwrap_or("<unknown>");
-    debug!(method, sender, "D-Bus items-extension call");
-}
 
 pub struct RosecItems {
     pub(super) state: Arc<ServiceState>,
@@ -50,7 +45,7 @@ impl RosecItems {
         replace: bool,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<String, FdoError> {
-        log_caller("CreateItemExtended", &header);
+        log_dbus_caller("items-extension", "CreateItemExtended", &header);
         self.state.touch_activity();
 
         let write_provider = self
@@ -96,21 +91,7 @@ impl RosecItems {
         info!(item_id = %id, provider = %provider_id, item_type = %item_type, "created item via D-Bus (extended)");
 
         let item_path = make_item_path(&provider_id, &id);
-
-        let mut attrs = item.attributes.clone();
-        attrs
-            .entry(ATTR_PROVIDER.to_string())
-            .or_insert_with(|| provider_id.clone());
-
-        let meta = ItemMeta {
-            id: id.clone(),
-            provider_id: provider_id.clone(),
-            label: item.label.clone(),
-            attributes: attrs,
-            created: Some(std::time::SystemTime::now()),
-            modified: Some(std::time::SystemTime::now()),
-            locked: false,
-        };
+        let meta = ItemMeta::from_new_item(id, provider_id, &item);
 
         self.state
             .insert_created_item(&item_path, meta)
@@ -138,17 +119,10 @@ impl RosecItems {
         secrets: HashMap<String, Vec<u8>>,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(), FdoError> {
-        log_caller("UpdateItem", &header);
+        log_dbus_caller("items-extension", "UpdateItem", &header);
         self.state.touch_activity();
 
-        let (provider, item_id) = self.state.provider_and_id_for_path(item_path)?;
-
-        // Verify the provider supports writes.
-        if !provider.capabilities().contains(&Capability::Write) {
-            return Err(FdoError::NotSupported(
-                "provider does not support writes".into(),
-            ));
-        }
+        let (provider, item_id) = self.state.writable_provider_for_path(item_path)?;
 
         let parsed_type = if item_type.is_empty() {
             None
@@ -171,6 +145,13 @@ impl RosecItems {
         } else {
             Some(attributes)
         };
+
+        // Capture values for cache patching before they are moved into
+        // `ItemUpdate`.  `label` and `item_path` are borrowed `&str` so
+        // they survive the move; `parsed_type` and `update_attrs` are owned
+        // and must be cloned.
+        let cache_type = parsed_type;
+        let cache_attrs = update_attrs.clone();
 
         let update_secrets = if secrets.is_empty() {
             None
@@ -200,6 +181,16 @@ impl RosecItems {
 
         info!(item_id = %item_id_for_log, provider = %provider_id, "updated item via D-Bus");
 
+        // Update the in-memory caches so searches reflect the change
+        // immediately without waiting for a full cache rebuild.
+        let cache_label = if label.is_empty() { None } else { Some(label) };
+        self.state.patch_cached_item(
+            item_path,
+            cache_label,
+            cache_type.as_ref(),
+            cache_attrs.as_ref(),
+        );
+
         Ok(())
     }
 
@@ -209,16 +200,10 @@ impl RosecItems {
         item_path: &str,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(), FdoError> {
-        log_caller("DeleteItem", &header);
+        log_dbus_caller("items-extension", "DeleteItem", &header);
         self.state.touch_activity();
 
-        let (provider, item_id) = self.state.provider_and_id_for_path(item_path)?;
-
-        if !provider.capabilities().contains(&Capability::Write) {
-            return Err(FdoError::NotSupported(
-                "provider does not support writes".into(),
-            ));
-        }
+        let (provider, item_id) = self.state.writable_provider_for_path(item_path)?;
 
         let provider_id = provider.id().to_string();
         let item_id_for_log = item_id.clone();
@@ -244,7 +229,7 @@ impl RosecItems {
         provider_id: &str,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<String>, FdoError> {
-        log_caller("GetCapabilities", &header);
+        log_dbus_caller("items-extension", "GetCapabilities", &header);
 
         let provider = if provider_id.is_empty() {
             self.state
@@ -271,7 +256,7 @@ impl RosecItems {
         provider_id: &str,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<String>, FdoError> {
-        log_caller("GetSupportedItemTypes", &header);
+        log_dbus_caller("items-extension", "GetSupportedItemTypes", &header);
 
         let provider = if provider_id.is_empty() {
             self.state

@@ -9,8 +9,8 @@ use rosec_core::config::{Config, PromptConfig};
 use rosec_core::dedup::is_stale;
 use rosec_core::router::Router;
 use rosec_core::{
-    ATTR_PROVIDER, Attributes, AutoLockPolicy, Capability, ItemMeta, Provider, ProviderError,
-    SecretBytes, UnlockInput,
+    ATTR_PROVIDER, ATTR_TYPE, Attributes, AutoLockPolicy, Capability, ItemMeta, ItemType, Provider,
+    ProviderError, SecretBytes, UnlockInput,
 };
 use tracing::{debug, info, warn};
 use zbus::Connection;
@@ -371,6 +371,24 @@ impl ServiceState {
         let provider = self
             .provider_by_id(&provider_id)
             .ok_or_else(|| FdoError::Failed(format!("provider '{provider_id}' not found")))?;
+        Ok((provider, item_id))
+    }
+
+    /// Resolve an item path to its provider and item ID, verifying the
+    /// provider supports writes.
+    ///
+    /// Combines [`provider_and_id_for_path`] with a [`Capability::Write`]
+    /// check.
+    pub fn writable_provider_for_path(
+        &self,
+        item_path: &str,
+    ) -> Result<(Arc<dyn Provider>, String), FdoError> {
+        let (provider, item_id) = self.provider_and_id_for_path(item_path)?;
+        if !provider.capabilities().contains(&Capability::Write) {
+            return Err(FdoError::NotSupported(
+                "provider does not support writes".into(),
+            ));
+        }
         Ok((provider, item_id))
     }
 
@@ -1542,6 +1560,50 @@ impl ServiceState {
         // 4. Register the D-Bus object so GetSecret works on the new path.
         self.register_items(&[(path.to_string(), meta)]).await?;
         Ok(())
+    }
+
+    /// Patch the cached metadata for an existing item after an `UpdateItem`
+    /// call so that searches reflect changes immediately.
+    ///
+    /// Only non-`None` fields are applied.  The `rosec:type` attribute is
+    /// stamped when `item_type` is provided, mirroring the provider-level
+    /// stamping done inside `LocalVault::update_item`.
+    pub(crate) fn patch_cached_item(
+        &self,
+        path: &str,
+        label: Option<&str>,
+        item_type: Option<&ItemType>,
+        attributes: Option<&HashMap<String, String>>,
+    ) {
+        let patch = |meta: &mut ItemMeta| {
+            if let Some(l) = label {
+                meta.label = l.to_string();
+            }
+            if let Some(attrs) = attributes {
+                meta.attributes = attrs.clone();
+                // Re-stamp provider since caller-supplied attributes won't
+                // include reserved attrs.
+                meta.attributes
+                    .entry(ATTR_PROVIDER.to_string())
+                    .or_insert_with(|| meta.provider_id.clone());
+            }
+            if let Some(it) = item_type {
+                meta.attributes
+                    .insert(ATTR_TYPE.to_string(), it.to_string());
+            }
+            meta.modified = Some(std::time::SystemTime::now());
+        };
+
+        if let Ok(mut items) = self.items.lock()
+            && let Some(meta) = items.get_mut(path)
+        {
+            patch(meta);
+        }
+        if let Ok(mut cache) = self.metadata_cache.lock()
+            && let Some(meta) = cache.get_mut(path)
+        {
+            patch(meta);
+        }
     }
 
     /// Remove a deleted item from both the `items` and `metadata_cache`
