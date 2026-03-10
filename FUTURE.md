@@ -125,6 +125,77 @@ rosec status
 
 ---
 
+## XDG Desktop Portal Secret backend (`org.freedesktop.impl.portal.Secret`)
+
+### Background
+
+The [XDG Desktop Portal](https://flatpak.github.io/xdg-desktop-portal/) is a
+D-Bus framework that lets sandboxed apps (Flatpak, Snap) access host services
+through portal interfaces.  The `org.freedesktop.portal.Secret` portal
+(frontend) delegates to an implementation backend
+(`org.freedesktop.impl.portal.Secret`) to retrieve a per-application master
+secret that apps use to derive their own encryption keys.
+
+The portal interface has exactly one method:
+
+```xml
+org.freedesktop.impl.portal.Secret.RetrieveSecret(
+    IN  handle      ObjectPath,
+    IN  app_id      String,
+    IN  fd          UnixFD,
+    IN  options     Dict<String, Variant>,
+    OUT response    UInt32,
+    OUT results     Dict<String, Variant>
+)
+```
+
+The implementation writes a stable, per-`app_id` secret to the passed file
+descriptor.  The app never learns the master vault password — it only receives
+a derived key unique to its `app_id`.
+
+### Why rosec should implement this
+
+- **Flatpak apps** (e.g. GNOME Secrets, Firefox Flatpak) use this portal to
+  bootstrap their encrypted storage.  Without a portal backend, these apps
+  either fall back to plaintext or fail to initialize their secret stores.
+- gnome-keyring-daemon provides this via `oo7-portal` (a separate binary).
+  Dropping gnome-keyring without replacing the portal backend breaks Flatpak
+  apps that depend on it.
+- The implementation is trivial: derive a stable per-app secret (e.g.
+  `HKDF(vault_key, app_id)`) and write it to the file descriptor.  oo7's
+  implementation is ~100 lines.
+- `cargo:libsecret` (Cargo's built-in credential helper) already talks to
+  `org.freedesktop.secrets` directly, so the portal is NOT needed for Cargo.
+  This is specifically for sandboxed Flatpak/Snap apps.
+
+### Implementation sketch
+
+1. A new D-Bus interface `org.freedesktop.impl.portal.Secret` registered on
+   the session bus (same `rosecd` process, or a small companion binary
+   activated via D-Bus).
+2. On `RetrieveSecret`: check that the vault is unlocked, derive
+   `HKDF-SHA256(vault_key, info=app_id)` → 64-byte secret, write to `fd`.
+3. Ship a `.portal` file so `xdg-desktop-portal` discovers rosec as the
+   Secret portal backend:
+   ```ini
+   [portal]
+   DBusName=org.freedesktop.secrets
+   Interfaces=org.freedesktop.impl.portal.Secret
+   ```
+
+### Effort estimate
+
+Low — single method, no complex state.  The HKDF derivation and fd write are
+straightforward.  Main work is D-Bus activation plumbing and integration
+testing with a Flatpak app.
+
+### Status
+
+- **Not started** — low priority, implement when Flatpak app compatibility
+  becomes a user request.
+
+---
+
 ## SSH Agent (`rosec-ssh-agent`)
 
 ### Motivation
