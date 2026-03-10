@@ -244,6 +244,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rosec-${{ matrix.target }}
+          retention-days: 1
           path: |
             rosec-*.tar.gz
             rosec-*.tar.gz.sha256
@@ -350,6 +351,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rosec-wasm-providers
+          retention-days: 1
           path: |
             rosec-provider-*.wasm.tar.gz
             rosec-provider-*.wasm.tar.gz.sha256
@@ -392,6 +394,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rosec-sbom
+          retention-days: 1
           path: rosec-*.sbom.cdx.json
           if-no-files-found: error
 
