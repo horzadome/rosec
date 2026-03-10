@@ -849,21 +849,12 @@ impl ServiceState {
         }
 
         // ── Resolve rosec-prompt binary ────────────────────────────────────
-        // Snapshot prompt config under the lock so we use a consistent view
-        // for both the binary path and the JSON theme payload.
-        let prompt_cfg = self
-            .prompt_config
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-        let program = match prompt_cfg.backend.as_str() {
-            "builtin" | "" => resolve_prompt_binary(),
-            custom => custom.to_string(),
-        };
-
-        let has_display =
-            std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
-        let has_tty = std::path::Path::new("/dev/tty").exists();
+        let PromptEnv {
+            cfg: prompt_cfg,
+            program,
+            has_display,
+            has_tty,
+        } = self.resolve_prompt_env();
 
         // ── 2 & 3. GUI or TTY via rosec-prompt ────────────────────────────
         if has_display || has_tty {
@@ -998,6 +989,29 @@ impl ServiceState {
         )))
     }
 
+    /// Snapshot the prompt configuration and resolve the binary path and
+    /// display environment in one place.
+    fn resolve_prompt_env(&self) -> PromptEnv {
+        let cfg = self
+            .prompt_config
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let program = match cfg.backend.as_str() {
+            "builtin" | "" => resolve_prompt_binary(),
+            custom => custom.to_string(),
+        };
+        let has_display =
+            std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
+        let has_tty = std::path::Path::new("/dev/tty").exists();
+        PromptEnv {
+            cfg,
+            program,
+            has_display,
+            has_tty,
+        }
+    }
+
     /// Launch `rosec-prompt` (or SSH_ASKPASS / built-in TTY) with arbitrary
     /// fields and return the full response map.
     ///
@@ -1024,20 +1038,12 @@ impl ServiceState {
 
         tracing::debug!(%prompt_path, %title, "spawn_prompt_fields called");
 
-        // Snapshot prompt config for binary path and theme.
-        let prompt_cfg = self
-            .prompt_config
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-        let program = match prompt_cfg.backend.as_str() {
-            "builtin" | "" => resolve_prompt_binary(),
-            custom => custom.to_string(),
-        };
-
-        let has_display =
-            std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
-        let has_tty = std::path::Path::new("/dev/tty").exists();
+        let PromptEnv {
+            cfg: prompt_cfg,
+            program,
+            has_display,
+            has_tty,
+        } = self.resolve_prompt_env();
 
         if !has_display && !has_tty {
             return Err(FdoError::Failed(
@@ -2078,6 +2084,14 @@ impl ServiceState {
 // Prompt helpers (module-private)
 // ---------------------------------------------------------------------------
 
+/// Resolved prompt environment: config snapshot, binary path, display state.
+struct PromptEnv {
+    cfg: PromptConfig,
+    program: String,
+    has_display: bool,
+    has_tty: bool,
+}
+
 /// Find the `rosec-prompt` binary next to the current executable or on PATH.
 fn resolve_prompt_binary() -> String {
     // Prefer a sibling binary in the same directory (installed layout).
@@ -2098,7 +2112,7 @@ fn resolve_prompt_binary() -> String {
 /// theme, but deliberately excludes the field values (those come back).
 fn build_prompt_json(provider_id: String, label: &str, cfg: &PromptConfig) -> String {
     use serde_json::{Value, json};
-    let theme = &cfg.theme;
+    let theme = serde_json::to_value(&cfg.theme).unwrap_or_default();
     let req: Value = json!({
         "title": label,
         "message": "",
@@ -2114,22 +2128,7 @@ fn build_prompt_json(provider_id: String, label: &str, cfg: &PromptConfig) -> St
                 "placeholder": "",
             }
         ],
-        "theme": {
-            "background":         theme.background,
-            "foreground":         theme.foreground,
-            "border_color":       theme.border_color,
-            "border_width":       theme.border_width,
-            "font_family":        theme.font_family,
-            "label_color":        theme.label_color,
-            "accent_color":       theme.accent_color,
-            "confirm_background": theme.confirm_background,
-            "confirm_text":       theme.confirm_text,
-            "cancel_background":  theme.cancel_background,
-            "cancel_text":        theme.cancel_text,
-            "input_background":   theme.input_background,
-            "input_text":         theme.input_text,
-            "font_size":          theme.font_size,
-        }
+        "theme": theme,
     });
     req.to_string()
 }
@@ -2144,7 +2143,7 @@ fn build_prompt_fields_json(
     cfg: &PromptConfig,
 ) -> String {
     use serde_json::{Value, json};
-    let theme = &cfg.theme;
+    let theme = serde_json::to_value(&cfg.theme).unwrap_or_default();
     let req: Value = json!({
         "title": title,
         "message": "",
@@ -2153,22 +2152,7 @@ fn build_prompt_fields_json(
         "confirm_label": "Submit",
         "cancel_label": "Cancel",
         "fields": fields,
-        "theme": {
-            "background":         theme.background,
-            "foreground":         theme.foreground,
-            "border_color":       theme.border_color,
-            "border_width":       theme.border_width,
-            "font_family":        theme.font_family,
-            "label_color":        theme.label_color,
-            "accent_color":       theme.accent_color,
-            "confirm_background": theme.confirm_background,
-            "confirm_text":       theme.confirm_text,
-            "cancel_background":  theme.cancel_background,
-            "cancel_text":        theme.cancel_text,
-            "input_background":   theme.input_background,
-            "input_text":         theme.input_text,
-            "font_size":          theme.font_size,
-        }
+        "theme": theme,
     });
     req.to_string()
 }

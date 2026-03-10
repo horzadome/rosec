@@ -140,7 +140,6 @@ impl RosecManagement {
         #[zbus(header)] header: Header<'_>,
     ) -> Result<Vec<AuthFieldInfo>, FdoError> {
         log_dbus_caller("management", "GetAuthFields", &header);
-        use rosec_core::AuthFieldKind;
 
         let provider = match self.state.provider_by_id(provider_id) {
             Some(b) => b,
@@ -154,11 +153,7 @@ impl RosecManagement {
         let field_to_info = |f: &rosec_core::AuthField| AuthFieldInfo {
             id: f.id.to_string(),
             label: f.label.to_string(),
-            kind: match f.kind {
-                AuthFieldKind::Text => "text".to_string(),
-                AuthFieldKind::Password => "password".to_string(),
-                AuthFieldKind::Secret => "secret".to_string(),
-            },
+            kind: f.kind.to_string(),
             placeholder: f.placeholder.to_string(),
             required: f.required,
         };
@@ -182,7 +177,6 @@ impl RosecManagement {
         #[zbus(header)] header: Header<'_>,
     ) -> Result<(String, Vec<AuthFieldInfo>), FdoError> {
         log_dbus_caller("management", "GetRegistrationInfo", &header);
-        use rosec_core::AuthFieldKind;
 
         let provider = match self.state.provider_by_id(provider_id) {
             Some(b) => b,
@@ -203,11 +197,7 @@ impl RosecManagement {
             .map(|f| AuthFieldInfo {
                 id: f.id.to_string(),
                 label: f.label.to_string(),
-                kind: match f.kind {
-                    AuthFieldKind::Text => "text".to_string(),
-                    AuthFieldKind::Password => "password".to_string(),
-                    AuthFieldKind::Secret => "secret".to_string(),
-                },
+                kind: f.kind.to_string(),
                 placeholder: f.placeholder.to_string(),
                 required: f.required,
             })

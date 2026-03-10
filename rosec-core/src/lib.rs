@@ -362,6 +362,16 @@ pub enum AuthFieldKind {
     Secret,
 }
 
+impl std::fmt::Display for AuthFieldKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Text => "text",
+            Self::Password => "password",
+            Self::Secret => "secret",
+        })
+    }
+}
+
 /// Describes a single credential field that a provider needs for `unlock`.
 ///
 /// Providers return a static slice of `AuthField` from `auth_fields()`.  The

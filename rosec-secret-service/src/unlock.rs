@@ -551,7 +551,7 @@ async fn auth_provider_with_tty_inner(
             .map(|f| TtyField {
                 id: f.id.to_string(),
                 label: f.label.to_string(),
-                kind: auth_field_kind_str(&f.kind),
+                kind: f.kind.to_string(),
                 placeholder: f.placeholder.to_string(),
             })
             .collect();
@@ -597,7 +597,7 @@ pub(crate) fn provider_auth_fields(provider: &dyn rosec_core::Provider) -> Vec<T
     let mut fields = vec![TtyField {
         id: pw.id.to_string(),
         label: pw.label.to_string(),
-        kind: auth_field_kind_str(&pw.kind),
+        kind: pw.kind.to_string(),
         placeholder: pw.placeholder.to_string(),
     }];
     // Exclude any auth_fields entry that duplicates the password field
@@ -610,19 +610,11 @@ pub(crate) fn provider_auth_fields(provider: &dyn rosec_core::Provider) -> Vec<T
             .map(|f| TtyField {
                 id: f.id.to_string(),
                 label: f.label.to_string(),
-                kind: auth_field_kind_str(&f.kind),
+                kind: f.kind.to_string(),
                 placeholder: f.placeholder.to_string(),
             }),
     );
     fields
-}
-
-pub(crate) fn auth_field_kind_str(kind: &rosec_core::AuthFieldKind) -> String {
-    match kind {
-        rosec_core::AuthFieldKind::Text => "text".to_string(),
-        rosec_core::AuthFieldKind::Password => "password".to_string(),
-        rosec_core::AuthFieldKind::Secret => "secret".to_string(),
-    }
 }
 
 /// Write a string to the fd (best-effort; errors are silently ignored since
