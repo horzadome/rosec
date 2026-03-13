@@ -1619,3 +1619,38 @@ pub fn auth_fields(_input: ()) -> FnResult<Json<AuthFieldsResponse>> {
     // beyond the primary password (e.g. 2FA tokens).
     Ok(Json(AuthFieldsResponse { fields: vec![] }))
 }
+
+/// Return readiness probes for host-side connectivity checks.
+///
+/// The host evaluates these natively (no WASM involved) before calling
+/// network-facing functions like `unlock`, `sync`, or
+/// `check_remote_changed`.  This prevents DNS/TLS failures from causing
+/// WASM traps that corrupt the plugin's internal state.
+///
+/// For Bitwarden PM, the identity server is the first endpoint hit during
+/// unlock (prelogin + login).  If it's unreachable, there's no point
+/// attempting the call.
+#[plugin_fn]
+pub fn readiness_probes(_input: ()) -> FnResult<Json<ReadinessProbesResponse>> {
+    let guard = STATE.lock();
+
+    let Some(state) = guard.as_ref() else {
+        // Not initialised yet — no probes to declare.
+        return Ok(Json(ReadinessProbesResponse { probes: vec![] }));
+    };
+
+    // Probe the identity server's well-known alive endpoint.
+    // Bitwarden identity servers (cloud and self-hosted) respond to
+    // GET/HEAD on the root or /.well-known/openid-configuration.
+    // We use the root with an expected 200 — lightest possible check.
+    let identity_url = format!("{}/.well-known/openid-configuration", state.config.urls.identity_url);
+
+    Ok(Json(ReadinessProbesResponse {
+        probes: vec![ReadinessProbe::Http {
+            url: identity_url,
+            method: "HEAD".to_string(),
+            expected_status: 200,
+            timeout_secs: 5,
+        }],
+    }))
+}

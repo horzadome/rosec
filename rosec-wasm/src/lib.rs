@@ -24,6 +24,7 @@
 //! | `registration_info`      | *(empty)*                | `RegistrationInfoResponse`   |
 //! | `auth_fields`            | *(empty)*                | `AuthFieldsResponse`         |
 //! | `attribute_descriptors`  | *(empty)*                | `AttributeDescriptorsResponse` |
+//! | `readiness_probes`       | *(empty)*                | `ReadinessProbesResponse`    |
 //! | `capabilities`           | *(empty)*                | `CapabilitiesResponse`       |
 
 pub mod discovery;

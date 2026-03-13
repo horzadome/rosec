@@ -1,6 +1,7 @@
 //! `WasmProvider` — wraps an Extism WASM plugin as a `rosec_core::Provider`.
 
 use std::collections::HashMap;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -9,7 +10,7 @@ use extism::{Manifest, Plugin, Wasm};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use zeroize::{Zeroize, Zeroizing};
 
 use rosec_core::{
@@ -69,6 +70,8 @@ pub struct WasmProviderConfig {
 pub struct WasmProvider {
     config: WasmProviderConfig,
     plugin: Mutex<Plugin>,
+    /// Stored manifest for plugin recreation after a WASM trap.
+    manifest: Manifest,
     /// Capabilities queried once from the guest at construction time.
     /// Leaked so we can return `&'static [Capability]` from the trait.
     capabilities: &'static [Capability],
@@ -79,13 +82,11 @@ pub struct WasmProvider {
     auth_fields: &'static [AuthField],
     /// Registration info queried once from the guest at construction time.
     registration_info: Option<RegistrationInfo>,
-    /// Callbacks registered by the daemon — stored here so we can fire them
-    /// from the host side when the guest reports state changes.
+    /// Readiness probes queried once from the guest after init.
+    readiness_probes: Vec<crate::protocol::ReadinessProbe>,
+    /// Callbacks registered by the daemon
     callbacks: std::sync::RwLock<ProviderCallbacks>,
     /// Cached timestamp of the last successful sync.
-    ///
-    /// Updated after `unlock` and `sync` calls succeed.  Queried by
-    /// `last_synced_at()` (synchronous) for the delta-sync check.
     last_sync_time: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
 }
 
@@ -151,6 +152,9 @@ impl WasmProvider {
             "WASM manifest configured",
         );
 
+        // Clone the manifest before consuming it so we can recreate the
+        // plugin after a WASM trap (which corrupts the instance).
+        let manifest = manifest;
         let mut plugin = Plugin::new(&manifest, [], true).map_err(|e| {
             ProviderError::Other(anyhow::anyhow!(
                 "failed to load WASM plugin '{}': {e}",
@@ -199,7 +203,7 @@ impl WasmProvider {
             provider_name: config.name.clone(),
             options,
         };
-        let init_resp: InitResponse = call_guest_json(&mut plugin, "init", &init_req)?;
+        let init_resp: InitResponse = call_guest_json(&mut plugin, "init", &init_req).0?;
         if !init_resp.ok {
             return Err(ProviderError::Other(anyhow::anyhow!(
                 "WASM plugin init failed: {}",
@@ -213,6 +217,7 @@ impl WasmProvider {
         let attribute_descriptors = query_attribute_descriptors(&mut plugin, &config.id);
         let auth_fields = query_auth_fields(&mut plugin, &config.id);
         let registration_info = query_registration_info(&mut plugin, &config.id);
+        let readiness_probes = query_readiness_probes(&mut plugin, &config.id);
 
         debug!(
             provider = %config.id,
@@ -220,19 +225,223 @@ impl WasmProvider {
             attrs = attribute_descriptors.len(),
             auth = auth_fields.len(),
             reg = registration_info.is_some(),
+            probes = readiness_probes.len(),
             "WASM provider initialised",
         );
 
         Ok(Self {
             config,
             plugin: Mutex::new(plugin),
+            manifest,
             capabilities,
             attribute_descriptors,
             auth_fields,
             registration_info,
+            readiness_probes,
             callbacks: std::sync::RwLock::new(ProviderCallbacks::default()),
             last_sync_time: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Recreate the WASM plugin from the stored manifest after a trap.
+    ///
+    /// After a WASM trap (timeout, OOM, host function error, guest panic),
+    /// the plugin's linear memory and globals are left in a corrupted state.
+    /// Extism's `Plugin::reset()` only clears allocation metadata, not the
+    /// actual WASM memory.  The only reliable recovery is to create a fresh
+    /// Plugin instance and re-run `init`.
+    ///
+    /// The recreated plugin starts in a locked state (no auth).
+    fn recreate_plugin(
+        manifest: &Manifest,
+        config: &WasmProviderConfig,
+    ) -> Result<Plugin, ProviderError> {
+        let mut plugin = Plugin::new(manifest, [], true).map_err(|e| {
+            ProviderError::Other(anyhow::anyhow!(
+                "failed to recreate WASM plugin '{}': {e}",
+                config.wasm_path,
+            ))
+        })?;
+
+        // Re-run init with the same config.
+        let mut options = config.options.clone();
+        if !options.contains_key("home_dir")
+            && let Ok(home) = std::env::var("HOME")
+        {
+            options.insert("home_dir".into(), serde_json::Value::String(home));
+        }
+
+        let init_req = crate::protocol::InitRequest {
+            provider_id: config.id.clone(),
+            provider_name: config.name.clone(),
+            options,
+        };
+        let init_resp: crate::protocol::InitResponse =
+            call_guest_json(&mut plugin, "init", &init_req).0?;
+        if !init_resp.ok {
+            return Err(ProviderError::Other(anyhow::anyhow!(
+                "WASM plugin re-init failed: {}",
+                init_resp.error.unwrap_or_else(|| "unknown error".into()),
+            )));
+        }
+
+        Ok(plugin)
+    }
+
+    /// Recreate the plugin after a failed `plugin.call()`.
+    ///
+    /// In the Extism protocol, guest application errors (wrong password,
+    /// not found, etc.) are returned as `Ok` responses with `resp.ok == false`
+    /// in the JSON body.  An `Err` from `plugin.call()` only occurs when
+    /// something went wrong at the WASM execution level: a trap (timeout,
+    /// OOM, host function error, guest panic), a serialization failure, or
+    /// a missing function.
+    ///
+    /// In all of these cases the plugin's linear memory and globals may be
+    /// in an undefined state.  Rather than trying to classify which errors
+    /// are "real" traps via brittle string matching on wasmtime internals,
+    /// we unconditionally recreate the plugin after any `plugin.call()`
+    /// failure.  This is safe because:
+    ///
+    /// - The plugin restarts in a clean locked state (same as fresh boot)
+    /// - Serialization / missing-function errors won't be fixed by retrying
+    ///   with the same plugin anyway
+    /// - The cost (~50-100ms) is acceptable for an error path
+    fn recreate_after_call_error(&self, plugin: &mut Plugin, err: &ProviderError) {
+        warn!(
+            provider = %self.config.id,
+            error = %err,
+            "WASM plugin call failed, recreating instance",
+        );
+        match Self::recreate_plugin(&self.manifest, &self.config) {
+            Ok(new_plugin) => {
+                *plugin = new_plugin;
+                debug!(
+                    provider = %self.config.id,
+                    "plugin instance recreated successfully (now locked)",
+                );
+            }
+            Err(recreate_err) => {
+                error!(
+                    provider = %self.config.id,
+                    "failed to recreate plugin: {recreate_err}",
+                );
+            }
+        }
+    }
+
+    /// Call a guest function with JSON input, recreating the plugin if
+    /// `plugin.call()` failed (indicating a WASM trap or execution error).
+    fn call_json<I: Serialize, O: serde::de::DeserializeOwned>(
+        &self,
+        plugin: &mut Plugin,
+        func: &str,
+        input: &I,
+    ) -> Result<O, ProviderError> {
+        let (result, outcome) = call_guest_json(plugin, func, input);
+        if outcome == CallOutcome::PluginCallFailed
+            && let Err(ref e) = result
+        {
+            self.recreate_after_call_error(plugin, e);
+        }
+        result
+    }
+
+    /// Call a guest function with sensitive JSON input, recreating the
+    /// plugin if `plugin.call()` failed.  Zeroizes the serialized input
+    /// regardless of success or failure.
+    fn call_json_sensitive<I: Serialize, O: serde::de::DeserializeOwned>(
+        &self,
+        plugin: &mut Plugin,
+        func: &str,
+        input: &I,
+    ) -> Result<O, ProviderError> {
+        let (result, outcome) = call_guest_json_sensitive(plugin, func, input);
+        if outcome == CallOutcome::PluginCallFailed
+            && let Err(ref e) = result
+        {
+            self.recreate_after_call_error(plugin, e);
+        }
+        result
+    }
+
+    /// Call a guest function with no input, recreating the plugin if
+    /// `plugin.call()` failed.
+    fn call_json_no_input<O: serde::de::DeserializeOwned>(
+        &self,
+        plugin: &mut Plugin,
+        func: &str,
+    ) -> Result<O, ProviderError> {
+        let (result, outcome) = call_guest_json_no_input(plugin, func);
+        if outcome == CallOutcome::PluginCallFailed
+            && let Err(ref e) = result
+        {
+            self.recreate_after_call_error(plugin, e);
+        }
+        result
+    }
+
+    /// Evaluate all readiness probes before attempting unlock.
+    ///
+    /// Each probe is checked against the manifest's `allowed_hosts` and
+    /// executed natively (no WASM involvement).  Uses exponential backoff
+    /// if any probe fails.
+    ///
+    /// Returns `Ok(())` when all probes pass, or `Err` if `max_attempts`
+    /// is exhausted.
+    async fn wait_for_readiness(&self) -> Result<(), ProviderError> {
+        if self.readiness_probes.is_empty() {
+            return Ok(());
+        }
+
+        const MAX_ATTEMPTS: u32 = 8;
+        let initial_delay = Duration::from_millis(500);
+        let max_delay = Duration::from_secs(30);
+        let mut delay = initial_delay;
+
+        let allowed_hosts = self.manifest.allowed_hosts.as_deref().unwrap_or_default();
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let mut all_ready = true;
+            let mut last_failure = String::new();
+
+            for probe in &self.readiness_probes {
+                match evaluate_probe(probe, allowed_hosts) {
+                    Ok(()) => {}
+                    Err(reason) => {
+                        all_ready = false;
+                        last_failure = reason;
+                        break;
+                    }
+                }
+            }
+
+            if all_ready {
+                if attempt > 1 {
+                    debug!(
+                        provider = %self.config.id,
+                        attempt,
+                        "all readiness probes passed",
+                    );
+                }
+                return Ok(());
+            }
+
+            debug!(
+                provider = %self.config.id,
+                attempt,
+                delay_ms = delay.as_millis() as u64,
+                reason = %last_failure,
+                "readiness probe failed, backing off",
+            );
+
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(max_delay);
+        }
+
+        Err(ProviderError::Unavailable(format!(
+            "readiness probes not satisfied after {MAX_ATTEMPTS} attempts"
+        )))
     }
 }
 
@@ -295,7 +504,7 @@ impl Provider for WasmProvider {
 
     async fn status(&self) -> Result<ProviderStatus, ProviderError> {
         let mut plugin = self.plugin.lock().await;
-        let resp: StatusResponse = call_guest_json_no_input(&mut plugin, "status")?;
+        let resp: StatusResponse = self.call_json_no_input(&mut plugin, "status")?;
         Ok(ProviderStatus {
             locked: resp.locked,
             last_sync: resp
@@ -305,6 +514,9 @@ impl Provider for WasmProvider {
     }
 
     async fn unlock(&self, input: UnlockInput) -> Result<(), ProviderError> {
+        // Wait for readiness probes before attempting unlock.
+        self.wait_for_readiness().await?;
+
         // Extract the password (needed for credential persistence key derivation).
         let password_ref: &Zeroizing<String> = match &input {
             UnlockInput::Password(pw) => pw,
@@ -350,7 +562,7 @@ impl Provider for WasmProvider {
         let mut plugin = self.plugin.lock().await;
 
         let result: Result<SimpleResponse, ProviderError> =
-            call_guest_json_sensitive(&mut plugin, "unlock", &req);
+            self.call_json_sensitive(&mut plugin, "unlock", &req);
 
         // If the guest requires registration and none was provided, try
         // loading stored credentials from a previous session.
@@ -382,7 +594,7 @@ impl Provider for WasmProvider {
                             };
 
                             let retry_result: Result<SimpleResponse, ProviderError> =
-                                call_guest_json_sensitive(&mut plugin, "unlock", &retry_req);
+                                self.call_json_sensitive(&mut plugin, "unlock", &retry_req);
 
                             retry_req.password.zeroize();
                             if let Some(ref mut fields) = retry_req.registration_fields {
@@ -492,7 +704,7 @@ impl Provider for WasmProvider {
 
     async fn lock(&self) -> Result<(), ProviderError> {
         let mut plugin = self.plugin.lock().await;
-        let resp: SimpleResponse = call_guest_json_no_input(&mut plugin, "lock")?;
+        let resp: SimpleResponse = self.call_json_no_input(&mut plugin, "lock")?;
         if resp.ok {
             if let Ok(cbs) = self.callbacks.read()
                 && let Some(ref cb) = cbs.on_locked
@@ -506,11 +718,12 @@ impl Provider for WasmProvider {
     }
 
     async fn sync(&self) -> Result<(), ProviderError> {
+        self.wait_for_readiness().await?;
         let mut plugin = self.plugin.lock().await;
         if !plugin.function_exists("sync") {
             return Err(ProviderError::NotSupported);
         }
-        let resp: SimpleResponse = call_guest_json_no_input(&mut plugin, "sync")?;
+        let resp: SimpleResponse = self.call_json_no_input(&mut plugin, "sync")?;
         if resp.ok {
             // Update the cached last-sync timestamp.
             if let Ok(mut guard) = self.last_sync_time.lock() {
@@ -534,7 +747,7 @@ impl Provider for WasmProvider {
 
     async fn list_items(&self) -> Result<Vec<ItemMeta>, ProviderError> {
         let mut plugin = self.plugin.lock().await;
-        let resp: ItemListResponse = call_guest_json_no_input(&mut plugin, "list_items")?;
+        let resp: ItemListResponse = self.call_json_no_input(&mut plugin, "list_items")?;
         if !resp.ok {
             return Err(map_guest_error(resp.error, resp.error_kind));
         }
@@ -550,7 +763,7 @@ impl Provider for WasmProvider {
             attributes: attrs.clone(),
         };
         let mut plugin = self.plugin.lock().await;
-        let resp: ItemListResponse = call_guest_json(&mut plugin, "search", &req)?;
+        let resp: ItemListResponse = self.call_json(&mut plugin, "search", &req)?;
         if !resp.ok {
             return Err(map_guest_error(resp.error, resp.error_kind));
         }
@@ -565,7 +778,7 @@ impl Provider for WasmProvider {
         let req = ItemIdRequest { id: id.to_owned() };
         let mut plugin = self.plugin.lock().await;
         let resp: ItemAttributesResponse =
-            call_guest_json(&mut plugin, "get_item_attributes", &req)?;
+            self.call_json(&mut plugin, "get_item_attributes", &req)?;
         if !resp.ok {
             return Err(map_guest_error(resp.error, resp.error_kind));
         }
@@ -581,7 +794,7 @@ impl Provider for WasmProvider {
             attr: attr.to_owned(),
         };
         let mut plugin = self.plugin.lock().await;
-        let resp: SecretAttrResponse = call_guest_json(&mut plugin, "get_secret_attr", &req)?;
+        let resp: SecretAttrResponse = self.call_json(&mut plugin, "get_secret_attr", &req)?;
         if !resp.ok {
             return Err(map_guest_error(resp.error, resp.error_kind));
         }
@@ -599,7 +812,7 @@ impl Provider for WasmProvider {
         if !plugin.function_exists("list_ssh_keys") {
             return Ok(Vec::new());
         }
-        let resp: SshKeyListResponse = call_guest_json_no_input(&mut plugin, "list_ssh_keys")?;
+        let resp: SshKeyListResponse = self.call_json_no_input(&mut plugin, "list_ssh_keys")?;
         if !resp.ok {
             return Err(map_guest_error(resp.error, resp.error_kind));
         }
@@ -619,7 +832,7 @@ impl Provider for WasmProvider {
             return Err(ProviderError::NotSupported);
         }
         let resp: SshPrivateKeyResponse =
-            call_guest_json(&mut plugin, "get_ssh_private_key", &req)?;
+            self.call_json(&mut plugin, "get_ssh_private_key", &req)?;
         if !resp.ok {
             return Err(map_guest_error(resp.error, resp.error_kind));
         }
@@ -650,6 +863,8 @@ impl Provider for WasmProvider {
             }
         };
 
+        self.wait_for_readiness().await?;
+
         let mut plugin = self.plugin.lock().await;
         if !plugin.function_exists("check_remote_changed") {
             // No guest support — assume changed (safe default).
@@ -661,7 +876,7 @@ impl Provider for WasmProvider {
         };
 
         let resp: crate::protocol::CheckRemoteChangedResponse =
-            call_guest_json(&mut plugin, "check_remote_changed", &req)?;
+            self.call_json(&mut plugin, "check_remote_changed", &req)?;
 
         if !resp.ok {
             // On guest error, assume changed so the host falls back to full sync.
@@ -681,7 +896,7 @@ fn query_capabilities(plugin: &mut Plugin, provider_id: &str) -> &'static [Capab
     if !plugin.function_exists("capabilities") {
         return &[];
     }
-    match call_guest_json_no_input::<CapabilitiesResponse>(plugin, "capabilities") {
+    match call_guest_json_no_input::<CapabilitiesResponse>(plugin, "capabilities").0 {
         Ok(resp) => {
             let caps: Vec<Capability> = resp
                 .capabilities
@@ -712,7 +927,9 @@ fn query_attribute_descriptors(
     match call_guest_json_no_input::<crate::protocol::AttributeDescriptorsResponse>(
         plugin,
         "attribute_descriptors",
-    ) {
+    )
+    .0
+    {
         Ok(resp) => {
             let descs: Vec<AttributeDescriptor> = resp
                 .descriptors
@@ -737,7 +954,7 @@ fn query_auth_fields(plugin: &mut Plugin, provider_id: &str) -> &'static [AuthFi
     if !plugin.function_exists("auth_fields") {
         return &[];
     }
-    match call_guest_json_no_input::<AuthFieldsResponse>(plugin, "auth_fields") {
+    match call_guest_json_no_input::<AuthFieldsResponse>(plugin, "auth_fields").0 {
         Ok(resp) => {
             let fields: Vec<AuthField> = resp.fields.into_iter().map(leak_auth_field).collect();
             if fields.is_empty() {
@@ -758,7 +975,7 @@ fn query_registration_info(plugin: &mut Plugin, provider_id: &str) -> Option<Reg
     if !plugin.function_exists("registration_info") {
         return None;
     }
-    match call_guest_json_no_input::<RegistrationInfoResponse>(plugin, "registration_info") {
+    match call_guest_json_no_input::<RegistrationInfoResponse>(plugin, "registration_info").0 {
         Ok(resp) if resp.has_registration => {
             let instructions: &'static str = resp
                 .instructions
@@ -783,27 +1000,181 @@ fn query_registration_info(plugin: &mut Plugin, provider_id: &str) -> Option<Reg
     }
 }
 
+/// Query readiness probes from the guest (called during `new()`).
+fn query_readiness_probes(
+    plugin: &mut Plugin,
+    provider_id: &str,
+) -> Vec<crate::protocol::ReadinessProbe> {
+    if !plugin.function_exists("readiness_probes") {
+        return Vec::new();
+    }
+    match call_guest_json_no_input::<crate::protocol::ReadinessProbesResponse>(
+        plugin,
+        "readiness_probes",
+    )
+    .0
+    {
+        Ok(resp) => {
+            debug!(
+                provider = %provider_id,
+                count = resp.probes.len(),
+                "queried readiness probes from guest",
+            );
+            resp.probes
+        }
+        Err(e) => {
+            warn!(provider = %provider_id, "readiness_probes call failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+// ── Readiness probe evaluation ───────────────────────────────────
+
+/// Check whether a probe target's hostname is in the allowed hosts list.
+///
+/// Uses the same glob matching as Extism's built-in HTTP host function.
+fn is_host_allowed(hostname: &str, allowed_hosts: &[String]) -> bool {
+    allowed_hosts
+        .iter()
+        .any(|pattern| match glob::Pattern::new(pattern) {
+            Ok(pat) => pat.matches(hostname),
+            Err(_) => pattern == hostname,
+        })
+}
+
+/// Evaluate a single readiness probe natively on the host.
+///
+/// Returns `Ok(())` if the probe passes, or `Err(reason)` with a
+/// human-readable explanation of why it failed.
+fn evaluate_probe(
+    probe: &crate::protocol::ReadinessProbe,
+    allowed_hosts: &[String],
+) -> Result<(), String> {
+    match probe {
+        crate::protocol::ReadinessProbe::Http {
+            url,
+            method,
+            expected_status,
+            timeout_secs,
+        } => {
+            // Parse URL and enforce allowed_hosts.
+            let parsed =
+                url::Url::parse(url).map_err(|e| format!("invalid probe URL '{url}': {e}"))?;
+            let host = parsed.host_str().unwrap_or_default();
+            if !is_host_allowed(host, allowed_hosts) {
+                return Err(format!("probe host '{host}' not in allowed_hosts"));
+            }
+
+            let timeout = Duration::from_secs(u64::from(*timeout_secs));
+            let agent = ureq::agent();
+            let req = ureq::http::request::Builder::new()
+                .method(method.to_uppercase().as_str())
+                .uri(url.as_str());
+            let config = agent
+                .configure_request(req.body(()).map_err(|e| format!("build request: {e}"))?)
+                .http_status_as_error(false);
+            let result = ureq::run(config.timeout_global(Some(timeout)).build());
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    if status == *expected_status {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "HTTP {method} {url}: got status {status}, expected {expected_status}"
+                        ))
+                    }
+                }
+                Err(e) => Err(format!("HTTP {method} {url}: {e}")),
+            }
+        }
+        crate::protocol::ReadinessProbe::Tcp {
+            host,
+            port,
+            timeout_secs,
+        } => {
+            // Enforce allowed_hosts.
+            if !is_host_allowed(host, allowed_hosts) {
+                return Err(format!("probe host '{host}' not in allowed_hosts"));
+            }
+
+            let timeout = Duration::from_secs(u64::from(*timeout_secs));
+            let addr = format!("{host}:{port}");
+            let socket_addr = addr
+                .to_socket_addrs()
+                .map_err(|e| format!("DNS resolution failed for {addr}: {e}"))?
+                .next()
+                .ok_or_else(|| format!("no addresses resolved for {addr}"))?;
+
+            TcpStream::connect_timeout(&socket_addr, timeout)
+                .map(|_| ())
+                .map_err(|e| format!("TCP connect to {addr}: {e}"))
+        }
+    }
+}
+
 // ── Guest call helpers ───────────────────────────────────────────
+
+/// Whether a `plugin.call()` failure occurred (as opposed to a
+/// serialization/deserialization error).
+///
+/// When `plugin.call()` fails, the WASM instance may be in a corrupted
+/// state (trap, timeout, OOM, host function error, guest panic).  The
+/// plugin should be recreated.  Serialization failures happen before or
+/// after the WASM call and do not affect the instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallOutcome {
+    /// No WASM call failure — the error (if any) is from serialization.
+    Clean,
+    /// `plugin.call()` returned an error — the instance may be corrupted.
+    PluginCallFailed,
+}
+
+/// Result of a guest call: the value or an error, plus whether the WASM
+/// call itself failed (requiring plugin recreation).
+type GuestCallResult<T> = (Result<T, ProviderError>, CallOutcome);
 
 /// Call a guest function with JSON input, deserialize JSON output.
 fn call_guest_json<I: Serialize, O: DeserializeOwned>(
     plugin: &mut Plugin,
     func: &str,
     input: &I,
-) -> Result<O, ProviderError> {
-    let input_bytes = serde_json::to_vec(input).map_err(|e| {
-        ProviderError::Other(anyhow::anyhow!("failed to serialize input for {func}: {e}"))
-    })?;
+) -> GuestCallResult<O> {
+    let input_bytes = match serde_json::to_vec(input) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                Err(ProviderError::Other(anyhow::anyhow!(
+                    "failed to serialize input for {func}: {e}"
+                ))),
+                CallOutcome::Clean,
+            );
+        }
+    };
 
-    let output_bytes: &[u8] = plugin
-        .call(func, &input_bytes)
-        .map_err(|e| ProviderError::Other(anyhow::anyhow!("WASM call to {func} failed: {e}")))?;
+    let output_bytes: &[u8] = match plugin.call(func, &input_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                Err(ProviderError::Other(anyhow::anyhow!(
+                    "WASM call to {func} failed: {e}"
+                ))),
+                CallOutcome::PluginCallFailed,
+            );
+        }
+    };
 
-    serde_json::from_slice(output_bytes).map_err(|e| {
-        ProviderError::Other(anyhow::anyhow!(
-            "failed to deserialize output from {func}: {e}"
-        ))
-    })
+    match serde_json::from_slice(output_bytes) {
+        Ok(val) => (Ok(val), CallOutcome::Clean),
+        Err(e) => (
+            Err(ProviderError::Other(anyhow::anyhow!(
+                "failed to deserialize output from {func}: {e}"
+            ))),
+            CallOutcome::Clean,
+        ),
+    }
 }
 
 /// Call a guest function with JSON input that may contain secrets.
@@ -815,42 +1186,72 @@ fn call_guest_json_sensitive<I: Serialize, O: DeserializeOwned>(
     plugin: &mut Plugin,
     func: &str,
     input: &I,
-) -> Result<O, ProviderError> {
-    let mut input_bytes = serde_json::to_vec(input).map_err(|e| {
-        ProviderError::Other(anyhow::anyhow!("failed to serialize input for {func}: {e}"))
-    })?;
+) -> GuestCallResult<O> {
+    let mut input_bytes = match serde_json::to_vec(input) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                Err(ProviderError::Other(anyhow::anyhow!(
+                    "failed to serialize input for {func}: {e}"
+                ))),
+                CallOutcome::Clean,
+            );
+        }
+    };
 
-    let result = plugin
-        .call(func, &input_bytes)
-        .map_err(|e| ProviderError::Other(anyhow::anyhow!("WASM call to {func} failed: {e}")))
-        .and_then(|output_bytes: &[u8]| {
-            serde_json::from_slice(output_bytes).map_err(|e| {
-                ProviderError::Other(anyhow::anyhow!(
-                    "failed to deserialize output from {func}: {e}"
-                ))
-            })
-        });
-
+    let call_result = plugin.call(func, &input_bytes);
     // Zeroize the JSON buffer that contained the password / secrets.
     input_bytes.zeroize();
 
-    result
+    let output_bytes: &[u8] = match call_result {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                Err(ProviderError::Other(anyhow::anyhow!(
+                    "WASM call to {func} failed: {e}"
+                ))),
+                CallOutcome::PluginCallFailed,
+            );
+        }
+    };
+
+    match serde_json::from_slice(output_bytes) {
+        Ok(val) => (Ok(val), CallOutcome::Clean),
+        Err(e) => (
+            Err(ProviderError::Other(anyhow::anyhow!(
+                "failed to deserialize output from {func}: {e}"
+            ))),
+            CallOutcome::Clean,
+        ),
+    }
 }
 
 /// Call a guest function with no input (empty bytes), deserialize JSON output.
 fn call_guest_json_no_input<O: DeserializeOwned>(
     plugin: &mut Plugin,
     func: &str,
-) -> Result<O, ProviderError> {
-    let output_bytes: &[u8] = plugin
-        .call(func, &[] as &[u8])
-        .map_err(|e| ProviderError::Other(anyhow::anyhow!("WASM call to {func} failed: {e}")))?;
+) -> GuestCallResult<O> {
+    let output_bytes: &[u8] = match plugin.call(func, &[] as &[u8]) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                Err(ProviderError::Other(anyhow::anyhow!(
+                    "WASM call to {func} failed: {e}"
+                ))),
+                CallOutcome::PluginCallFailed,
+            );
+        }
+    };
 
-    serde_json::from_slice(output_bytes).map_err(|e| {
-        ProviderError::Other(anyhow::anyhow!(
-            "failed to deserialize output from {func}: {e}"
-        ))
-    })
+    match serde_json::from_slice(output_bytes) {
+        Ok(val) => (Ok(val), CallOutcome::Clean),
+        Err(e) => (
+            Err(ProviderError::Other(anyhow::anyhow!(
+                "failed to deserialize output from {func}: {e}"
+            ))),
+            CallOutcome::Clean,
+        ),
+    }
 }
 
 /// Map a guest error response to a `ProviderError`.

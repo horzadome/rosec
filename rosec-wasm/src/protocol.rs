@@ -327,6 +327,64 @@ pub struct CapabilitiesResponse {
     pub capabilities: Vec<String>,
 }
 
+// ── Readiness probes ─────────────────────────────────────────────
+
+/// Returned by `readiness_probes` — declares what the host should check
+/// before attempting stateful calls like `unlock`.
+///
+/// The host evaluates these probes natively (no WASM execution), respecting
+/// the Extism `allowed_hosts` security boundary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadinessProbesResponse {
+    #[serde(default)]
+    pub probes: Vec<ReadinessProbe>,
+}
+
+/// A single readiness probe declared by a WASM guest plugin.
+///
+/// The host evaluates these natively before attempting `unlock`.
+/// Each variant carries only the fields relevant to its protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadinessProbe {
+    /// HTTP(S) probe — performs a request and checks the response status.
+    Http {
+        /// Full URL to probe (e.g. `"https://identity.bitwarden.com/alive"`).
+        url: String,
+        /// HTTP method (default: `"HEAD"`).
+        #[serde(default = "default_probe_http_method")]
+        method: String,
+        /// Expected HTTP status code (default: 200).
+        #[serde(default = "default_probe_expected_status")]
+        expected_status: u16,
+        /// Probe timeout in seconds (default: 5).
+        #[serde(default = "default_probe_timeout")]
+        timeout_secs: u32,
+    },
+    /// TCP probe — attempts a connection to `host:port`.
+    Tcp {
+        /// Hostname to connect to (e.g. `"vault.bitwarden.com"`).
+        host: String,
+        /// Port number.
+        port: u16,
+        /// Probe timeout in seconds (default: 5).
+        #[serde(default = "default_probe_timeout")]
+        timeout_secs: u32,
+    },
+}
+
+fn default_probe_http_method() -> String {
+    "HEAD".into()
+}
+
+fn default_probe_expected_status() -> u16 {
+    200
+}
+
+fn default_probe_timeout() -> u32 {
+    5
+}
+
 // ── Plugin manifest (pre-init discovery) ─────────────────────────
 
 /// Returned by `plugin_manifest` — called before `init` to discover

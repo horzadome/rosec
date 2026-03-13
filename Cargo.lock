@@ -3961,6 +3961,7 @@ dependencies = [
  "base64",
  "chrono",
  "extism",
+ "glob",
  "hkdf",
  "minisign-verify",
  "rosec-core",
@@ -3971,6 +3972,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "ureq",
+ "url",
  "zeroize",
 ]
 
