@@ -211,6 +211,14 @@ list using the same glob matching Extism uses.  A probe whose hostname
 doesn't match `allowed_hosts` is rejected at evaluation time.  This
 prevents a malicious guest from probing arbitrary internal hosts.
 
+**Glob wildcard semantics:** The `glob` crate's `*` matches `.` characters,
+so `*.example.com` is a _deep_ wildcard — it matches `foo.example.com`
+**and** `foo.bar.example.com`.  Use exact hostnames where possible (e.g.
+`vault.bitwarden.com`) and only use wildcards when the provider genuinely
+needs to reach variable subdomains (e.g. self-hosted instances).  The host
+performs an exact `glob::Pattern::matches()` check against the probe URL's
+hostname.
+
 ## File I/O considerations
 
 ### WASI file access
@@ -343,7 +351,9 @@ The poisoned-but-recovered mutex in the old instance is never used again.
 4. **Respect `allowed_hosts`.**
    Only make HTTP requests to hosts declared in the manifest's
    `allowed_hosts`.  Extism enforces this at the host function level, but
-   the guest should also validate URLs defensively.
+   the guest should also validate URLs defensively.  Prefer exact hostnames
+   over wildcards — `*` matches `.` so `*.example.com` matches arbitrary
+   subdomain depth (see "Security constraint" above).
 
 ## Checklist for new providers
 

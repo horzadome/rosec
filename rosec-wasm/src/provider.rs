@@ -88,6 +88,12 @@ pub struct WasmProvider {
     callbacks: std::sync::RwLock<ProviderCallbacks>,
     /// Cached timestamp of the last successful sync.
     last_sync_time: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    /// Set `true` after a failed plugin recreation.  Prevents an infinite
+    /// trap → recreate → trap loop.  While poisoned, all plugin calls
+    /// immediately return `ProviderError::Unavailable` without touching
+    /// the WASM instance.  Cleared on next successful `unlock` (which
+    /// recreates the plugin from scratch anyway).
+    poisoned: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for WasmProvider {
@@ -240,6 +246,7 @@ impl WasmProvider {
             readiness_probes,
             callbacks: std::sync::RwLock::new(ProviderCallbacks::default()),
             last_sync_time: std::sync::Mutex::new(None),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -316,17 +323,33 @@ impl WasmProvider {
         match Self::recreate_plugin(&self.manifest, &self.config) {
             Ok(new_plugin) => {
                 *plugin = new_plugin;
+                self.poisoned
+                    .store(false, std::sync::atomic::Ordering::Release);
                 debug!(
                     provider = %self.config.id,
                     "plugin instance recreated successfully (now locked)",
                 );
             }
             Err(recreate_err) => {
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::Release);
                 error!(
                     provider = %self.config.id,
-                    "failed to recreate plugin: {recreate_err}",
+                    "failed to recreate plugin, instance is poisoned: {recreate_err}",
                 );
             }
+        }
+    }
+
+    /// Return `Err(Unavailable)` if the plugin is poisoned (recreation
+    /// failed after a previous WASM trap).
+    fn check_poisoned(&self) -> Result<(), ProviderError> {
+        if self.poisoned.load(std::sync::atomic::Ordering::Acquire) {
+            Err(ProviderError::Unavailable(
+                "WASM plugin is poisoned after failed recreation".into(),
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -338,6 +361,7 @@ impl WasmProvider {
         func: &str,
         input: &I,
     ) -> Result<O, ProviderError> {
+        self.check_poisoned()?;
         let (result, outcome) = call_guest_json(plugin, func, input);
         if outcome == CallOutcome::PluginCallFailed
             && let Err(ref e) = result
@@ -356,6 +380,7 @@ impl WasmProvider {
         func: &str,
         input: &I,
     ) -> Result<O, ProviderError> {
+        self.check_poisoned()?;
         let (result, outcome) = call_guest_json_sensitive(plugin, func, input);
         if outcome == CallOutcome::PluginCallFailed
             && let Err(ref e) = result
@@ -372,6 +397,7 @@ impl WasmProvider {
         plugin: &mut Plugin,
         func: &str,
     ) -> Result<O, ProviderError> {
+        self.check_poisoned()?;
         let (result, outcome) = call_guest_json_no_input(plugin, func);
         if outcome == CallOutcome::PluginCallFailed
             && let Err(ref e) = result
@@ -640,6 +666,11 @@ impl Provider for WasmProvider {
         // Zeroize the original request fields.
         req.password.zeroize();
         if let Some(ref mut fields) = req.registration_fields {
+            for v in fields.values_mut() {
+                v.zeroize();
+            }
+        }
+        if let Some(ref mut fields) = req.auth_fields {
             for v in fields.values_mut() {
                 v.zeroize();
             }
@@ -1043,6 +1074,11 @@ fn is_host_allowed(hostname: &str, allowed_hosts: &[String]) -> bool {
         })
 }
 
+/// Maximum timeout for any single probe, regardless of what the guest
+/// declares.  Prevents a malicious guest from setting `timeout_secs` to
+/// `u32::MAX` and blocking the host thread for years.
+const MAX_PROBE_TIMEOUT_SECS: u64 = 30;
+
 /// Evaluate a single readiness probe natively on the host.
 ///
 /// Returns `Ok(())` if the probe passes, or `Err(reason)` with a
@@ -1061,13 +1097,23 @@ fn evaluate_probe(
             // Parse URL and enforce allowed_hosts.
             let parsed =
                 url::Url::parse(url).map_err(|e| format!("invalid probe URL '{url}': {e}"))?;
-            let host = parsed.host_str().unwrap_or_default();
+            let host = parsed
+                .host_str()
+                .filter(|h| !h.is_empty())
+                .ok_or_else(|| format!("probe URL '{url}' has no valid host"))?;
             if !is_host_allowed(host, allowed_hosts) {
                 return Err(format!("probe host '{host}' not in allowed_hosts"));
             }
 
-            let timeout = Duration::from_secs(u64::from(*timeout_secs));
-            let agent = ureq::agent();
+            let clamped = u64::from(*timeout_secs).min(MAX_PROBE_TIMEOUT_SECS);
+            let timeout = Duration::from_secs(clamped);
+
+            // Build agent with redirects disabled to prevent SSRF via
+            // an allowed host that 302-redirects to internal endpoints.
+            let agent = ureq::Agent::config_builder()
+                .max_redirects(0)
+                .build()
+                .new_agent();
             let req = ureq::http::request::Builder::new()
                 .method(method.to_uppercase().as_str())
                 .uri(url.as_str());
@@ -1100,7 +1146,8 @@ fn evaluate_probe(
                 return Err(format!("probe host '{host}' not in allowed_hosts"));
             }
 
-            let timeout = Duration::from_secs(u64::from(*timeout_secs));
+            let clamped = u64::from(*timeout_secs).min(MAX_PROBE_TIMEOUT_SECS);
+            let timeout = Duration::from_secs(clamped);
             let addr = format!("{host}:{port}");
             let socket_addr = addr
                 .to_socket_addrs()
@@ -1187,8 +1234,8 @@ fn call_guest_json_sensitive<I: Serialize, O: DeserializeOwned>(
     func: &str,
     input: &I,
 ) -> GuestCallResult<O> {
-    let mut input_bytes = match serde_json::to_vec(input) {
-        Ok(b) => b,
+    let mut input_bytes: Zeroizing<Vec<u8>> = match serde_json::to_vec(input) {
+        Ok(b) => Zeroizing::new(b),
         Err(e) => {
             return (
                 Err(ProviderError::Other(anyhow::anyhow!(
@@ -1199,8 +1246,9 @@ fn call_guest_json_sensitive<I: Serialize, O: DeserializeOwned>(
         }
     };
 
-    let call_result = plugin.call(func, &input_bytes);
-    // Zeroize the JSON buffer that contained the password / secrets.
+    let call_result = plugin.call(func, input_bytes.as_slice());
+    // Explicit zeroize before drop — defense-in-depth alongside Zeroizing's
+    // Drop impl, which guarantees cleanup even on early-return / panic paths.
     input_bytes.zeroize();
 
     let output_bytes: &[u8] = match call_result {
