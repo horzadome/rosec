@@ -43,16 +43,20 @@ impl std::fmt::Display for BitwardenError {
 
 impl BitwardenError {
     /// Map this error to a protocol `ErrorKind` for the host.
+    ///
+    /// `Crypto` and `CipherParse` errors are mapped to `AuthFailed` because in
+    /// the Bitwarden PM guest they almost always mean the password-derived key
+    /// was wrong (cannot decrypt the vault's `protected_key`).  The host uses
+    /// this to distinguish "wrong password — don't re-prompt" from internal
+    /// errors.
     pub fn to_error_kind(&self) -> ErrorKind {
         match self {
             Self::Locked => ErrorKind::Locked,
             Self::NotFound(_) => ErrorKind::NotFound,
             Self::TwoFactorRequired { .. } => ErrorKind::TwoFactorRequired,
             Self::DeviceVerificationRequired => ErrorKind::RegistrationRequired,
-            Self::Auth(_) => ErrorKind::AuthFailed,
-            Self::Api(_) | Self::Crypto(_) | Self::CipherParse(_) | Self::Http(_) => {
-                ErrorKind::Other
-            }
+            Self::Auth(_) | Self::Crypto(_) | Self::CipherParse(_) => ErrorKind::AuthFailed,
+            Self::Api(_) | Self::Http(_) => ErrorKind::Other,
         }
     }
 }

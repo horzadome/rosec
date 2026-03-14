@@ -8,11 +8,11 @@
 //! WASM guest.  Test-only encryption functions are omitted.
 
 use aes::Aes256;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use block_padding::Pkcs7;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use cbc::Decryptor;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use zeroize::Zeroizing;

@@ -54,6 +54,11 @@ use zeroize::Zeroize as _;
 const PAM_SUCCESS: i32 = 0;
 const PAM_IGNORE: i32 = 25;
 
+/// D-Bus wire type for `org.rosec.Daemon.ProviderList` entries.
+///
+/// Fields: `(id, name, kind, locked, cached, offline_cache, last_cache_write_epoch, last_sync_epoch)`.
+type ProviderEntry = (String, String, String, bool, bool, bool, u64, u64);
+
 /// Log a debug message to syslog. TEMPORARY — remove before release.
 fn debug_log(msg: &str) {
     // Use libc syslog directly to avoid pulling in a logging framework.
@@ -330,18 +335,17 @@ async fn unlock_vaults_async(password: &[u8]) -> Result<(), ()> {
         debug_log(&format!("proxy creation failed: {e}"));
     })?;
 
-    // ProviderList returns Vec<(id, name, kind, locked)>.
+    // ProviderList returns Vec<ProviderEntry>.
     debug_log("calling ProviderList");
-    let providers: Vec<(String, String, String, bool)> =
-        proxy.call("ProviderList", &()).await.map_err(|e| {
-            debug_log(&format!("ProviderList call failed: {e}"));
-        })?;
+    let providers: Vec<ProviderEntry> = proxy.call("ProviderList", &()).await.map_err(|e| {
+        debug_log(&format!("ProviderList call failed: {e}"));
+    })?;
 
     debug_log(&format!("found {} providers", providers.len()));
 
     let locked: Vec<_> = providers
         .iter()
-        .filter(|(_, _, _, is_locked)| *is_locked)
+        .filter(|(_, _, _, is_locked, ..)| *is_locked)
         .collect();
 
     if locked.is_empty() {
@@ -354,7 +358,7 @@ async fn unlock_vaults_async(password: &[u8]) -> Result<(), ()> {
     // Spawn all unlock attempts concurrently.  Each gets its own pipe
     // and D-Bus call — the daemon handles them in parallel.
     let mut handles = Vec::with_capacity(locked.len());
-    for (id, name, _kind, _) in &locked {
+    for (id, name, _kind, ..) in &locked {
         let pipe_fd = make_password_pipe(password).map_err(|_| {
             debug_log("failed to create password pipe");
         })?;
@@ -490,17 +494,16 @@ async fn change_vault_passwords_async(old_password: &[u8], new_password: &[u8]) 
     })?;
 
     debug_log("calling ProviderList");
-    let providers: Vec<(String, String, String, bool)> =
-        proxy.call("ProviderList", &()).await.map_err(|e| {
-            debug_log(&format!("ProviderList call failed: {e}"));
-        })?;
+    let providers: Vec<ProviderEntry> = proxy.call("ProviderList", &()).await.map_err(|e| {
+        debug_log(&format!("ProviderList call failed: {e}"));
+    })?;
 
     // Only attempt password change on unlocked local vault providers.
     // Locked providers can't have their password changed (they need to
     // be unlocked first to re-wrap the vault key).
     let targets: Vec<_> = providers
         .iter()
-        .filter(|(_, _, kind, locked)| kind == "local" && !locked)
+        .filter(|(_, _, kind, locked, ..)| kind == "local" && !locked)
         .collect();
 
     if targets.is_empty() {
@@ -514,7 +517,7 @@ async fn change_vault_passwords_async(old_password: &[u8], new_password: &[u8]) 
     ));
 
     let mut any_changed = false;
-    for (id, name, _, _) in &targets {
+    for (id, name, ..) in &targets {
         let old_pipe = make_password_pipe(old_password).map_err(|_| {
             debug_log("failed to create old password pipe");
         })?;

@@ -220,7 +220,7 @@ impl SshManager {
                 for entry in new_entries {
                     guard.insert(entry);
                 }
-                info!(
+                debug!(
                     entries = guard.len(),
                     unique_keys = guard.unique_count(),
                     "SSH key store rebuilt"

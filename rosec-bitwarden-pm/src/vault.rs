@@ -270,7 +270,10 @@ mod opt_system_time_epoch {
     ) -> Result<S::Ok, S::Error> {
         match time {
             Some(t) => {
-                let secs = t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs();
+                let secs = t
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO)
+                    .as_secs();
                 serializer.serialize_some(&secs)
             }
             None => serializer.serialize_none(),

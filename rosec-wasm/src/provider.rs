@@ -10,7 +10,7 @@ use extism::{Manifest, Plugin, Wasm};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use zeroize::{Zeroize, Zeroizing};
 
 use rosec_core::{
@@ -358,32 +358,81 @@ impl WasmProvider {
     ///
     /// Each probe is checked against the manifest's `allowed_hosts` and
     /// executed natively (no WASM involvement).  Uses exponential backoff
-    /// if any probe fails.
+    /// if any probe fails (unless `quick` mode is requested).
     ///
-    /// Returns `Ok(())` when all probes pass, or `Err` if `max_attempts`
-    /// is exhausted.
-    async fn wait_for_readiness(&self) -> Result<(), ProviderError> {
+    /// When `quick` is `true`, a single probe attempt is made with a
+    /// reduced timeout (2 s).  This is used for providers with an offline
+    /// cache — there is no point retrying for ~100 s when we will fall
+    /// back to cached data anyway — and for background sync operations.
+    ///
+    /// **Timeout enforcement:** `ureq`'s `timeout_global` does not
+    /// reliably interrupt a hung TCP connect (it depends on OS-level
+    /// socket timeouts, which can be 60-120 s on Linux).  To guarantee
+    /// the timeout, each probe is run inside `spawn_blocking` wrapped
+    /// with `tokio::time::timeout`.
+    ///
+    /// Returns `Ok(())` when all probes pass, or `Err` if attempts are
+    /// exhausted.
+    async fn wait_for_readiness(&self, quick: bool) -> Result<(), ProviderError> {
         if self.readiness_probes.is_empty() {
             return Ok(());
         }
 
-        const MAX_ATTEMPTS: u32 = 8;
+        let max_attempts: u32 = if quick { 1 } else { 8 };
+        // In quick mode, enforce a hard 3 s wall-clock ceiling per probe.
+        // In normal mode, let the guest-declared timeout (clamped to 30 s
+        // by MAX_PROBE_TIMEOUT_SECS) govern.
+        let hard_timeout: Duration = if quick {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_secs(MAX_PROBE_TIMEOUT_SECS + 1)
+        };
+        let probe_timeout_override: Option<Duration> = if quick {
+            Some(Duration::from_secs(2))
+        } else {
+            None
+        };
         let initial_delay = Duration::from_millis(500);
         let max_delay = Duration::from_secs(30);
         let mut delay = initial_delay;
 
-        let allowed_hosts = self.manifest.allowed_hosts.as_deref().unwrap_or_default();
+        let allowed_hosts: Vec<String> = self
+            .manifest
+            .allowed_hosts
+            .as_deref()
+            .unwrap_or_default()
+            .to_vec();
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        for attempt in 1..=max_attempts {
             let mut all_ready = true;
             let mut last_failure = String::new();
 
             for probe in &self.readiness_probes {
-                match evaluate_probe(probe, allowed_hosts) {
-                    Ok(()) => {}
-                    Err(reason) => {
+                let probe = probe.clone();
+                let hosts = allowed_hosts.clone();
+                let result = tokio::time::timeout(
+                    hard_timeout,
+                    tokio::task::spawn_blocking(move || {
+                        evaluate_probe(&probe, &hosts, probe_timeout_override)
+                    }),
+                )
+                .await;
+
+                match result {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(reason))) => {
                         all_ready = false;
                         last_failure = reason;
+                        break;
+                    }
+                    Ok(Err(join_err)) => {
+                        all_ready = false;
+                        last_failure = format!("probe task panicked: {join_err}");
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        all_ready = false;
+                        last_failure = format!("probe timed out after {}s", hard_timeout.as_secs());
                         break;
                     }
                 }
@@ -400,6 +449,10 @@ impl WasmProvider {
                 return Ok(());
             }
 
+            if attempt == max_attempts {
+                break;
+            }
+
             debug!(
                 provider = %self.config.id,
                 attempt,
@@ -413,7 +466,8 @@ impl WasmProvider {
         }
 
         Err(ProviderError::Unavailable(format!(
-            "readiness probes not satisfied after {MAX_ATTEMPTS} attempts"
+            "readiness probes not satisfied after {max_attempts} attempt{}",
+            if max_attempts == 1 { "" } else { "s" },
         )))
     }
 
@@ -557,6 +611,37 @@ impl WasmProvider {
             f(&cbs);
         }
     }
+
+    /// Derive the cache key from `password` + machine key + provider ID and
+    /// store it in `self.cache_key`.
+    ///
+    /// Best-effort: logs a warning on failure (machine key missing, HKDF error)
+    /// but does not propagate — callers that need the key (e.g.
+    /// `unlock_from_cache`) will detect `None` and return a proper error.
+    fn derive_and_store_cache_key(&self, password: &str) {
+        let machine_key = match rosec_core::machine_key::load_or_create() {
+            Ok(mk) => mk,
+            Err(e) => {
+                warn!(
+                    provider = %self.config.id,
+                    "cannot load machine key for cache key derivation: {e}"
+                );
+                return;
+            }
+        };
+
+        match crate::cache::derive_cache_key(&machine_key, password, &self.config.id) {
+            Ok(key) => {
+                *self.cache_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(key);
+            }
+            Err(e) => {
+                warn!(
+                    provider = %self.config.id,
+                    "cache key derivation failed: {e}"
+                );
+            }
+        }
+    }
 }
 
 // ── Provider trait impl ──────────────────────────────────────────
@@ -644,45 +729,15 @@ impl Provider for WasmProvider {
 
         let has_offline_cache = self.capabilities().contains(&Capability::OfflineCache);
 
-        // Derive and store the cache key while we have the password.
-        // This must happen before any early return so that:
-        //   - online path: sync() can update the cache without the password
-        //   - offline path: we can decrypt the cache file
-        if has_offline_cache {
-            match rosec_core::machine_key::load_or_create() {
-                Ok(machine_key) => {
-                    match crate::cache::derive_cache_key(
-                        &machine_key,
-                        password_ref.as_str(),
-                        &self.config.id,
-                    ) {
-                        Ok(ck) => {
-                            *self.cache_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(ck);
-                        }
-                        Err(e) => {
-                            warn!(
-                                provider = %self.config.id,
-                                "failed to derive cache key: {e} — cache disabled for this session"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        provider = %self.config.id,
-                        "failed to load machine key: {e} — cache disabled for this session"
-                    );
-                }
-            }
-        }
-
         // Try readiness probes.  If they fail and we have a cache, attempt
         // offline unlock instead of propagating the error immediately.
-        let readiness_ok = match self.wait_for_readiness().await {
+        // Use quick mode for cache-capable providers — no point waiting
+        // ~100 s on exponential backoff when we will fall back to cache.
+        let readiness_ok = match self.wait_for_readiness(has_offline_cache).await {
             Ok(()) => true,
             Err(e) => {
                 if has_offline_cache {
-                    debug!(
+                    info!(
                         provider = %self.config.id,
                         "readiness probes failed, attempting offline cache fallback: {e}"
                     );
@@ -694,7 +749,10 @@ impl Provider for WasmProvider {
         };
 
         if !readiness_ok {
-            // Offline unlock path.
+            // Offline unlock path — derive the cache key now so we can
+            // decrypt the cache file.  The key is only stored on success
+            // (unlock_from_cache will read it from self.cache_key).
+            self.derive_and_store_cache_key(password_ref.as_str());
             return self.unlock_from_cache().await;
         }
 
@@ -868,6 +926,8 @@ impl Provider for WasmProvider {
 
             // Export and persist cache for offline use.
             if has_offline_cache {
+                info!(provider = %self.config.id, "deriving cache key for offline cache");
+                self.derive_and_store_cache_key(password_ref.as_str());
                 self.try_export_cache(&mut plugin);
             }
 
@@ -915,7 +975,9 @@ impl Provider for WasmProvider {
     }
 
     async fn sync(&self) -> Result<(), ProviderError> {
-        let readiness_result = self.wait_for_readiness().await;
+        // Background sync — use quick mode so we don't block for ~100 s
+        // on exponential backoff when the network is down.
+        let readiness_result = self.wait_for_readiness(true).await;
         if let Err(e) = readiness_result {
             // Network unavailable — mark data as unconfirmed.
             self.cached
@@ -1085,7 +1147,7 @@ impl Provider for WasmProvider {
             }
         };
 
-        self.wait_for_readiness().await?;
+        self.wait_for_readiness(true).await?;
 
         let mut plugin = self.plugin.lock().await;
         if !plugin.function_exists("check_remote_changed") {
@@ -1274,9 +1336,14 @@ const MAX_PROBE_TIMEOUT_SECS: u64 = 30;
 ///
 /// Returns `Ok(())` if the probe passes, or `Err(reason)` with a
 /// human-readable explanation of why it failed.
+///
+/// When `timeout_override` is `Some(d)`, the probe timeout is clamped to
+/// `d` regardless of what the guest declared.  This is used in quick mode
+/// to fail fast when the network is down.
 fn evaluate_probe(
     probe: &crate::protocol::ReadinessProbe,
     allowed_hosts: &[String],
+    timeout_override: Option<Duration>,
 ) -> Result<(), String> {
     match probe {
         crate::protocol::ReadinessProbe::Http {
@@ -1296,8 +1363,13 @@ fn evaluate_probe(
                 return Err(format!("probe host '{host}' not in allowed_hosts"));
             }
 
-            let clamped = u64::from(*timeout_secs).min(MAX_PROBE_TIMEOUT_SECS);
-            let timeout = Duration::from_secs(clamped);
+            let timeout = match timeout_override {
+                Some(d) => d,
+                None => {
+                    let clamped = u64::from(*timeout_secs).min(MAX_PROBE_TIMEOUT_SECS);
+                    Duration::from_secs(clamped)
+                }
+            };
 
             // Build agent with redirects disabled to prevent SSRF via
             // an allowed host that 302-redirects to internal endpoints.
@@ -1337,8 +1409,13 @@ fn evaluate_probe(
                 return Err(format!("probe host '{host}' not in allowed_hosts"));
             }
 
-            let clamped = u64::from(*timeout_secs).min(MAX_PROBE_TIMEOUT_SECS);
-            let timeout = Duration::from_secs(clamped);
+            let timeout = match timeout_override {
+                Some(d) => d,
+                None => {
+                    let clamped = u64::from(*timeout_secs).min(MAX_PROBE_TIMEOUT_SECS);
+                    Duration::from_secs(clamped)
+                }
+            };
             let addr = format!("{host}:{port}");
             let socket_addr = addr
                 .to_socket_addrs()

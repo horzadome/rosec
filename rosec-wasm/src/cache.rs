@@ -46,7 +46,7 @@ use hmac::{Hmac, Mac};
 use rand::Rng;
 use rosec_core::ProviderError;
 use sha2::Sha256;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -194,7 +194,7 @@ pub fn write_cache_file(
         ))
     })?;
 
-    debug!(
+    info!(
         provider = %provider_id,
         path = %path.display(),
         size = ct_len,

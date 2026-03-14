@@ -3719,7 +3719,13 @@ async fn cmd_unlock() -> Result<()> {
         if *success {
             println!("'{id}' unlocked.");
         } else {
-            eprintln!("'{id}' failed: {message}");
+            let display_msg = match message.as_str() {
+                "auth_failed" => "wrong password (skipped)",
+                "offline, no cache" => "offline, no cached data available",
+                "provider error" => "provider error (skipped)",
+                other => other,
+            };
+            eprintln!("'{id}': {display_msg}");
         }
     }
 

@@ -761,32 +761,27 @@ fn authenticate(
     //
     // Try refresh_token grant first (no new device session).
     // Fall back to full password login if refresh fails or isn't available.
-    let (access_token, refresh_token, protected_key) =
-        if two_factor.is_none() {
-            if let Some(cached) = cached_session {
-                match api.refresh_token(&cached.refresh_token) {
-                    Ok(resp) => {
-                        extism_pdk::info!("unlocked via refresh token (no new device session)");
-                        (
-                            resp.access_token,
-                            resp.refresh_token,
-                            cached.protected_key,
-                        )
-                    }
-                    Err(e) => {
-                        extism_pdk::info!(
-                            "refresh token expired or rejected, falling back to password login: {e}"
-                        );
-                        full_password_login(&api, email, password, &master_key, None)?
-                    }
+    let (access_token, refresh_token, protected_key) = if two_factor.is_none() {
+        if let Some(cached) = cached_session {
+            match api.refresh_token(&cached.refresh_token) {
+                Ok(resp) => {
+                    extism_pdk::info!("unlocked via refresh token (no new device session)");
+                    (resp.access_token, resp.refresh_token, cached.protected_key)
                 }
-            } else {
-                full_password_login(&api, email, password, &master_key, None)?
+                Err(e) => {
+                    extism_pdk::info!(
+                        "refresh token expired or rejected, falling back to password login: {e}"
+                    );
+                    full_password_login(&api, email, password, &master_key, None)?
+                }
             }
         } else {
-            // 2FA requires a full password login.
-            full_password_login(&api, email, password, &master_key, two_factor)?
-        };
+            full_password_login(&api, email, password, &master_key, None)?
+        }
+    } else {
+        // 2FA requires a full password login.
+        full_password_login(&api, email, password, &master_key, two_factor)?
+    };
 
     // Step 4: Initialize vault state from protected key.
     let mut vault_state = VaultState::new(&identity_keys, &protected_key)?;
@@ -804,7 +799,11 @@ fn authenticate(
 }
 
 /// Result of a password-based login: (access_token, refresh_token, protected_key).
-type LoginTokens = (Zeroizing<String>, Option<Zeroizing<String>>, Zeroizing<String>);
+type LoginTokens = (
+    Zeroizing<String>,
+    Option<Zeroizing<String>>,
+    Zeroizing<String>,
+);
 
 /// Perform a full `grant_type=password` login.
 fn full_password_login(
@@ -822,7 +821,11 @@ fn full_password_login(
         .key
         .ok_or_else(|| BitwardenError::Auth("no protected key in login response".to_string()))?;
 
-    Ok((login_resp.access_token, login_resp.refresh_token, protected_key))
+    Ok((
+        login_resp.access_token,
+        login_resp.refresh_token,
+        protected_key,
+    ))
 }
 
 /// Re-sync the vault using the existing access token.
@@ -1696,8 +1699,7 @@ pub fn export_cache(_input: ()) -> FnResult<Json<ExportCacheResponse>> {
 
     match auth.vault.to_cache_blob() {
         Ok(blob) => {
-            let blob_b64 =
-                base64::engine::general_purpose::STANDARD.encode(&blob);
+            let blob_b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
             Ok(Json(ExportCacheResponse {
                 ok: true,
                 error: None,
