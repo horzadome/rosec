@@ -787,7 +787,8 @@ pub struct ProviderListEntry {
     /// True when in-memory data has not been confirmed against the remote
     /// (offline unlock or failed sync). Data-quality signal.
     pub cached: bool,
-    /// Whether this provider supports offline caching.
+    /// Whether offline caching is active for this provider (both
+    /// `Capability::OfflineCache` declared and host config enabled).
     pub offline_cache: bool,
     /// When the cache file was last written to disk (epoch seconds, 0 = never).
     pub last_cache_write: u64,

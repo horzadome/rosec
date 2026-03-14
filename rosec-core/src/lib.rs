@@ -99,6 +99,10 @@ pub enum Capability {
     /// Provider supports password changes ([`Provider::change_password`]).
     PasswordChange,
     /// Provider supports offline cache export/restore (`export_cache`, `restore_cache`).
+    ///
+    /// This is the guest-side feature toggle.  Actual caching also requires
+    /// the host's per-provider `offline_cache` config to be `true` (default).
+    /// See [`ProviderEntry::offline_cache`](crate::config::ProviderEntry::offline_cache).
     OfflineCache,
 }
 
@@ -272,7 +276,11 @@ pub struct ProviderStatus {
     /// This is a data-quality signal, not a provenance signal.
     /// Combined with `last_sync`, consumers can assess staleness severity.
     pub cached: bool,
-    /// Whether this provider supports offline caching.
+    /// Whether offline caching is active for this provider.
+    ///
+    /// True only when both conditions are met: the provider declares
+    /// `Capability::OfflineCache` (guest feature toggle) *and* the host's
+    /// per-provider `offline_cache` config is `true` (default).
     pub offline_cache: bool,
     /// When the cache file was last written to disk.
     pub last_cache_write: Option<SystemTime>,

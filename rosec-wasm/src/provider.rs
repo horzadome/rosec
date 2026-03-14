@@ -59,6 +59,10 @@ pub struct WasmProviderConfig {
     pub allowed_paths: Vec<(String, std::path::PathBuf)>,
     /// Opaque key-value options forwarded to the guest `init` function.
     pub options: HashMap<String, serde_json::Value>,
+    /// Host-side gate for offline caching.  When `false`, cache export and
+    /// offline unlock are suppressed even if the guest declares
+    /// `Capability::OfflineCache`.  Defaults to `true`.
+    pub offline_cache: bool,
 }
 
 // ── WasmProvider ─────────────────────────────────────────────────
@@ -473,8 +477,8 @@ impl WasmProvider {
 
     /// Attempt offline unlock by restoring the cache file.
     ///
-    /// Called when readiness probes fail and the provider has the
-    /// `OfflineCache` capability.
+    /// Called when readiness probes fail and offline caching is enabled
+    /// (both `Capability::OfflineCache` and `config.offline_cache`).
     async fn unlock_from_cache(&self) -> Result<(), ProviderError> {
         use crate::protocol::{RestoreCacheRequest, SimpleResponse};
 
@@ -602,6 +606,17 @@ impl WasmProvider {
 }
 
 impl WasmProvider {
+    /// Whether offline caching is both supported by the guest and enabled by
+    /// the host configuration.
+    ///
+    /// The guest declares `Capability::OfflineCache` to signal it *supports*
+    /// caching.  The host config `offline_cache` field (per-provider, default
+    /// `true`) is the user-facing gate.  Both must be true for any cache
+    /// operation (export, import, offline unlock fallback) to proceed.
+    fn offline_cache_enabled(&self) -> bool {
+        self.config.offline_cache && self.capabilities().contains(&Capability::OfflineCache)
+    }
+
     /// Fire a provider callback if one is registered.
     ///
     /// Silently does nothing if the callbacks lock is poisoned or the
@@ -710,7 +725,7 @@ impl Provider for WasmProvider {
                 .last_sync_epoch_secs
                 .map(|s| UNIX_EPOCH + Duration::from_secs(s)),
             cached: self.cached.load(std::sync::atomic::Ordering::Relaxed),
-            offline_cache: self.capabilities().contains(&Capability::OfflineCache),
+            offline_cache: self.offline_cache_enabled(),
             last_cache_write: *self
                 .last_cache_write
                 .lock()
@@ -727,7 +742,7 @@ impl Provider for WasmProvider {
             | UnlockInput::WithAuth { password, .. } => password,
         };
 
-        let has_offline_cache = self.capabilities().contains(&Capability::OfflineCache);
+        let has_offline_cache = self.offline_cache_enabled();
 
         // Try readiness probes.  If they fail and we have a cache, attempt
         // offline unlock instead of propagating the error immediately.
@@ -1006,7 +1021,7 @@ impl Provider for WasmProvider {
             }
 
             // Export and persist cache for offline use.
-            if self.capabilities().contains(&Capability::OfflineCache) {
+            if self.offline_cache_enabled() {
                 self.try_export_cache(&mut plugin);
             }
 

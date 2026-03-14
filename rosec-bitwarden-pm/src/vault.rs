@@ -662,21 +662,126 @@ impl VaultState {
         self.org_keys.get(org_id)
     }
 
-    /// Serialize this vault state to a JSON blob for the offline cache.
-    ///
-    /// The returned bytes are the raw JSON — the host will base64-encode
-    /// and encrypt them before persisting to disk.
-    pub fn to_cache_blob(&self) -> Result<Vec<u8>, BitwardenError> {
-        serde_json::to_vec(self).map_err(|e| {
-            BitwardenError::Crypto(format!("failed to serialize vault state for cache: {e}"))
-        })
-    }
-
     /// Deserialize a vault state from a JSON cache blob.
     pub fn from_cache_blob(blob: &[u8]) -> Result<Self, BitwardenError> {
         serde_json::from_slice(blob).map_err(|e| {
             BitwardenError::Crypto(format!("failed to deserialize vault state from cache: {e}"))
         })
+    }
+}
+
+// ─── Cache blob envelope ────────────────────────────────────────
+
+/// Versioned envelope for the offline cache (deserialization target).
+///
+/// ## Versions
+///
+/// - **v1** (implicit): bare `VaultState` JSON — no session tokens.
+///   The provider restores in read-only offline mode; a full re-unlock is
+///   required when connectivity returns.
+/// - **v2**: `CacheBlob` with `vault` + optional session metadata
+///   (`refresh_token`, `protected_key`).  When connectivity returns, the
+///   guest can refresh the access token and sync automatically.
+///
+/// ## Refresh token persistence
+///
+/// The `refresh_token` and `protected_key` are included so that when
+/// connectivity returns after an offline unlock, the guest can refresh
+/// the access token and sync without requiring a full re-unlock.  If the
+/// refresh token has since expired or been revoked, the sync will fail
+/// with `AuthFailed` and the host will lock the provider — triggering a
+/// normal re-unlock prompt, exactly as if it were a fresh unlock.
+///
+/// ## Security considerations
+///
+/// - The refresh token is less sensitive than the vault keys and decrypted
+///   passwords already present in the blob — all of which are encrypted by
+///   the host's AES-256-CBC + HMAC-SHA256 layer derived from
+///   `HKDF(machine_key || password)`.
+/// - **The cache blob (and therefore the refresh token) is only ever
+///   written to disk when two conditions are met:**
+///   1. The provider declares `Capability::OfflineCache` (guest-side
+///      feature toggle).
+///   2. The host's per-provider `offline_cache` config is `true`
+///      (default).
+///
+///   The host's `try_export_cache()` and `unlock_from_cache()` are both
+///   gated on this combined check.  Users who wish to avoid any offline
+///   token storage can set `offline_cache = false` in the provider's
+///   config section.
+#[derive(Deserialize)]
+pub struct CacheBlob {
+    /// Blob format version — allows future schema evolution.
+    /// Currently unused after deserialization (v1 vs v2 is distinguished
+    /// by whether the envelope parses at all), but reserved for future
+    /// version-gated migration logic.
+    #[serde(default = "default_cache_version", rename = "version")]
+    pub _version: u32,
+    /// The full decrypted vault state.
+    pub vault: VaultState,
+    /// Refresh token from the last successful authentication.
+    /// `None` for v1 blobs or if no refresh token was available.
+    #[serde(default)]
+    pub refresh_token: Option<Zeroizing<String>>,
+    /// Protected symmetric key from the login response.
+    /// Needed alongside `refresh_token` to reconstruct vault keys after
+    /// a refresh-based re-authentication.
+    #[serde(default)]
+    pub protected_key: Option<Zeroizing<String>>,
+}
+
+fn default_cache_version() -> u32 {
+    1
+}
+
+impl CacheBlob {
+    /// Deserialize from JSON bytes.
+    ///
+    /// Handles both v2 `CacheBlob` and legacy v1 bare `VaultState` blobs
+    /// transparently — if `CacheBlob` deserialization fails, falls back to
+    /// parsing as a bare `VaultState` with no session tokens.
+    pub fn from_bytes(blob: &[u8]) -> Result<Self, BitwardenError> {
+        // Try v2 envelope first.
+        if let Ok(cb) = serde_json::from_slice::<CacheBlob>(blob) {
+            return Ok(cb);
+        }
+        // Fall back to bare VaultState (v1).
+        let vault = VaultState::from_cache_blob(blob)?;
+        Ok(CacheBlob {
+            _version: 1,
+            vault,
+            refresh_token: None,
+            protected_key: None,
+        })
+    }
+}
+
+/// Borrowing version of [`CacheBlob`] for serialization without cloning
+/// `VaultState` (which intentionally does not implement `Clone` to prevent
+/// untracked copies of secret material).
+///
+/// See [`CacheBlob`] for the full versioning scheme, security
+/// considerations, and the guarantee that tokens are never persisted
+/// unless the provider declares `Capability::OfflineCache` *and* the
+/// host's `offline_cache` config is enabled.
+#[derive(Serialize)]
+pub struct CacheBlobRef<'a> {
+    pub version: u32,
+    pub vault: &'a VaultState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<&'a Zeroizing<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_key: Option<&'a Zeroizing<String>>,
+}
+
+impl<'a> CacheBlobRef<'a> {
+    /// Current cache blob version.
+    pub const VERSION: u32 = 2;
+
+    /// Serialize to JSON bytes for the host to encrypt and persist.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, BitwardenError> {
+        serde_json::to_vec(self)
+            .map_err(|e| BitwardenError::Crypto(format!("failed to serialize cache blob: {e}")))
     }
 }
 

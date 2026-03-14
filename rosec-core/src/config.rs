@@ -249,6 +249,27 @@ pub struct ProviderEntry {
     /// ```
     #[serde(default)]
     pub cache_sync_modifier: Option<f64>,
+
+    /// Whether to use the provider's offline cache for fallback unlock when
+    /// the remote service is unreachable.
+    ///
+    /// This is the **host-side gate** for offline caching.  The provider
+    /// (WASM guest) declares `Capability::OfflineCache` to signal that it
+    /// *supports* caching, but actual caching only happens when this config
+    /// field is also `true`.  Set to `false` to disable caching for a
+    /// provider even if it supports it — e.g. for high-security environments
+    /// where stale secrets are unacceptable.
+    ///
+    /// Defaults to `true`.
+    ///
+    /// ```toml
+    /// [[provider]]
+    /// id            = "bw1"
+    /// kind          = "bitwarden-pm"
+    /// offline_cache = false   # never fall back to cached secrets
+    /// ```
+    #[serde(default = "default_true")]
+    pub offline_cache: bool,
 }
 
 fn default_true() -> bool {
@@ -292,6 +313,7 @@ impl std::fmt::Debug for ProviderEntry {
             .field("options", &redacted)
             .field("return_attr", &self.return_attr)
             .field("match_attr", &self.match_attr)
+            .field("offline_cache", &self.offline_cache)
             .finish()
     }
 }

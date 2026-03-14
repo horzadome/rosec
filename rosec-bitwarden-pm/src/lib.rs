@@ -1670,9 +1670,30 @@ pub fn readiness_probes(_input: ()) -> FnResult<Json<ReadinessProbesResponse>> {
 
 /// Export the current vault state as an opaque cache blob.
 ///
-/// Serializes the entire `VaultState` (keys + decrypted ciphers) to JSON,
-/// base64-encodes it, and returns the result.  The host will wrap this in
-/// an additional encryption layer before persisting to disk.
+/// Serializes the vault state plus session metadata (refresh token,
+/// protected key) into a versioned [`CacheBlobRef`], base64-encodes it,
+/// and returns the result.  The host wraps this in an additional
+/// AES-256-CBC + HMAC-SHA256 encryption layer before persisting to disk.
+///
+/// ## Refresh token in the cache blob
+///
+/// The cache blob includes the current refresh token (if available) so
+/// that when the provider is restored from cache in offline mode, it can
+/// automatically recover a live session once connectivity returns — the
+/// guest uses the cached refresh token to obtain a new access token and
+/// sync, clearing the `cached` flag without requiring a full re-unlock.
+///
+/// If the refresh token has expired or been revoked by the time
+/// connectivity returns, the sync attempt fails with `AuthFailed` and
+/// the host locks the provider, triggering a normal re-unlock prompt.
+///
+/// **This function is only called when the provider declares
+/// `Capability::OfflineCache` *and* the host's per-provider
+/// `offline_cache` config is `true` (default).**  The host gates
+/// `try_export_cache()` on both conditions, so the refresh token is
+/// never persisted to disk when caching is disabled by either the
+/// guest (not declaring the capability) or the user (setting
+/// `offline_cache = false` in config).
 ///
 /// Returns an error response if the provider is locked (no vault state).
 #[plugin_fn]
@@ -1697,7 +1718,23 @@ pub fn export_cache(_input: ()) -> FnResult<Json<ExportCacheResponse>> {
         }));
     };
 
-    match auth.vault.to_cache_blob() {
+    // Build a borrowing cache blob — avoids cloning VaultState (which
+    // intentionally does not implement Clone to prevent untracked copies
+    // of secret material).
+    let protected_key_ref = if auth.protected_key.is_empty() {
+        None
+    } else {
+        Some(&auth.protected_key)
+    };
+
+    let blob_ref = vault::CacheBlobRef {
+        version: vault::CacheBlobRef::VERSION,
+        vault: &auth.vault,
+        refresh_token: auth.refresh_token.as_ref(),
+        protected_key: protected_key_ref,
+    };
+
+    match blob_ref.to_bytes() {
         Ok(blob) => {
             let blob_b64 = base64::engine::general_purpose::STANDARD.encode(&blob);
             Ok(Json(ExportCacheResponse {
@@ -1716,15 +1753,30 @@ pub fn export_cache(_input: ()) -> FnResult<Json<ExportCacheResponse>> {
     }
 }
 
-/// Restore vault state from a cache blob previously exported by `export_cache`.
+/// Restore vault state from a cache blob previously exported by
+/// [`export_cache`].
 ///
-/// Decodes the base64 blob, deserializes the `VaultState`, and sets it as
-/// the current auth state.  This is used for offline unlock when the network
-/// is unavailable.
+/// Decodes the base64 blob, deserializes the versioned [`CacheBlob`]
+/// envelope, and sets it as the current auth state.  This is used for
+/// offline unlock when the network is unavailable.
 ///
-/// The restored vault has no access/refresh tokens — only the decrypted
-/// vault data.  Network operations (sync, check_remote_changed) will fail
-/// until a full online unlock is performed.
+/// ## Session recovery from cached tokens
+///
+/// If the cache blob contains a refresh token and protected key (v2+
+/// blobs), the restored auth state includes them so that when
+/// connectivity returns, [`resync`] can transparently refresh the access
+/// token and sync the vault — clearing the `cached` flag without
+/// requiring user interaction.
+///
+/// Legacy v1 blobs (bare `VaultState` without session metadata) are
+/// still supported: the provider will be restored in read-only offline
+/// mode with no tokens, and a full re-unlock will be required when
+/// connectivity returns.
+///
+/// **The refresh token is only present in the cache blob when
+/// `Capability::OfflineCache` is declared *and* the host's
+/// `offline_cache` config is enabled.** If either condition is false,
+/// the host never calls `export_cache` and no tokens are persisted.
 #[plugin_fn]
 pub fn restore_cache(Json(input): Json<RestoreCacheRequest>) -> FnResult<Json<SimpleResponse>> {
     use base64::Engine;
@@ -1741,8 +1793,8 @@ pub fn restore_cache(Json(input): Json<RestoreCacheRequest>) -> FnResult<Json<Si
         }
     };
 
-    let vault = match vault::VaultState::from_cache_blob(&blob) {
-        Ok(v) => v,
+    let cache_blob = match vault::CacheBlob::from_bytes(&blob) {
+        Ok(cb) => cb,
         Err(e) => {
             return Ok(Json(SimpleResponse {
                 ok: false,
@@ -1752,6 +1804,8 @@ pub fn restore_cache(Json(input): Json<RestoreCacheRequest>) -> FnResult<Json<Si
             }));
         }
     };
+
+    let has_session = cache_blob.refresh_token.is_some();
 
     let mut guard = STATE.lock();
     let Some(state) = guard.as_mut() else {
@@ -1763,15 +1817,25 @@ pub fn restore_cache(Json(input): Json<RestoreCacheRequest>) -> FnResult<Json<Si
         }));
     };
 
-    // Set auth state with the restored vault but no network tokens.
-    // The guest is now "unlocked" in offline mode — data access works
-    // but sync/refresh will fail.
+    // Restore auth state from the cache blob.  If the blob includes
+    // session tokens (v2+), the provider can attempt token refresh when
+    // connectivity returns.  Otherwise it runs in read-only offline mode.
     state.auth = Some(AuthState {
         access_token: Zeroizing::new(String::new()),
-        refresh_token: None,
-        protected_key: Zeroizing::new(String::new()),
-        vault,
+        refresh_token: cache_blob.refresh_token,
+        protected_key: cache_blob
+            .protected_key
+            .unwrap_or_else(|| Zeroizing::new(String::new())),
+        vault: cache_blob.vault,
     });
+
+    if has_session {
+        extism_pdk::info!("cache restored with session tokens — online recovery possible");
+    } else {
+        extism_pdk::info!(
+            "cache restored without session tokens (v1 blob) — full re-unlock required for online access"
+        );
+    }
 
     Ok(Json(SimpleResponse {
         ok: true,

@@ -317,8 +317,13 @@ async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
                             tracing::debug!(provider = %provider_id, "background: sync skipped (already in progress)");
                         }
                         Err(e) => {
-                            let pf = provider_failures.entry(provider_id.clone()).or_insert(0);
-                            log_background_failure(pf, &provider_id, "sync", &e);
+                            if handle_sync_auth_failure(&e, &provider, &provider_id).await {
+                                last_checked.remove(&provider_id);
+                                provider_failures.remove(&provider_id);
+                            } else {
+                                let pf = provider_failures.entry(provider_id.clone()).or_insert(0);
+                                log_background_failure(pf, &provider_id, "sync", &e);
+                            }
                         }
                     }
                 }
@@ -350,13 +355,19 @@ async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
                                 );
                             }
                             Err(e) => {
-                                let pf = provider_failures.entry(provider_id.clone()).or_insert(0);
-                                log_background_failure(
-                                    pf,
-                                    &provider_id,
-                                    "forced sync (cached recovery)",
-                                    &e,
-                                );
+                                if handle_sync_auth_failure(&e, &provider, &provider_id).await {
+                                    last_checked.remove(&provider_id);
+                                    provider_failures.remove(&provider_id);
+                                } else {
+                                    let pf =
+                                        provider_failures.entry(provider_id.clone()).or_insert(0);
+                                    log_background_failure(
+                                        pf,
+                                        &provider_id,
+                                        "forced sync (cached recovery)",
+                                        &e,
+                                    );
+                                }
                             }
                         }
                     }
@@ -384,6 +395,42 @@ async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
             consecutive_failures = 0;
         }
     }
+}
+
+/// Handle `auth_failed` errors from background sync.
+///
+/// When a sync attempt fails with `auth_failed`, the provider's session is
+/// unrecoverable in the background (the refresh token has expired or been
+/// revoked).  Lock the provider so the next user interaction triggers a
+/// normal unlock prompt — exactly as if it were a fresh start.
+///
+/// Returns `true` if the error was `auth_failed` and the provider was
+/// locked, `false` for all other errors (caller should handle normally).
+async fn handle_sync_auth_failure(
+    error: &zbus::fdo::Error,
+    provider: &Arc<dyn Provider>,
+    provider_id: &str,
+) -> bool {
+    let err_str = error.to_string();
+    if !err_str.contains("auth_failed") {
+        return false;
+    }
+
+    tracing::warn!(
+        provider = %provider_id,
+        "background sync failed with auth_failed — session is unrecoverable, \
+         locking provider to trigger re-unlock on next access"
+    );
+
+    if let Err(lock_err) = provider.lock().await {
+        tracing::error!(
+            provider = %provider_id,
+            error = %lock_err,
+            "failed to lock provider after auth_failed"
+        );
+    }
+
+    true
 }
 
 /// Auto-lock policy loop: evaluates idle-timeout and max-unlocked policies for
@@ -1406,6 +1453,7 @@ async fn build_single_provider(
                 allowed_hosts,
                 allowed_paths,
                 options: guest_options,
+                offline_cache: entry.offline_cache,
             };
 
             Ok(Arc::new(

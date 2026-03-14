@@ -51,7 +51,13 @@ pub struct ProviderStatus {
     ///   cached=true, last_sync=3h ago  -> briefly offline
     ///   cached=true, last_sync=8d ago  -> extended offline / cache restore
     pub cached: bool,
-    /// Whether this provider supports offline caching.
+    /// Whether offline caching is active for this provider.
+    ///
+    /// This is the AND of two gates:
+    ///   1. The guest declares `Capability::OfflineCache`
+    ///   2. The host config has `offline_cache = true` (the default)
+    ///
+    /// Both must be true for any cache operations to occur.
     pub offline_cache: bool,
     /// When the cache file was last written to disk.
     pub last_cache_write: Option<SystemTime>,
@@ -169,7 +175,7 @@ pub struct WasmProvider {
 4. readiness probes pass
 5. guest.unlock(password) -> network auth + sync -> Ok
 6. cached = false
-7. if OfflineCache capability:
+7. if offline_cache_enabled() (capability AND config):
       guest.export_cache() -> blob_b64
       host encrypts blob with cache_key -> writes cache file
       last_cache_write = now
@@ -184,7 +190,8 @@ pub struct WasmProvider {
 2. derive cache_key from password + machine_key + provider_id
 3. store cache_key in self.cache_key
 4. readiness probes FAIL
-5. check: provider has OfflineCache capability?  NO -> Err(Unavailable)
+5. check: offline_cache_enabled() (capability AND config)?
+      NO -> Err(Unavailable)
 6. read cache file from disk
 7. verify MAC with cache_key -> FAIL -> Err(AuthFailed) [wrong password]
 8. check timestamp: age > max_cache_age? -> Err(Unavailable("cache expired"))
@@ -204,7 +211,7 @@ pub struct WasmProvider {
 2. wait_for_readiness() -> PASS
 3. guest.sync() -> Ok
 4. cached = false              ← data confirmed live
-5. if OfflineCache capability:
+5. if offline_cache_enabled() (capability AND config):
       guest.export_cache() -> blob
       host encrypts blob with cache_key -> overwrites cache file
       last_cache_write = now
@@ -264,6 +271,7 @@ This means `cached` can oscillate during a session:
 - [ ] Cache file updated (write-back) after every successful sync
 - [ ] `lock()` zeroizes cache_key, cache file remains on disk
 - [ ] Provider without OfflineCache capability: no cache operations attempted
+- [ ] Provider with `offline_cache = false` in host config: no cache operations attempted
 - [ ] `rosec provider detach` deletes cache file
 
 ### Status model
@@ -273,7 +281,7 @@ This means `cached` can oscillate during a session:
 - [ ] `cached` set `false` on successful online unlock
 - [ ] `cached` set `false` on successful sync
 - [ ] `cached` reset to `false` on lock (no data)
-- [ ] `offline_cache` reflects whether provider has OfflineCache capability
+- [ ] `offline_cache` reflects the AND of two gates: guest declares `OfflineCache` capability AND host config has `offline_cache = true`
 - [ ] `last_cache_write` updated on every successful cache file write
 - [ ] Status fields propagated to D-Bus properties and `rosec status` CLI
 
@@ -305,9 +313,10 @@ kind = "bitwarden-pm"
 # ...
 
 # Offline cache settings (optional, defaults shown)
-[provider.cache]
-enabled = true          # default: true for providers with OfflineCache cap
-max_age_days = 10       # default: 10, set to 0 to disable age check
+offline_cache = true    # default: true; set false to disable caching for
+                        # this provider even if the guest declares
+                        # Capability::OfflineCache
+max_cache_age = 10      # days; default: 10, set to 0 to disable age check
 ```
 
 ## Out of Scope
@@ -320,8 +329,10 @@ max_age_days = 10       # default: 10, set to 0 to disable age check
   Native providers could implement their own caching outside this system.
 - **Cache sharing between machines**: machine_key binding intentionally
   prevents this. Each machine has its own cache.
-- **Automatic background sync retry**: the sync poller or manual CLI
-  triggers the transition from cached to online. No new background task.
+- **~~Automatic background sync retry~~**: Implemented — the background sync
+  loop uses accelerated retry intervals (~12–15s) when a provider is in
+  cached mode, with auth failure detection that locks the provider if the
+  refresh token has expired.
 
 ## Security Considerations
 

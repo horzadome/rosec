@@ -375,10 +375,27 @@ ID, then writes it to disk.
 The guest owns the **what** (blob contents); the host owns the **how**
 (encryption, file management, key derivation, expiry).
 
-### Capability
+### Capability and configuration
 
-The guest must declare `Capability::OfflineCache` via its `capabilities`
-export:
+Offline caching requires **two gates** to be active:
+
+1. **Guest gate:** The guest declares `Capability::OfflineCache` via its
+   `capabilities` export (feature toggle — "I support this").
+2. **Host gate:** The per-provider `offline_cache` config is `true`
+   (default) — the user's toggle ("I want this").
+
+Both must be true for the host to call `export_cache`, `restore_cache`, or
+attempt offline unlock.  If the user sets `offline_cache = false` in the
+provider's config, caching is disabled regardless of the guest's capability.
+
+```toml
+[[provider]]
+id            = "bw1"
+kind          = "bitwarden-pm"
+offline_cache = false   # disable caching even though the plugin supports it
+```
+
+Guest capability declaration:
 
 ```rust
 #[plugin_fn]
@@ -392,8 +409,8 @@ pub fn capabilities(_: ()) -> FnResult<Json<CapabilitiesResponse>> {
 }
 ```
 
-Without this capability, the host never calls `export_cache` or
-`restore_cache`.
+Without the capability, the host never calls `export_cache` or
+`restore_cache` — even if the config enables caching.
 
 ### `export_cache`
 
@@ -428,10 +445,17 @@ pub fn export_cache(_: ()) -> FnResult<Json<ExportCacheResponse>> {
 - The blob is opaque to the host.  The host encrypts and stores it as-is.
 - Prefer a format you can deserialize in `restore_cache` (e.g. JSON, then
   base64-encoded to fit in the string field).
-- Do **not** include network tokens (OAuth, session tokens) in the blob.
-  After a cache restore the guest is offline -- stale tokens are useless and
-  a security risk.  Include only the decrypted vault data needed to serve
-  secrets.
+- **Session tokens (refresh tokens, protected keys) MAY be included** in the
+  cache blob if your provider supports automatic session recovery.  When
+  connectivity returns after an offline unlock, the host triggers a background
+  sync.  If the blob contains a valid refresh token, the guest can
+  transparently refresh its access token and sync — clearing the `cached`
+  flag without requiring a full re-unlock.  If the refresh token has expired
+  or been revoked, the sync fails with `AuthFailed` and the host locks the
+  provider, triggering a normal re-unlock prompt.
+  The host's AES-256-CBC + HMAC-SHA256 wrapper (bound to machine key +
+  password + provider ID) protects tokens at rest — they are no more
+  sensitive than the decrypted vault data already in the blob.
 - If the guest is locked or has no data, return `ok: false`.
 
 ### `restore_cache`
@@ -520,7 +544,7 @@ is plaintext from the guest's perspective.
 | Field              | Type                  | Meaning                                              |
 |--------------------|-----------------------|------------------------------------------------------|
 | `cached`           | `bool`                | Data-quality signal: true when data has not been confirmed against the remote (offline unlock, failed sync). |
-| `offline_cache`    | `bool`                | Whether this provider supports offline caching (has `Capability::OfflineCache`). |
+| `offline_cache`    | `bool`                | Whether offline caching is active for this provider (both `Capability::OfflineCache` declared AND host `offline_cache` config enabled). |
 | `last_cache_write` | `Option<SystemTime>`  | When the cache file was last written to disk (None = never). |
 
 The CLI shows `cached` as `"unlocked (cached)"` in `rosec provider list`
@@ -546,5 +570,6 @@ and `rosec status` to alert the user that secrets may be stale.
 - [ ] If using WASI file I/O on storage that could be network-mounted
       (e.g. home directories), TCP probe declared for the file server
 - [ ] If supporting offline cache: `capabilities` includes `"offline_cache"`,
-      `export_cache` serializes in-memory state (without network tokens),
-      `restore_cache` deserializes it and makes data-access functions work
+      `export_cache` serializes in-memory state (optionally including session
+      tokens for automatic recovery), `restore_cache` deserializes it and
+      makes data-access functions work
