@@ -107,6 +107,9 @@ pub struct WasmProvider {
     cached: std::sync::atomic::AtomicBool,
     /// Timestamp of the last successful cache write-back to disk.
     last_cache_write: std::sync::Mutex<Option<std::time::SystemTime>>,
+    /// SHA-256 hash of the last blob written to the cache file.
+    /// Used to skip redundant writes when the guest state hasn't changed.
+    last_cache_blob_hash: std::sync::Mutex<Option<[u8; 32]>>,
 }
 
 impl std::fmt::Debug for WasmProvider {
@@ -217,6 +220,7 @@ impl WasmProvider {
             cache_key: std::sync::Mutex::new(None),
             cached: std::sync::atomic::AtomicBool::new(false),
             last_cache_write: std::sync::Mutex::new(None),
+            last_cache_blob_hash: std::sync::Mutex::new(None),
         })
     }
 
@@ -546,6 +550,7 @@ impl WasmProvider {
     /// path to succeed).
     fn try_export_cache(&self, plugin: &mut Plugin) {
         use crate::protocol::ExportCacheResponse;
+        use sha2::{Digest, Sha256};
 
         if !plugin.function_exists("export_cache") {
             return;
@@ -579,6 +584,23 @@ impl WasmProvider {
             return;
         };
 
+        // Skip the write if the blob hasn't changed since the last write.
+        let blob_bytes = blob_b64.as_bytes();
+        let blob_hash: [u8; 32] = Sha256::digest(blob_bytes).into();
+        {
+            let prev_hash = self
+                .last_cache_blob_hash
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if prev_hash.as_ref() == Some(&blob_hash) {
+                debug!(
+                    provider = %self.config.id,
+                    "cache blob unchanged — skipping write"
+                );
+                return;
+            }
+        }
+
         let cache_key_guard = self.cache_key.lock().unwrap_or_else(|e| e.into_inner());
         let Some(cache_key) = cache_key_guard.as_ref() else {
             debug!(
@@ -588,12 +610,16 @@ impl WasmProvider {
             return;
         };
 
-        match crate::cache::write_cache_file(&self.config.id, cache_key, blob_b64.as_bytes()) {
+        match crate::cache::write_cache_file(&self.config.id, cache_key, blob_bytes) {
             Ok(write_time) => {
                 *self
                     .last_cache_write
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = Some(write_time);
+                *self
+                    .last_cache_blob_hash
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(blob_hash);
             }
             Err(e) => {
                 warn!(
@@ -975,6 +1001,10 @@ impl Provider for WasmProvider {
             *self.cache_key.lock().unwrap_or_else(|e| e.into_inner()) = None;
             self.cached
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            *self
+                .last_cache_blob_hash
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
             // Note: last_cache_write is intentionally NOT reset — it reflects
             // when the file was last written, which is useful even after lock.
 
