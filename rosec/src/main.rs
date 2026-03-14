@@ -579,7 +579,11 @@ async fn trigger_unlock(conn: &Connection) -> Result<()> {
             )
             .await?;
             let cancel_path = OwnedObjectPath::try_from(prompt_path.clone())
-                .unwrap_or_else(|_| OwnedObjectPath::try_from("/".to_string()).unwrap());
+                .unwrap_or_else(|_| {
+                    // "/" is always a valid D-Bus object path.
+                    OwnedObjectPath::try_from("/".to_string())
+                        .unwrap_or_else(|_| unreachable!("root path is always valid"))
+                });
             let _: Result<bool, _> = daemon_proxy.call("CancelPrompt", &(&cancel_path,)).await;
             bail!("cancelled by user");
         }
