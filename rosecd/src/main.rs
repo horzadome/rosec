@@ -206,17 +206,36 @@ async fn run() -> Result<()> {
 /// Background sync loop: periodically checks each unlocked provider for remote
 /// changes, syncs when needed, and rebuilds the item cache as a safety net.
 ///
-/// Reads `refresh_interval_secs` from live config on every tick so config file
-/// changes take effect without a restart.
+/// **Per-provider scheduling:** Each provider tracks its own last-checked
+/// timestamp.  The loop ticks every [`SYNC_TICK_SECS`] seconds and only
+/// processes providers whose effective interval has elapsed.
+///
+/// **Accelerated cached-mode retry:** When a provider is in cached mode
+/// (operating from its offline cache), the effective interval is
+/// `refresh_interval_secs × cache_sync_modifier` (default 0.2, i.e. 5×
+/// more frequent).  Once a sync succeeds and clears the `cached` flag, the
+/// provider reverts to its normal interval on the next tick.
+///
+/// Both `refresh_interval_secs` and `cache_sync_modifier` are read from
+/// live config on every tick, so config changes take effect without a restart.
+const SYNC_TICK_SECS: u64 = 5;
+
 async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
+    use std::collections::HashMap;
+    use std::time::Instant;
+
     let mut consecutive_failures = 0u32;
+    // Per-provider tracking: last time we checked, and per-provider failure
+    // counter for log suppression.
+    let mut last_checked: HashMap<String, Instant> = HashMap::new();
+    let mut provider_failures: HashMap<String, u32> = HashMap::new();
+
     loop {
-        let interval_secs = state
-            .live_config()
-            .service
-            .refresh_interval_secs
-            .unwrap_or(60);
-        tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(SYNC_TICK_SECS)).await;
+
+        let config = state.live_config();
+        let base_interval_secs = config.service.refresh_interval_secs.unwrap_or(60);
+        let now = Instant::now();
 
         let mut did_any_work = false;
 
@@ -230,17 +249,52 @@ async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
                 continue;
             }
 
-            let locked = match provider.status().await {
-                Ok(s) => s.locked,
+            let status = match provider.status().await {
+                Ok(s) => s,
                 Err(e) => {
                     tracing::debug!(provider = %provider_id, error = %e, "status check failed, skipping");
                     continue;
                 }
             };
 
-            if locked {
+            if status.locked {
                 tracing::debug!(provider = %provider_id, "background: provider locked, skipping sync");
+                // Reset last-checked so that when it unlocks, we check
+                // immediately rather than waiting a full interval.
+                last_checked.remove(&provider_id);
                 continue;
+            }
+
+            // Compute effective interval: accelerate when cached.
+            let fraction = if status.cached {
+                config
+                    .provider
+                    .iter()
+                    .find(|e| e.id == provider_id)
+                    .map_or(0.2, |e| e.effective_cache_sync_modifier())
+            } else {
+                1.0
+            };
+            let effective_secs = (base_interval_secs as f64 * fraction)
+                .ceil()
+                .max(SYNC_TICK_SECS as f64) as u64;
+
+            // Check whether enough time has elapsed since last check.
+            // First iteration or just unlocked → no entry → check immediately.
+            if let Some(&last) = last_checked.get(&provider_id)
+                && now.duration_since(last).as_secs() < effective_secs
+            {
+                continue;
+            }
+
+            last_checked.insert(provider_id.clone(), now);
+
+            if status.cached {
+                tracing::debug!(
+                    provider = %provider_id,
+                    effective_interval_secs = effective_secs,
+                    "background: provider cached, using accelerated sync interval"
+                );
             }
 
             match provider.check_remote_changed().await {
@@ -250,22 +304,62 @@ async fn background_sync_loop(state: Arc<rosec_secret_service::ServiceState>) {
                         Ok(true) => {
                             tracing::debug!(provider = %provider_id, "background: sync ok");
                             did_any_work = true;
+                            provider_failures.remove(&provider_id);
+
+                            if status.cached {
+                                tracing::info!(
+                                    provider = %provider_id,
+                                    "provider recovered from cached mode after successful sync"
+                                );
+                            }
                         }
                         Ok(false) => {
                             tracing::debug!(provider = %provider_id, "background: sync skipped (already in progress)");
                         }
                         Err(e) => {
-                            log_background_failure(
-                                &mut consecutive_failures,
-                                &provider_id,
-                                "sync",
-                                &e,
-                            );
+                            let pf = provider_failures.entry(provider_id.clone()).or_insert(0);
+                            log_background_failure(pf, &provider_id, "sync", &e);
                         }
                     }
                 }
                 Ok(false) => {
                     tracing::debug!(provider = %provider_id, "background: no remote changes");
+                    provider_failures.remove(&provider_id);
+
+                    // If the provider is cached but probes passed (no remote
+                    // changes is still a successful probe), try syncing anyway
+                    // to refresh from the server and clear cached state.
+                    if status.cached {
+                        tracing::info!(
+                            provider = %provider_id,
+                            "background: provider cached but probes passed, forcing sync to recover"
+                        );
+                        match state.try_sync_provider(&provider_id).await {
+                            Ok(true) => {
+                                tracing::info!(
+                                    provider = %provider_id,
+                                    "provider recovered from cached mode after forced sync"
+                                );
+                                did_any_work = true;
+                                provider_failures.remove(&provider_id);
+                            }
+                            Ok(false) => {
+                                tracing::debug!(
+                                    provider = %provider_id,
+                                    "background: forced sync skipped (already in progress)"
+                                );
+                            }
+                            Err(e) => {
+                                let pf = provider_failures.entry(provider_id.clone()).or_insert(0);
+                                log_background_failure(
+                                    pf,
+                                    &provider_id,
+                                    "forced sync (cached recovery)",
+                                    &e,
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::debug!(provider = %provider_id, error = %e,
@@ -1207,6 +1301,22 @@ async fn config_watcher(
                 refresh_interval_secs = ?new_config.service.refresh_interval_secs,
                 "hot-reload: refresh_interval_secs updated (takes effect on next timer tick)"
             );
+        }
+        // Log per-provider cache_sync_modifier changes.
+        for new_entry in &new_config.provider {
+            let old_fraction = old_config
+                .provider
+                .iter()
+                .find(|e| e.id == new_entry.id)
+                .and_then(|e| e.cache_sync_modifier);
+            if new_entry.cache_sync_modifier != old_fraction {
+                tracing::info!(
+                    provider = %new_entry.id,
+                    cache_sync_modifier = ?new_entry.cache_sync_modifier,
+                    effective = new_entry.effective_cache_sync_modifier(),
+                    "hot-reload: cache_sync_modifier updated (takes effect on next sync tick)"
+                );
+            }
         }
         if new_config.autolock != old_config.autolock {
             tracing::info!(

@@ -224,6 +224,31 @@ pub struct ProviderEntry {
     /// global `[autolock]` section.
     #[serde(default)]
     pub autolock: Option<AutoLockOverride>,
+
+    /// Multiplier applied to `refresh_interval_secs` when this provider is
+    /// operating from its offline cache.
+    ///
+    /// While a provider is in cached mode (i.e. it was unlocked from its
+    /// offline cache or a sync has failed), the background sync loop polls
+    /// readiness probes at `refresh_interval_secs × cache_sync_modifier`
+    /// instead of the full interval.  This allows faster recovery once
+    /// network connectivity is restored.
+    ///
+    /// - **< 1.0** — check *more* frequently than normal (e.g. `0.2` with a
+    ///   60 s base interval → probe every 12 s)
+    /// - **= 1.0** — same rate as normal sync
+    /// - **> 1.0** — check *less* frequently (deliberate back-off)
+    ///
+    /// Clamped to `(0.0, 5.0]`.  Defaults to `0.2`.
+    ///
+    /// ```toml
+    /// [[provider]]
+    /// id                  = "bw1"
+    /// kind                = "bitwarden-pm"
+    /// cache_sync_modifier = 0.1   # probe every 6 s (10× faster)
+    /// ```
+    #[serde(default)]
+    pub cache_sync_modifier: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -268,6 +293,22 @@ impl std::fmt::Debug for ProviderEntry {
             .field("return_attr", &self.return_attr)
             .field("match_attr", &self.match_attr)
             .finish()
+    }
+}
+
+/// Default modifier applied when [`ProviderEntry::cache_sync_modifier`] is
+/// not set.  At 0.2, a 60 s base interval becomes 12 s while cached.
+const DEFAULT_CACHE_SYNC_MODIFIER: f64 = 0.2;
+
+impl ProviderEntry {
+    /// Effective cached-mode sync modifier, clamped to `(0.0, 5.0]`.
+    ///
+    /// Returns [`DEFAULT_CACHE_SYNC_MODIFIER`] when the field is `None`.
+    pub fn effective_cache_sync_modifier(&self) -> f64 {
+        let raw = self
+            .cache_sync_modifier
+            .unwrap_or(DEFAULT_CACHE_SYNC_MODIFIER);
+        raw.clamp(f64::MIN_POSITIVE, 5.0)
     }
 }
 
@@ -741,5 +782,80 @@ mod tests {
         // 0 in override → None in merged (disabled)
         assert!(merged.idle_timeout_minutes.is_none());
         assert!(merged.max_unlocked_minutes.is_none());
+    }
+
+    #[test]
+    fn cache_sync_modifier_defaults_to_none() {
+        let toml_str = r#"
+            [[provider]]
+            id = "bw1"
+            kind = "bitwarden-pm"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.provider[0].cache_sync_modifier.is_none());
+    }
+
+    #[test]
+    fn cache_sync_modifier_parsed_from_toml() {
+        let toml_str = r#"
+            [[provider]]
+            id = "bw1"
+            kind = "bitwarden-pm"
+            cache_sync_modifier = 0.1
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.provider[0].cache_sync_modifier, Some(0.1));
+        assert!((cfg.provider[0].effective_cache_sync_modifier() - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cache_sync_modifier_effective_default() {
+        let toml_str = r#"
+            [[provider]]
+            id = "bw1"
+            kind = "bitwarden-pm"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        // Default is 0.2
+        assert!((cfg.provider[0].effective_cache_sync_modifier() - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cache_sync_modifier_clamped_below_zero() {
+        let toml_str = r#"
+            [[provider]]
+            id = "bw1"
+            kind = "bitwarden-pm"
+            cache_sync_modifier = -0.5
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        // Clamped to f64::MIN_POSITIVE (effectively near-zero but positive)
+        let frac = cfg.provider[0].effective_cache_sync_modifier();
+        assert!(frac > 0.0);
+        assert!(frac <= 1.0);
+    }
+
+    #[test]
+    fn cache_sync_modifier_clamped_above_five() {
+        let toml_str = r#"
+            [[provider]]
+            id = "bw1"
+            kind = "bitwarden-pm"
+            cache_sync_modifier = 10.0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!((cfg.provider[0].effective_cache_sync_modifier() - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cache_sync_modifier_exactly_one() {
+        let toml_str = r#"
+            [[provider]]
+            id = "bw1"
+            kind = "bitwarden-pm"
+            cache_sync_modifier = 1.0
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!((cfg.provider[0].effective_cache_sync_modifier() - 1.0).abs() < f64::EPSILON);
     }
 }
