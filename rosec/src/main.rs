@@ -15,6 +15,11 @@ use rosec_core::config_edit;
 
 mod enable;
 
+/// D-Bus wire type for `org.rosec.Daemon.ProviderList` entries.
+///
+/// Fields: `(id, name, kind, locked, cached, offline_cache, last_cache_write_epoch, last_sync_epoch)`.
+type ProviderEntry = (String, String, String, bool, bool, bool, u64, u64);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Reset SIGPIPE to default so piping output to `head` etc. exits cleanly
@@ -374,7 +379,7 @@ async fn wait_for_daemon_reload(id: &str) -> Option<zbus::Proxy<'static>> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
         if let Ok(entries) = proxy
-            .call::<_, _, Vec<(String, String, String, bool)>>("ProviderList", &())
+            .call::<_, _, Vec<ProviderEntry>>("ProviderList", &())
             .await
             && entries.iter().any(|(bid, ..)| bid == id)
         {
@@ -941,7 +946,7 @@ async fn cmd_provider_list() -> Result<()> {
         )
         .await
         && let Ok(entries) = proxy
-            .call::<_, _, Vec<(String, String, String, bool)>>("ProviderList", &())
+            .call::<_, _, Vec<ProviderEntry>>("ProviderList", &())
             .await
     {
         if entries.is_empty() && disabled.is_empty() {
@@ -949,29 +954,69 @@ async fn cmd_provider_list() -> Result<()> {
             return Ok(());
         }
 
-        let all_ids: Vec<&str> = entries
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Build row data with sync strings for column width measurement.
+        struct RowData {
+            id: String,
+            name: String,
+            kind: String,
+            state: String,
+            sync: String,
+        }
+
+        let mut rows: Vec<RowData> = entries
             .iter()
-            .map(|(id, ..)| id.as_str())
-            .chain(disabled.iter().map(|p| p.id.as_str()))
-            .collect();
-        let all_names: Vec<&str> = entries
-            .iter()
-            .map(|(_, n, ..)| n.as_str())
-            .chain(disabled.iter().map(|p| p.id.as_str()))
-            .collect();
-        let all_kinds: Vec<&str> = entries
-            .iter()
-            .map(|(_, _, k, _)| k.as_str())
-            .chain(disabled.iter().map(|p| p.kind.as_str()))
+            .map(|(id, name, kind, locked, cached, _, _, last_sync)| {
+                let state = match (*locked, *cached) {
+                    (true, _) => "locked".to_string(),
+                    (false, true) => "unlocked (cached)".to_string(),
+                    (false, false) => "unlocked".to_string(),
+                };
+                let sync = if *locked {
+                    String::new()
+                } else {
+                    format_relative_time(*last_sync, now_epoch)
+                };
+                RowData {
+                    id: id.clone(),
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    state,
+                    sync,
+                }
+            })
             .collect();
 
-        let id_w = all_ids.iter().map(|s| s.len()).max().unwrap_or(2).max(2);
-        let name_w = all_names.iter().map(|s| s.len()).max().unwrap_or(4).max(4);
-        let kind_w = all_kinds.iter().map(|s| s.len()).max().unwrap_or(4).max(4);
-        let state_w = "unlocked".len().max("STATE".len());
+        for entry in &disabled {
+            rows.push(RowData {
+                id: entry.id.clone(),
+                name: entry.id.clone(),
+                kind: entry.kind.clone(),
+                state: "disabled".to_string(),
+                sync: String::new(),
+            });
+        }
 
-        // Priority: ID > NAME > KIND > STATE (fit to terminal).
-        let mut cols = [
+        let id_w = rows.iter().map(|r| r.id.len()).max().unwrap_or(2).max(2);
+        let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
+        let kind_w = rows.iter().map(|r| r.kind.len()).max().unwrap_or(4).max(4);
+        let state_w = rows.iter().map(|r| r.state.len()).max().unwrap_or(5).max(5);
+        let sync_w = rows.iter().map(|r| r.sync.len()).max().unwrap_or(0).max(
+            if rows.iter().any(|r| !r.sync.is_empty()) {
+                "LAST SYNC".len()
+            } else {
+                0
+            },
+        );
+
+        let has_sync_col = sync_w > 0;
+
+        // Priority: ID > NAME > KIND > STATE > SYNC (fit to terminal).
+        let mut cols = vec![
             ColSpec {
                 natural: id_w,
                 min: 2,
@@ -989,37 +1034,65 @@ async fn cmd_provider_list() -> Result<()> {
             },
             ColSpec {
                 natural: state_w,
-                min: "STATE".len(),
+                min: 5,
                 allocated: 0,
             },
         ];
+        if has_sync_col {
+            cols.push(ColSpec {
+                natural: sync_w,
+                min: "SYNC".len(),
+                allocated: 0,
+            });
+        }
+
         fit_columns(&mut cols, 2, terminal_width());
         let id_w = cols[0].allocated;
         let name_w = cols[1].allocated;
         let kind_w = cols[2].allocated;
+        let state_w = cols[3].allocated;
+        let sync_w = if has_sync_col { cols[4].allocated } else { 0 };
 
-        println!(
-            "{:<id_w$}  {:<name_w$}  {:<kind_w$}  STATE",
-            "ID", "NAME", "KIND",
-        );
-        let sep_w = id_w + 2 + name_w + 2 + kind_w + 2 + state_w;
-        println!("{}", "-".repeat(sep_w));
-        for (id, name, kind, locked) in &entries {
+        if has_sync_col {
             println!(
-                "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {}",
-                trunc(id, id_w),
-                trunc(name, name_w),
-                trunc(kind, kind_w),
-                if *locked { "locked" } else { "unlocked" },
+                "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<state_w$}  LAST SYNC",
+                "ID", "NAME", "KIND", "STATE",
+            );
+        } else {
+            println!(
+                "{:<id_w$}  {:<name_w$}  {:<kind_w$}  STATE",
+                "ID", "NAME", "KIND",
             );
         }
-        for entry in &disabled {
-            println!(
-                "{:<id_w$}  {:<name_w$}  {:<kind_w$}  disabled",
-                trunc(&entry.id, id_w),
-                trunc(&entry.id, name_w),
-                trunc(&entry.kind, kind_w),
-            );
+        let sep_w = id_w
+            + 2
+            + name_w
+            + 2
+            + kind_w
+            + 2
+            + state_w
+            + if has_sync_col { 2 + sync_w } else { 0 };
+        println!("{}", "\u{2500}".repeat(sep_w));
+
+        for row in &rows {
+            if has_sync_col {
+                println!(
+                    "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<state_w$}  {}",
+                    trunc(&row.id, id_w),
+                    trunc(&row.name, name_w),
+                    trunc(&row.kind, kind_w),
+                    trunc(&row.state, state_w),
+                    trunc(&row.sync, sync_w),
+                );
+            } else {
+                println!(
+                    "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {}",
+                    trunc(&row.id, id_w),
+                    trunc(&row.name, name_w),
+                    trunc(&row.kind, kind_w),
+                    trunc(&row.state, state_w),
+                );
+            }
         }
         return Ok(());
     }
@@ -1064,7 +1137,7 @@ async fn cmd_provider_list() -> Result<()> {
 
     println!("{:<id_w$}  {:<kind_w$}  STATE", "ID", "KIND");
     let sep_w = id_w + 2 + kind_w + 2 + state_w;
-    println!("{}", "-".repeat(sep_w));
+    println!("{}", "\u{2500}".repeat(sep_w));
     for entry in &cfg.provider {
         let state = if entry.enabled {
             "(daemon not running)"
@@ -1779,44 +1852,30 @@ fn expand_tilde(path: &str) -> String {
 // ---------------------------------------------------------------------------
 
 async fn cmd_status() -> Result<()> {
-    // ── Version info ────────────────────────────────────────────────
-    println!("Components:");
-    println!(
-        "  {:<22} {} ({})",
-        "rosec",
-        env!("ROSEC_VERSION"),
-        env!("ROSEC_GIT_SHA"),
-    );
+    // ── Header ──────────────────────────────────────────────────────
+    let ver = format!("{} ({})", env!("ROSEC_VERSION"), env!("ROSEC_GIT_SHA"));
+    let cfg_path = config_path();
+    let cfg_display = cfg_path
+        .strip_prefix(
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+        )
+        .map(|rel| format!("~/{}", rel.display()))
+        .unwrap_or_else(|_| cfg_path.display().to_string());
 
-    // Probe sibling binaries for their version strings.
-    for bin in &["rosecd", "rosec-prompt"] {
-        let ver = probe_binary_version(bin).unwrap_or_else(|| "not found".to_string());
-        println!("  {:<22} {ver}", bin);
-    }
+    let socket_display = if std::env::var_os("ROSEC_SOCKET").is_some() {
+        "private socket"
+    } else {
+        "session bus"
+    };
 
-    // rosec-pam-unlock may live in /usr/lib/rosec/ rather than on $PATH.
-    let pam_unlock_ver = probe_binary_version("rosec-pam-unlock")
-        .or_else(|| probe_binary_version_at("/usr/lib/rosec/rosec-pam-unlock"));
-    println!(
-        "  {:<22} {}",
-        "rosec-pam-unlock",
-        pam_unlock_ver.unwrap_or_else(|| "not found".to_string())
-    );
-
-    // pam_rosec.so — no version info, just presence check.
-    let pam_so = std::path::Path::new("/usr/lib/security/pam_rosec.so");
-    println!(
-        "  {:<22} {}",
-        "pam_rosec.so",
-        if pam_so.exists() {
-            "installed"
-        } else {
-            "not found"
-        }
-    );
+    println!("  {:<14}{ver}", "Daemon");
+    println!("  {:<14}{cfg_display}", "Config");
+    println!("  {:<14}{socket_display}", "Socket");
     println!();
 
-    // ── Daemon status ───────────────────────────────────────────────
+    // ── Daemon connection ───────────────────────────────────────────
     let conn = conn().await?;
     let proxy = zbus::Proxy::new(
         &conn,
@@ -1826,25 +1885,198 @@ async fn cmd_status() -> Result<()> {
     )
     .await?;
 
-    let (cache_size, last_sync_epoch, sessions): (u32, u64, u32) =
-        proxy.call("Status", &()).await?;
+    let (cache_size,): (u32,) = proxy.call("Status", &()).await?;
 
-    // Fetch all providers with type and lock state.
-    let providers: Vec<(String, String, String, bool)> = proxy.call("ProviderList", &()).await?;
+    // ── Provider table ──────────────────────────────────────────────
+    let cfg = load_config();
+    let disabled: Vec<&rosec_core::config::ProviderEntry> =
+        cfg.provider.iter().filter(|p| !p.enabled).collect();
+    let providers: Vec<ProviderEntry> = proxy.call("ProviderList", &()).await?;
 
-    println!("Providers:");
-    for (id, name, kind, locked) in &providers {
-        let lock_indicator = if *locked { "locked" } else { "unlocked" };
-        println!("  {name} ({id})  [{kind}, {lock_indicator}]");
+    println!("Providers");
+
+    if providers.is_empty() && disabled.is_empty() {
+        println!("  (none configured)");
+    } else {
+        // Build state + sync strings for column width measurement.
+        struct RowData {
+            id: String,
+            name: String,
+            kind: String,
+            state: String,
+            sync: String,
+        }
+
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut rows: Vec<RowData> = providers
+            .iter()
+            .map(
+                |(id, name, kind, locked, cached, _offline_cache, _last_cache_write, last_sync)| {
+                    let state = match (*locked, *cached) {
+                        (true, _) => "locked".to_string(),
+                        (false, true) => "unlocked (cached)".to_string(),
+                        (false, false) => "unlocked".to_string(),
+                    };
+                    let sync = if *locked {
+                        String::new()
+                    } else {
+                        format_relative_time(*last_sync, now_epoch)
+                    };
+                    RowData {
+                        id: id.clone(),
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        state,
+                        sync,
+                    }
+                },
+            )
+            .collect();
+
+        for entry in &disabled {
+            rows.push(RowData {
+                id: entry.id.clone(),
+                name: entry.id.clone(),
+                kind: entry.kind.clone(),
+                state: "disabled".to_string(),
+                sync: String::new(),
+            });
+        }
+
+        let id_w = rows.iter().map(|r| r.id.len()).max().unwrap_or(2).max(2);
+        let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
+        let kind_w = rows.iter().map(|r| r.kind.len()).max().unwrap_or(4).max(4);
+        let state_w = rows.iter().map(|r| r.state.len()).max().unwrap_or(5).max(5);
+        let sync_w = rows.iter().map(|r| r.sync.len()).max().unwrap_or(0).max(
+            if rows.iter().any(|r| !r.sync.is_empty()) {
+                "LAST SYNC".len()
+            } else {
+                0
+            },
+        );
+
+        let has_sync_col = sync_w > 0;
+
+        // Priority ordering: ID > NAME > KIND > STATE > SYNC
+        let mut cols = vec![
+            ColSpec {
+                natural: id_w,
+                min: 2,
+                allocated: 0,
+            },
+            ColSpec {
+                natural: name_w,
+                min: 4,
+                allocated: 0,
+            },
+            ColSpec {
+                natural: kind_w,
+                min: 4,
+                allocated: 0,
+            },
+            ColSpec {
+                natural: state_w,
+                min: 5,
+                allocated: 0,
+            },
+        ];
+        if has_sync_col {
+            cols.push(ColSpec {
+                natural: sync_w,
+                min: "SYNC".len(),
+                allocated: 0,
+            });
+        }
+
+        fit_columns(&mut cols, 2, terminal_width().saturating_sub(2)); // 2-char indent
+        let id_w = cols[0].allocated;
+        let name_w = cols[1].allocated;
+        let kind_w = cols[2].allocated;
+        let state_w = cols[3].allocated;
+        let sync_w = if has_sync_col { cols[4].allocated } else { 0 };
+
+        // Header
+        if has_sync_col {
+            println!(
+                "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<state_w$}  LAST SYNC",
+                "ID", "NAME", "KIND", "STATE",
+            );
+        } else {
+            println!(
+                "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  STATE",
+                "ID", "NAME", "KIND",
+            );
+        }
+        let sep_w = id_w
+            + 2
+            + name_w
+            + 2
+            + kind_w
+            + 2
+            + state_w
+            + if has_sync_col { 2 + sync_w } else { 0 };
+        println!("  {}", "\u{2500}".repeat(sep_w));
+
+        for row in &rows {
+            if has_sync_col {
+                println!(
+                    "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<state_w$}  {}",
+                    trunc(&row.id, id_w),
+                    trunc(&row.name, name_w),
+                    trunc(&row.kind, kind_w),
+                    trunc(&row.state, state_w),
+                    trunc(&row.sync, sync_w),
+                );
+            } else {
+                println!(
+                    "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  {}",
+                    trunc(&row.id, id_w),
+                    trunc(&row.name, name_w),
+                    trunc(&row.kind, kind_w),
+                    trunc(&row.state, state_w),
+                );
+            }
+        }
     }
     println!();
-    println!("Cache size:  {cache_size} items");
-    if last_sync_epoch > 0 {
-        println!("Last sync:   {last_sync_epoch} (epoch secs)");
-    } else {
-        println!("Last sync:   never");
+
+    // ── Daemon summary ──────────────────────────────────────────────
+    println!("Daemon");
+    println!("  {:<14}{cache_size} items", "Items");
+    println!();
+
+    // ── Components ──────────────────────────────────────────────────
+    println!("Components");
+    println!("  {:<22}{ver}", "rosec");
+
+    for bin in &["rosecd", "rosec-prompt"] {
+        let bin_ver = probe_binary_version(bin).unwrap_or_else(|| "not found".to_string());
+        println!("  {:<22}{bin_ver}", bin);
     }
-    println!("Sessions:    {sessions}");
+
+    let pam_unlock_ver = probe_binary_version("rosec-pam-unlock")
+        .or_else(|| probe_binary_version_at("/usr/lib/rosec/rosec-pam-unlock"));
+    println!(
+        "  {:<22}{}",
+        "rosec-pam-unlock",
+        pam_unlock_ver.unwrap_or_else(|| "not found".to_string())
+    );
+
+    let pam_so = std::path::Path::new("/usr/lib/security/pam_rosec.so");
+    println!(
+        "  {:<22}{}",
+        "pam_rosec.so",
+        if pam_so.exists() {
+            "installed"
+        } else {
+            "not found"
+        }
+    );
+
     Ok(())
 }
 
@@ -1906,9 +2138,9 @@ async fn cmd_sync() -> Result<()> {
     .await?;
 
     // Fetch the list of providers so we know which ones to sync.
-    let providers: Vec<(String, String, String, bool)> = proxy.call("ProviderList", &()).await?;
+    let providers: Vec<ProviderEntry> = proxy.call("ProviderList", &()).await?;
 
-    for (id, _name, _kind, _locked) in &providers {
+    for (id, _name, _kind, _locked, ..) in &providers {
         eprint!("Syncing '{id}'...");
         match proxy.call::<_, _, u32>("SyncProvider", &(id,)).await {
             Ok(count) => {
@@ -1942,10 +2174,11 @@ async fn cmd_sync() -> Result<()> {
 
 /// Ensure the daemon's cache is fresh by syncing providers in parallel.
 ///
-/// Checks `DaemonStatus.last_sync_epoch` — if the last sync was more than
-/// 60 seconds ago (matching the daemon's internal staleness threshold), calls
-/// `SyncProvider` for each unlocked provider concurrently.  If the cache is
-/// already fresh, this is a single cheap D-Bus call with no network I/O.
+/// Syncs unlocked providers that haven't synced in the last 60 seconds.
+///
+/// Uses per-provider `last_sync` from `ProviderList` to decide which providers
+/// are stale.  If all providers are fresh, this is a single cheap D-Bus call
+/// with no network I/O.
 ///
 /// Locked providers are skipped — the caller handles unlock via the Prompt flow
 /// and can call this again afterwards to sync the newly-unlocked providers.
@@ -1958,27 +2191,23 @@ async fn preemptive_sync(conn: &Connection) -> Result<()> {
     )
     .await?;
 
-    // Check global staleness: if last_sync_epoch is within 60 s, skip.
-    let status: (u32, u64, u32) = proxy.call("Status", &()).await?;
-    let last_sync_epoch = status.1;
+    let providers: Vec<ProviderEntry> = proxy.call("ProviderList", &()).await?;
 
-    if last_sync_epoch > 0 {
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if now_epoch.saturating_sub(last_sync_epoch) < 60 {
-            return Ok(());
-        }
-    }
-
-    // Stale or never synced — sync each unlocked provider in parallel.
-    let providers: Vec<(String, String, String, bool)> = proxy.call("ProviderList", &()).await?;
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     let futures: Vec<_> = providers
         .into_iter()
-        .filter(|(_, _, _, locked)| !locked)
-        .map(|(id, _, _, _)| {
+        .filter(|(_, _, _, locked, _, _, _, last_sync)| {
+            // Skip locked providers and providers synced within the last 60 s.
+            if *locked {
+                return false;
+            }
+            *last_sync == 0 || now_epoch.saturating_sub(*last_sync) >= 60
+        })
+        .map(|(id, ..)| {
             let conn = conn.clone();
             async move {
                 let p = zbus::Proxy::new(
@@ -2018,8 +2247,8 @@ async fn any_providers_locked(conn: &Connection) -> Result<bool> {
         "org.rosec.Daemon",
     )
     .await?;
-    let providers: Vec<(String, String, String, bool)> = proxy.call("ProviderList", &()).await?;
-    Ok(providers.iter().any(|(_, _, _, locked)| *locked))
+    let providers: Vec<ProviderEntry> = proxy.call("ProviderList", &()).await?;
+    Ok(providers.iter().any(|(_, _, _, locked, ..)| *locked))
 }
 
 /// Output format for `rosec search`.
@@ -2142,7 +2371,7 @@ async fn warn_if_no_providers(conn: &Connection) {
         return;
     };
     let Ok(entries) = proxy
-        .call::<_, _, Vec<(String, String, String, bool)>>("ProviderList", &())
+        .call::<_, _, Vec<ProviderEntry>>("ProviderList", &())
         .await
     else {
         return;
@@ -2401,6 +2630,25 @@ async fn fetch_item_data(conn: &zbus::Connection, path: &str, locked: bool) -> R
 }
 
 /// Truncate a string to `max` display chars, appending `…` if cut.
+/// Format an epoch timestamp as a human-readable relative time string.
+///
+/// Returns "never" for 0, otherwise "Xs ago", "Xm ago", "Xh ago", or "Xd ago".
+fn format_relative_time(epoch_secs: u64, now_epoch: u64) -> String {
+    if epoch_secs == 0 {
+        return "never".to_string();
+    }
+    let delta = now_epoch.saturating_sub(epoch_secs);
+    if delta < 60 {
+        format!("{delta}s ago")
+    } else if delta < 3600 {
+        format!("{}m ago", delta / 60)
+    } else if delta < 86400 {
+        format!("{}h ago", delta / 3600)
+    } else {
+        format!("{}d ago", delta / 86400)
+    }
+}
+
 fn trunc(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -3390,9 +3638,11 @@ async fn cmd_lock() -> Result<()> {
         "org.rosec.Daemon",
     )
     .await?;
-    let providers: Vec<(String, String, String, bool)> =
-        mgmt_proxy.call("ProviderList", &()).await?;
-    let unlocked_count = providers.iter().filter(|(_, _, _, locked)| !locked).count();
+    let providers: Vec<ProviderEntry> = mgmt_proxy.call("ProviderList", &()).await?;
+    let unlocked_count = providers
+        .iter()
+        .filter(|(_, _, _, locked, ..)| !locked)
+        .count();
 
     let proxy = zbus::Proxy::new(
         &conn,
@@ -3433,7 +3683,7 @@ async fn cmd_unlock() -> Result<()> {
     )
     .await?;
 
-    let providers: Vec<(String, String, String, bool)> = proxy.call("ProviderList", &()).await?;
+    let providers: Vec<ProviderEntry> = proxy.call("ProviderList", &()).await?;
 
     if providers.is_empty() {
         println!("No providers configured. Run `rosec provider add <kind>` to add one.");
@@ -3441,8 +3691,8 @@ async fn cmd_unlock() -> Result<()> {
     }
 
     // Report already-unlocked providers.
-    let any_locked = providers.iter().any(|(_, _, _, locked)| *locked);
-    for (id, _, _, is_locked) in &providers {
+    let any_locked = providers.iter().any(|(_, _, _, locked, ..)| *locked);
+    for (id, _, _, is_locked, ..) in &providers {
         if !is_locked {
             println!("'{id}' is already unlocked.");
         }
