@@ -2340,6 +2340,9 @@ mod tests {
             Ok(ProviderStatus {
                 locked: false,
                 last_sync: None,
+                cached: false,
+                offline_cache: false,
+                last_cache_write: None,
             })
         }
 

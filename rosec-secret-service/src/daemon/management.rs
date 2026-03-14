@@ -32,25 +32,8 @@ impl RosecManagement {
             .map(|items| items.len())
             .unwrap_or(0);
 
-        let last_sync = self
-            .state
-            .last_sync
-            .lock()
-            .ok()
-            .and_then(|guard| *guard)
-            .map(|time| {
-                time.duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            })
-            .unwrap_or(0);
-
-        let sessions_active = self.state.sessions.count().unwrap_or(0);
-
         Ok(DaemonStatus {
             cache_size: cache_size as u32,
-            last_sync_epoch: last_sync,
-            sessions_active: sessions_active as u32,
         })
     }
 
@@ -116,11 +99,23 @@ impl RosecManagement {
                 .run_on_tokio(async move { p.status().await })
                 .await?
                 .map_err(|e| FdoError::Failed(format!("status error for {id}: {e}")))?;
+            let last_cache_write = status
+                .last_cache_write
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            let last_sync = status
+                .last_sync
+                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
             entries.push(ProviderListEntry {
                 id,
                 name,
                 kind,
                 locked: status.locked,
+                cached: status.cached,
+                offline_cache: status.offline_cache,
+                last_cache_write,
+                last_sync,
             });
         }
         Ok(entries)
@@ -779,8 +774,6 @@ async fn wait_for_task_or_peer_exit<T: Send + 'static>(
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, zvariant::Type)]
 pub struct DaemonStatus {
     pub cache_size: u32,
-    pub last_sync_epoch: u64,
-    pub sessions_active: u32,
 }
 
 /// A provider list entry returned by `ProviderList`.
@@ -791,6 +784,15 @@ pub struct ProviderListEntry {
     /// The provider type string (e.g. `"bitwarden-pm"`, `"bitwarden-sm"`).
     pub kind: String,
     pub locked: bool,
+    /// True when in-memory data has not been confirmed against the remote
+    /// (offline unlock or failed sync). Data-quality signal.
+    pub cached: bool,
+    /// Whether this provider supports offline caching.
+    pub offline_cache: bool,
+    /// When the cache file was last written to disk (epoch seconds, 0 = never).
+    pub last_cache_write: u64,
+    /// When this provider last synced successfully (epoch seconds, 0 = never).
+    pub last_sync: u64,
 }
 
 /// A single auth-field descriptor returned by `GetAuthFields`.

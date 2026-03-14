@@ -4,8 +4,9 @@
 //! Changes: tracing → extism_pdk logging, anyhow → BitwardenError, crate::api → guest api types.
 
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::api::{SyncCipher, SyncResponse};
@@ -18,6 +19,11 @@ use crate::error::BitwardenError;
 /// `Clone` is intentionally not derived — cloning secret material creates
 /// untracked copies that may outlive the vault and escape zeroization.
 /// Use references (`&DecryptedCipher`) or indices wherever possible.
+///
+/// `Serialize`/`Deserialize` are used only for the offline cache blob
+/// (opaque to the host).  The serialized form lives in encrypted memory
+/// or in the host-encrypted cache file — never on disk in plaintext.
+#[derive(Serialize, Deserialize)]
 pub struct DecryptedCipher {
     pub id: String,
     pub name: String,
@@ -57,7 +63,7 @@ impl std::fmt::Debug for DecryptedCipher {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CipherType {
     Login,
     SecureNote,
@@ -91,6 +97,7 @@ impl CipherType {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct DecryptedLogin {
     /// Username is PII — zeroized on drop.
     pub username: Option<Zeroizing<String>>,
@@ -110,6 +117,7 @@ impl std::fmt::Debug for DecryptedLogin {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct DecryptedCard {
     /// Cardholder name is PII — zeroized on drop.
     pub cardholder_name: Option<Zeroizing<String>>,
@@ -138,6 +146,7 @@ impl std::fmt::Debug for DecryptedCard {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct DecryptedSshKey {
     pub private_key: Option<Zeroizing<String>>,
     pub public_key: Option<String>,
@@ -157,6 +166,7 @@ impl std::fmt::Debug for DecryptedSshKey {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct DecryptedIdentity {
     /// All identity fields are PII — zeroized on drop.
     pub title: Option<Zeroizing<String>>,
@@ -212,6 +222,7 @@ impl std::fmt::Debug for DecryptedIdentity {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct DecryptedField {
     pub name: Option<String>,
     /// Value is wrapped in `Zeroizing` because hidden fields (type 1) contain secrets.
@@ -230,6 +241,7 @@ impl std::fmt::Debug for DecryptedField {
 }
 
 /// Holds the unlocked vault state: keys + decrypted ciphers.
+#[derive(Serialize, Deserialize)]
 pub struct VaultState {
     /// The master vault keys (enc_key + mac_key).
     vault_keys: Keys,
@@ -243,8 +255,34 @@ pub struct VaultState {
     folder_names: HashMap<String, String>,
     /// All decrypted ciphers.
     ciphers: Vec<DecryptedCipher>,
-    /// Timestamp of last sync.
+    /// Timestamp of last sync (stored as epoch seconds for portability).
+    #[serde(with = "opt_system_time_epoch")]
     last_sync: Option<SystemTime>,
+}
+
+/// Serde helper: serialize `Option<SystemTime>` as `Option<u64>` epoch seconds.
+mod opt_system_time_epoch {
+    use super::*;
+
+    pub fn serialize<S: serde::Serializer>(
+        time: &Option<SystemTime>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match time {
+            Some(t) => {
+                let secs = t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs();
+                serializer.serialize_some(&secs)
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<SystemTime>, D::Error> {
+        let opt: Option<u64> = Option::deserialize(deserializer)?;
+        Ok(opt.map(|secs| UNIX_EPOCH + Duration::from_secs(secs)))
+    }
 }
 
 impl VaultState {
@@ -619,6 +657,23 @@ impl VaultState {
     #[allow(dead_code)]
     pub fn org_keys(&self, org_id: &str) -> Option<&Keys> {
         self.org_keys.get(org_id)
+    }
+
+    /// Serialize this vault state to a JSON blob for the offline cache.
+    ///
+    /// The returned bytes are the raw JSON — the host will base64-encode
+    /// and encrypt them before persisting to disk.
+    pub fn to_cache_blob(&self) -> Result<Vec<u8>, BitwardenError> {
+        serde_json::to_vec(self).map_err(|e| {
+            BitwardenError::Crypto(format!("failed to serialize vault state for cache: {e}"))
+        })
+    }
+
+    /// Deserialize a vault state from a JSON cache blob.
+    pub fn from_cache_blob(blob: &[u8]) -> Result<Self, BitwardenError> {
+        serde_json::from_slice(blob).map_err(|e| {
+            BitwardenError::Crypto(format!("failed to deserialize vault state from cache: {e}"))
+        })
     }
 }
 

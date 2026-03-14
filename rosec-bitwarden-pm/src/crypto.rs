@@ -8,11 +8,11 @@
 //! WASM guest.  Test-only encryption functions are omitted.
 
 use aes::Aes256;
-use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
 use block_padding::Pkcs7;
-use cbc::Decryptor;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use cbc::Decryptor;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use zeroize::Zeroizing;
@@ -26,6 +26,30 @@ type Aes256CbcDec = Decryptor<Aes256>;
 #[derive(Clone)]
 pub struct Keys {
     data: Zeroizing<Vec<u8>>,
+}
+
+// Custom serde for Keys: base64-encode/decode the raw 64-byte key material.
+// This is used only for the offline cache blob (host-encrypted, opaque).
+impl serde::Serialize for Keys {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(&*self.data))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Keys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = <String as serde::Deserialize>::deserialize(deserializer)?;
+        let bytes = STANDARD.decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 64 {
+            return Err(serde::de::Error::custom(format!(
+                "expected 64-byte key, got {}",
+                bytes.len()
+            )));
+        }
+        Ok(Self {
+            data: Zeroizing::new(bytes),
+        })
+    }
 }
 
 impl Keys {

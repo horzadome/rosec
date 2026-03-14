@@ -94,6 +94,15 @@ pub struct WasmProvider {
     /// the WASM instance.  Cleared on next successful `unlock` (which
     /// recreates the plugin from scratch anyway).
     poisoned: std::sync::atomic::AtomicBool,
+    /// Cache encryption key — derived from password + machine_key + provider_id
+    /// during unlock.  Held in memory while unlocked so that sync() can update
+    /// the cache without needing the password again.  Zeroized on lock().
+    cache_key: std::sync::Mutex<Option<crate::cache::CacheKey>>,
+    /// Data-quality flag: true when in-memory data has not been confirmed
+    /// against the remote.  See [`ProviderStatus::cached`] for semantics.
+    cached: std::sync::atomic::AtomicBool,
+    /// Timestamp of the last successful cache write-back to disk.
+    last_cache_write: std::sync::Mutex<Option<std::time::SystemTime>>,
 }
 
 impl std::fmt::Debug for WasmProvider {
@@ -169,53 +178,7 @@ impl WasmProvider {
         })?;
 
         // Call init to let the guest set up its internal state.
-        // Inject the host user's home directory into options so guests can
-        // resolve default paths without relying on env vars (WASI sandbox
-        // does not forward the host environment).
-        let mut options = config.options.clone();
-        if !options.contains_key("home_dir")
-            && let Ok(home) = std::env::var("HOME")
-        {
-            debug!(provider = %config.id, home = %home, "injecting home_dir into guest options");
-            options.insert("home_dir".into(), serde_json::Value::String(home));
-        }
-
-        // Log all options being sent to the guest (redact values that may be
-        // sensitive — only log the keys and string lengths).
-        for (key, val) in &options {
-            match val {
-                serde_json::Value::String(s) => {
-                    debug!(
-                        provider = %config.id,
-                        key = %key,
-                        value_len = s.len(),
-                        value_preview = %if s.len() <= 60 { s.as_str() } else { &s[..60] },
-                        "guest init option",
-                    );
-                }
-                other => {
-                    debug!(
-                        provider = %config.id,
-                        key = %key,
-                        value = %other,
-                        "guest init option",
-                    );
-                }
-            }
-        }
-
-        let init_req = InitRequest {
-            provider_id: config.id.clone(),
-            provider_name: config.name.clone(),
-            options,
-        };
-        let init_resp: InitResponse = call_guest_json(&mut plugin, "init", &init_req).0?;
-        if !init_resp.ok {
-            return Err(ProviderError::Other(anyhow::anyhow!(
-                "WASM plugin init failed: {}",
-                init_resp.error.unwrap_or_else(|| "unknown error".into()),
-            )));
-        }
+        init_guest(&mut plugin, &config, "init")?;
 
         // ── Eagerly query static metadata from the guest ─────────
 
@@ -247,6 +210,9 @@ impl WasmProvider {
             callbacks: std::sync::RwLock::new(ProviderCallbacks::default()),
             last_sync_time: std::sync::Mutex::new(None),
             poisoned: std::sync::atomic::AtomicBool::new(false),
+            cache_key: std::sync::Mutex::new(None),
+            cached: std::sync::atomic::AtomicBool::new(false),
+            last_cache_write: std::sync::Mutex::new(None),
         })
     }
 
@@ -271,26 +237,7 @@ impl WasmProvider {
         })?;
 
         // Re-run init with the same config.
-        let mut options = config.options.clone();
-        if !options.contains_key("home_dir")
-            && let Ok(home) = std::env::var("HOME")
-        {
-            options.insert("home_dir".into(), serde_json::Value::String(home));
-        }
-
-        let init_req = crate::protocol::InitRequest {
-            provider_id: config.id.clone(),
-            provider_name: config.name.clone(),
-            options,
-        };
-        let init_resp: crate::protocol::InitResponse =
-            call_guest_json(&mut plugin, "init", &init_req).0?;
-        if !init_resp.ok {
-            return Err(ProviderError::Other(anyhow::anyhow!(
-                "WASM plugin re-init failed: {}",
-                init_resp.error.unwrap_or_else(|| "unknown error".into()),
-            )));
-        }
+        init_guest(&mut plugin, config, "re-init")?;
 
         Ok(plugin)
     }
@@ -469,6 +416,147 @@ impl WasmProvider {
             "readiness probes not satisfied after {MAX_ATTEMPTS} attempts"
         )))
     }
+
+    /// Attempt offline unlock by restoring the cache file.
+    ///
+    /// Called when readiness probes fail and the provider has the
+    /// `OfflineCache` capability.
+    async fn unlock_from_cache(&self) -> Result<(), ProviderError> {
+        use crate::protocol::{RestoreCacheRequest, SimpleResponse};
+
+        // Read and decrypt the cache file while holding the cache_key lock.
+        // All synchronous work happens in this block; the lock is released
+        // before any `.await`.
+        let (blob_b64, cache_time) = {
+            let guard = self.cache_key.lock().unwrap_or_else(|e| e.into_inner());
+            let cache_key = guard.as_ref().ok_or_else(|| {
+                ProviderError::Other(anyhow::anyhow!(
+                    "cache key not derived — cannot attempt offline unlock"
+                ))
+            })?;
+
+            let max_age = crate::cache::DEFAULT_MAX_CACHE_AGE;
+            let (plaintext, cache_time) =
+                crate::cache::read_cache_file(&self.config.id, cache_key, max_age)?.ok_or_else(
+                    || ProviderError::Unavailable("no offline cache available".to_string()),
+                )?;
+
+            let blob_b64 = String::from_utf8(plaintext.to_vec()).map_err(|e| {
+                ProviderError::Other(anyhow::anyhow!("cache blob is not valid UTF-8: {e}"))
+            })?;
+
+            (blob_b64, cache_time)
+        };
+        // guard is dropped here — safe to await.
+
+        // Feed the blob back to the guest.
+        let mut plugin = self.plugin.lock().await;
+        let restore_req = RestoreCacheRequest { blob_b64 };
+        let resp: SimpleResponse = self.call_json(&mut plugin, "restore_cache", &restore_req)?;
+
+        if !resp.ok {
+            return Err(map_guest_error(resp.error, resp.error_kind));
+        }
+
+        // Offline unlock succeeded — mark as cached (data unconfirmed).
+        self.cached
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Set last_sync to the cache timestamp so consumers can assess staleness.
+        if let Ok(mut guard) = self.last_sync_time.lock() {
+            *guard = Some(chrono::DateTime::<chrono::Utc>::from(cache_time));
+        }
+
+        debug!(
+            provider = %self.config.id,
+            "offline unlock from cache succeeded"
+        );
+
+        self.fire_callback(|cbs| {
+            if let Some(ref cb) = cbs.on_unlocked {
+                cb();
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Export the guest's cache blob and persist it to disk.
+    ///
+    /// Best-effort: logs warnings on failure but does not propagate errors
+    /// (cache is a nice-to-have, not a hard requirement for the unlock/sync
+    /// path to succeed).
+    fn try_export_cache(&self, plugin: &mut Plugin) {
+        use crate::protocol::ExportCacheResponse;
+
+        if !plugin.function_exists("export_cache") {
+            return;
+        }
+
+        let resp: ExportCacheResponse = match call_guest_json_no_input(plugin, "export_cache").0 {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    provider = %self.config.id,
+                    "export_cache call failed: {e}"
+                );
+                return;
+            }
+        };
+
+        if !resp.ok {
+            warn!(
+                provider = %self.config.id,
+                error = ?resp.error,
+                "guest export_cache returned error"
+            );
+            return;
+        }
+
+        let Some(blob_b64) = resp.blob_b64 else {
+            warn!(
+                provider = %self.config.id,
+                "guest export_cache returned ok but no blob"
+            );
+            return;
+        };
+
+        let cache_key_guard = self.cache_key.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(cache_key) = cache_key_guard.as_ref() else {
+            debug!(
+                provider = %self.config.id,
+                "no cache key — skipping cache write"
+            );
+            return;
+        };
+
+        match crate::cache::write_cache_file(&self.config.id, cache_key, blob_b64.as_bytes()) {
+            Ok(write_time) => {
+                *self
+                    .last_cache_write
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(write_time);
+            }
+            Err(e) => {
+                warn!(
+                    provider = %self.config.id,
+                    "failed to write cache file: {e}"
+                );
+            }
+        }
+    }
+}
+
+impl WasmProvider {
+    /// Fire a provider callback if one is registered.
+    ///
+    /// Silently does nothing if the callbacks lock is poisoned or the
+    /// specific callback is `None`.
+    fn fire_callback(&self, f: impl FnOnce(&ProviderCallbacks)) {
+        if let Ok(cbs) = self.callbacks.read() {
+            f(&cbs);
+        }
+    }
 }
 
 // ── Provider trait impl ──────────────────────────────────────────
@@ -536,19 +624,81 @@ impl Provider for WasmProvider {
             last_sync: resp
                 .last_sync_epoch_secs
                 .map(|s| UNIX_EPOCH + Duration::from_secs(s)),
+            cached: self.cached.load(std::sync::atomic::Ordering::Relaxed),
+            offline_cache: self.capabilities().contains(&Capability::OfflineCache),
+            last_cache_write: *self
+                .last_cache_write
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
         })
     }
 
     async fn unlock(&self, input: UnlockInput) -> Result<(), ProviderError> {
-        // Wait for readiness probes before attempting unlock.
-        self.wait_for_readiness().await?;
-
-        // Extract the password (needed for credential persistence key derivation).
+        // Extract the password (needed for credential persistence key derivation
+        // and cache key derivation).
         let password_ref: &Zeroizing<String> = match &input {
             UnlockInput::Password(pw) => pw,
             UnlockInput::WithRegistration { password, .. }
             | UnlockInput::WithAuth { password, .. } => password,
         };
+
+        let has_offline_cache = self.capabilities().contains(&Capability::OfflineCache);
+
+        // Derive and store the cache key while we have the password.
+        // This must happen before any early return so that:
+        //   - online path: sync() can update the cache without the password
+        //   - offline path: we can decrypt the cache file
+        if has_offline_cache {
+            match rosec_core::machine_key::load_or_create() {
+                Ok(machine_key) => {
+                    match crate::cache::derive_cache_key(
+                        &machine_key,
+                        password_ref.as_str(),
+                        &self.config.id,
+                    ) {
+                        Ok(ck) => {
+                            *self.cache_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(ck);
+                        }
+                        Err(e) => {
+                            warn!(
+                                provider = %self.config.id,
+                                "failed to derive cache key: {e} — cache disabled for this session"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        provider = %self.config.id,
+                        "failed to load machine key: {e} — cache disabled for this session"
+                    );
+                }
+            }
+        }
+
+        // Try readiness probes.  If they fail and we have a cache, attempt
+        // offline unlock instead of propagating the error immediately.
+        let readiness_ok = match self.wait_for_readiness().await {
+            Ok(()) => true,
+            Err(e) => {
+                if has_offline_cache {
+                    debug!(
+                        provider = %self.config.id,
+                        "readiness probes failed, attempting offline cache fallback: {e}"
+                    );
+                    false
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        if !readiness_ok {
+            // Offline unlock path.
+            return self.unlock_from_cache().await;
+        }
+
+        // ── Online unlock path ──────────────────────────────────────
 
         let mut req = match &input {
             UnlockInput::Password(pw) => UnlockRequest {
@@ -707,16 +857,25 @@ impl Provider for WasmProvider {
                 }
             }
 
+            // Online unlock succeeded — data is confirmed live.
+            self.cached
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+
             // Update the cached last-sync timestamp (unlock = first sync).
             if let Ok(mut guard) = self.last_sync_time.lock() {
                 *guard = Some(chrono::Utc::now());
             }
-            // Fire on_unlocked callback.
-            if let Ok(cbs) = self.callbacks.read()
-                && let Some(ref cb) = cbs.on_unlocked
-            {
-                cb();
+
+            // Export and persist cache for offline use.
+            if has_offline_cache {
+                self.try_export_cache(&mut plugin);
             }
+
+            self.fire_callback(|cbs| {
+                if let Some(ref cb) = cbs.on_unlocked {
+                    cb();
+                }
+            });
             Ok(())
         } else if resp
             .error_kind
@@ -737,11 +896,18 @@ impl Provider for WasmProvider {
         let mut plugin = self.plugin.lock().await;
         let resp: SimpleResponse = self.call_json_no_input(&mut plugin, "lock")?;
         if resp.ok {
-            if let Ok(cbs) = self.callbacks.read()
-                && let Some(ref cb) = cbs.on_locked
-            {
-                cb();
-            }
+            // Zeroize cache key and reset cache state.
+            *self.cache_key.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.cached
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // Note: last_cache_write is intentionally NOT reset — it reflects
+            // when the file was last written, which is useful even after lock.
+
+            self.fire_callback(|cbs| {
+                if let Some(ref cb) = cbs.on_locked {
+                    cb();
+                }
+            });
             Ok(())
         } else {
             Err(map_guest_error(resp.error, resp.error_kind))
@@ -749,29 +915,54 @@ impl Provider for WasmProvider {
     }
 
     async fn sync(&self) -> Result<(), ProviderError> {
-        self.wait_for_readiness().await?;
+        let readiness_result = self.wait_for_readiness().await;
+        if let Err(e) = readiness_result {
+            // Network unavailable — mark data as unconfirmed.
+            self.cached
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.fire_callback(|cbs| {
+                if let Some(ref cb) = cbs.on_sync_failed {
+                    cb();
+                }
+            });
+            return Err(e);
+        }
+
         let mut plugin = self.plugin.lock().await;
         if !plugin.function_exists("sync") {
             return Err(ProviderError::NotSupported);
         }
         let resp: SimpleResponse = self.call_json_no_input(&mut plugin, "sync")?;
         if resp.ok {
+            // Sync succeeded — data confirmed live.
+            self.cached
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+
             // Update the cached last-sync timestamp.
             if let Ok(mut guard) = self.last_sync_time.lock() {
                 *guard = Some(chrono::Utc::now());
             }
-            if let Ok(cbs) = self.callbacks.read()
-                && let Some(ref cb) = cbs.on_sync_succeeded
-            {
-                cb(true);
+
+            // Export and persist cache for offline use.
+            if self.capabilities().contains(&Capability::OfflineCache) {
+                self.try_export_cache(&mut plugin);
             }
+
+            self.fire_callback(|cbs| {
+                if let Some(ref cb) = cbs.on_sync_succeeded {
+                    cb(true);
+                }
+            });
             Ok(())
         } else {
-            if let Ok(cbs) = self.callbacks.read()
-                && let Some(ref cb) = cbs.on_sync_failed
-            {
-                cb();
-            }
+            // Sync call failed — mark data as unconfirmed.
+            self.cached
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.fire_callback(|cbs| {
+                if let Some(ref cb) = cbs.on_sync_failed {
+                    cb();
+                }
+            });
             Err(map_guest_error(resp.error, resp.error_kind))
         }
     }
@@ -1162,6 +1353,64 @@ fn evaluate_probe(
     }
 }
 
+// ── Guest init helper ────────────────────────────────────────────
+
+/// Build init options (injecting `home_dir` if needed), call the guest
+/// `init` function, and check the response.
+///
+/// `context` is used in error messages (e.g. `"init"`, `"re-init"`).
+fn init_guest(
+    plugin: &mut Plugin,
+    config: &WasmProviderConfig,
+    context: &str,
+) -> Result<(), ProviderError> {
+    let mut options = config.options.clone();
+    if !options.contains_key("home_dir")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        debug!(provider = %config.id, home = %home, "injecting home_dir into guest options");
+        options.insert("home_dir".into(), serde_json::Value::String(home));
+    }
+
+    // Log all options being sent to the guest (redact values that may be
+    // sensitive — only log the keys and string lengths).
+    for (key, val) in &options {
+        match val {
+            serde_json::Value::String(s) => {
+                debug!(
+                    provider = %config.id,
+                    key = %key,
+                    value_len = s.len(),
+                    value_preview = %if s.len() <= 60 { s.as_str() } else { &s[..60] },
+                    "guest {context} option",
+                );
+            }
+            other => {
+                debug!(
+                    provider = %config.id,
+                    key = %key,
+                    value = %other,
+                    "guest {context} option",
+                );
+            }
+        }
+    }
+
+    let init_req = InitRequest {
+        provider_id: config.id.clone(),
+        provider_name: config.name.clone(),
+        options,
+    };
+    let init_resp: InitResponse = call_guest_json(plugin, "init", &init_req).0?;
+    if !init_resp.ok {
+        return Err(ProviderError::Other(anyhow::anyhow!(
+            "WASM plugin {context} failed: {}",
+            init_resp.error.unwrap_or_else(|| "unknown error".into()),
+        )));
+    }
+    Ok(())
+}
+
 // ── Guest call helpers ───────────────────────────────────────────
 
 /// Whether a `plugin.call()` failure occurred (as opposed to a
@@ -1183,25 +1432,17 @@ enum CallOutcome {
 /// call itself failed (requiring plugin recreation).
 type GuestCallResult<T> = (Result<T, ProviderError>, CallOutcome);
 
-/// Call a guest function with JSON input, deserialize JSON output.
-fn call_guest_json<I: Serialize, O: DeserializeOwned>(
+/// Execute `plugin.call()`, classify errors, and deserialize the JSON
+/// output on success.
+///
+/// This is the shared core of [`call_guest_json`], [`call_guest_json_sensitive`],
+/// and [`call_guest_json_no_input`].
+fn dispatch_and_deserialize<O: DeserializeOwned>(
     plugin: &mut Plugin,
     func: &str,
-    input: &I,
+    input: &[u8],
 ) -> GuestCallResult<O> {
-    let input_bytes = match serde_json::to_vec(input) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                Err(ProviderError::Other(anyhow::anyhow!(
-                    "failed to serialize input for {func}: {e}"
-                ))),
-                CallOutcome::Clean,
-            );
-        }
-    };
-
-    let output_bytes: &[u8] = match plugin.call(func, &input_bytes) {
+    let output_bytes: &[u8] = match plugin.call(func, input) {
         Ok(b) => b,
         Err(e) => {
             return (
@@ -1222,6 +1463,27 @@ fn call_guest_json<I: Serialize, O: DeserializeOwned>(
             CallOutcome::Clean,
         ),
     }
+}
+
+/// Call a guest function with JSON input, deserialize JSON output.
+fn call_guest_json<I: Serialize, O: DeserializeOwned>(
+    plugin: &mut Plugin,
+    func: &str,
+    input: &I,
+) -> GuestCallResult<O> {
+    let input_bytes = match serde_json::to_vec(input) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                Err(ProviderError::Other(anyhow::anyhow!(
+                    "failed to serialize input for {func}: {e}"
+                ))),
+                CallOutcome::Clean,
+            );
+        }
+    };
+
+    dispatch_and_deserialize(plugin, func, &input_bytes)
 }
 
 /// Call a guest function with JSON input that may contain secrets.
@@ -1246,32 +1508,11 @@ fn call_guest_json_sensitive<I: Serialize, O: DeserializeOwned>(
         }
     };
 
-    let call_result = plugin.call(func, input_bytes.as_slice());
+    let result = dispatch_and_deserialize(plugin, func, &input_bytes);
     // Explicit zeroize before drop — defense-in-depth alongside Zeroizing's
     // Drop impl, which guarantees cleanup even on early-return / panic paths.
     input_bytes.zeroize();
-
-    let output_bytes: &[u8] = match call_result {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                Err(ProviderError::Other(anyhow::anyhow!(
-                    "WASM call to {func} failed: {e}"
-                ))),
-                CallOutcome::PluginCallFailed,
-            );
-        }
-    };
-
-    match serde_json::from_slice(output_bytes) {
-        Ok(val) => (Ok(val), CallOutcome::Clean),
-        Err(e) => (
-            Err(ProviderError::Other(anyhow::anyhow!(
-                "failed to deserialize output from {func}: {e}"
-            ))),
-            CallOutcome::Clean,
-        ),
-    }
+    result
 }
 
 /// Call a guest function with no input (empty bytes), deserialize JSON output.
@@ -1279,27 +1520,7 @@ fn call_guest_json_no_input<O: DeserializeOwned>(
     plugin: &mut Plugin,
     func: &str,
 ) -> GuestCallResult<O> {
-    let output_bytes: &[u8] = match plugin.call(func, &[] as &[u8]) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                Err(ProviderError::Other(anyhow::anyhow!(
-                    "WASM call to {func} failed: {e}"
-                ))),
-                CallOutcome::PluginCallFailed,
-            );
-        }
-    };
-
-    match serde_json::from_slice(output_bytes) {
-        Ok(val) => (Ok(val), CallOutcome::Clean),
-        Err(e) => (
-            Err(ProviderError::Other(anyhow::anyhow!(
-                "failed to deserialize output from {func}: {e}"
-            ))),
-            CallOutcome::Clean,
-        ),
-    }
+    dispatch_and_deserialize(plugin, func, &[])
 }
 
 /// Map a guest error response to a `ProviderError`.
@@ -1399,6 +1620,7 @@ fn parse_capability(s: &str) -> Option<Capability> {
         "ssh" | "Ssh" => Some(Capability::Ssh),
         "key_wrapping" | "KeyWrapping" => Some(Capability::KeyWrapping),
         "password_change" | "PasswordChange" => Some(Capability::PasswordChange),
+        "offline_cache" | "OfflineCache" => Some(Capability::OfflineCache),
         _ => None,
     }
 }

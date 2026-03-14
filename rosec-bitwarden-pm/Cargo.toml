@@ -32,4 +32,4 @@ base64 = "0.22"
 block-padding = "0.3"
 
 # Zeroize for secret scrubbing
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1", features = ["derive", "serde"] }

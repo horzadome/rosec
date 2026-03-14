@@ -26,7 +26,10 @@
 //! | `attribute_descriptors`  | *(empty)*                | `AttributeDescriptorsResponse` |
 //! | `readiness_probes`       | *(empty)*                | `ReadinessProbesResponse`    |
 //! | `capabilities`           | *(empty)*                | `CapabilitiesResponse`       |
+//! | `export_cache`           | *(empty)*                | `ExportCacheResponse`        |
+//! | `restore_cache`          | `RestoreCacheRequest`    | `SimpleResponse`             |
 
+pub mod cache;
 pub mod discovery;
 pub mod keys;
 pub mod protocol;
@@ -35,3 +38,9 @@ mod wasm_cred;
 
 pub use discovery::PluginRegistry;
 pub use provider::{WasmProvider, WasmProviderConfig};
+
+/// Crate-wide test mutex for serializing tests that manipulate environment
+/// variables (e.g. `XDG_DATA_HOME`).  All test modules in this crate should
+/// use this instead of a module-local mutex to prevent cross-module races.
+#[cfg(test)]
+pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());

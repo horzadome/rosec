@@ -407,6 +407,31 @@ fn default_option_kind() -> String {
     "text".into()
 }
 
+// ── Offline cache ────────────────────────────────────────────────
+
+/// Returned by `export_cache` — the guest serialises its current in-memory
+/// state into an opaque blob.  The host wraps this in an additional
+/// encryption layer before persisting to disk.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExportCacheResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub error_kind: Option<ErrorKind>,
+    /// Opaque cache blob, base64-encoded.
+    #[serde(default)]
+    pub blob_b64: Option<String>,
+}
+
+/// Sent to `restore_cache` — the host unwrapped the cache file and passes
+/// the inner blob back to the guest to restore its in-memory state.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RestoreCacheRequest {
+    /// The same opaque blob that was returned by `export_cache`, base64.
+    pub blob_b64: String,
+}
+
 // ── Error classification ─────────────────────────────────────────
 
 /// Allows the guest to communicate structured error kinds.

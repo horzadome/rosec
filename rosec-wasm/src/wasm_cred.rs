@@ -122,10 +122,6 @@ pub fn clear(provider_id: &str) -> Result<bool, String> {
 mod tests {
     use super::*;
     use std::env;
-    use std::sync::Mutex;
-
-    /// Serialize tests that manipulate XDG_DATA_HOME.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn with_tmp_home(f: impl FnOnce()) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,7 +129,7 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = env::temp_dir().join(format!("rosec-wasm-cred-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::TEST_ENV_MUTEX.lock().unwrap();
         unsafe { env::set_var("XDG_DATA_HOME", &tmp) };
         f();
         unsafe { env::remove_var("XDG_DATA_HOME") };

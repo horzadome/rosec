@@ -3956,14 +3956,19 @@ dependencies = [
 name = "rosec-wasm"
 version = "0.0.16"
 dependencies = [
+ "aes",
  "anyhow",
  "async-trait",
  "base64",
+ "block-padding",
+ "cbc",
  "chrono",
  "extism",
  "glob",
  "hkdf",
+ "hmac",
  "minisign-verify",
+ "rand 0.10.0",
  "rosec-core",
  "semver",
  "serde",

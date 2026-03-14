@@ -43,6 +43,8 @@ input and return JSON output through Extism byte buffers.  The guest runs on
 | `auth_fields`          | *(empty)*              | `AuthFieldsResponse`         | No            | No               |
 | `attribute_descriptors`| *(empty)*              | `AttributeDescriptorsResponse` | No          | No               |
 | `capabilities`         | *(empty)*              | `CapabilitiesResponse`       | No            | No               |
+| `export_cache`         | *(empty)*              | `ExportCacheResponse`        | No            | No               |
+| `restore_cache`        | `RestoreCacheRequest`  | `SimpleResponse`             | No            | No               |
 
 [1] "External I/O" means network calls (HTTP via Extism PDK) *or* file reads
 that may block (e.g. gnome-keyring reads `.keyring` files from WASI during
@@ -70,6 +72,11 @@ These read from in-memory state populated by `unlock`/`sync`.  They must not
 make network calls or perform file I/O.  If the plugin was recreated after a
 trap, the guest is in a locked state and should return an application-level
 error (`ok: false`, `error_kind: Locked`).
+
+**Cache (state serialization, not gated):**
+`export_cache`, `restore_cache`.
+These serialize/deserialize the guest's in-memory state for offline caching.
+See the "Offline cache" section below for the full contract.
 
 **Important:** some providers read files during `unlock` (e.g.
 `rosec-gnome-keyring` reads `.keyring` files from disk as part of its unlock
@@ -355,6 +362,170 @@ The poisoned-but-recovered mutex in the old instance is never used again.
    over wildcards — `*` matches `.` so `*.example.com` matches arbitrary
    subdomain depth (see "Security constraint" above).
 
+## Offline cache
+
+### Overview
+
+The offline cache lets WASM providers serve previously-synced secrets when
+the network is unavailable (e.g. after laptop resume, on aircraft, on local
+networks).  The guest exports an opaque blob of its state; the host wraps
+it in authenticated encryption bound to the machine, password, and provider
+ID, then writes it to disk.
+
+The guest owns the **what** (blob contents); the host owns the **how**
+(encryption, file management, key derivation, expiry).
+
+### Capability
+
+The guest must declare `Capability::OfflineCache` via its `capabilities`
+export:
+
+```rust
+#[plugin_fn]
+pub fn capabilities(_: ()) -> FnResult<Json<CapabilitiesResponse>> {
+    Ok(Json(CapabilitiesResponse {
+        capabilities: vec![
+            "sync".to_string(),
+            "offline_cache".to_string(),
+        ],
+    }))
+}
+```
+
+Without this capability, the host never calls `export_cache` or
+`restore_cache`.
+
+### `export_cache`
+
+Called by the host after a successful `unlock` or `sync` to snapshot the
+guest's current in-memory state.
+
+```rust
+#[plugin_fn]
+pub fn export_cache(_: ()) -> FnResult<Json<ExportCacheResponse>> {
+    let guard = STATE.lock();
+    let Some(state) = guard.as_ref() else {
+        return Ok(Json(ExportCacheResponse {
+            ok: false,
+            error: Some("not unlocked".to_string()),
+            blob: None,
+        }));
+    };
+
+    // Serialize vault state (the host cannot read this blob).
+    let json = serde_json::to_vec(&state.vault)?;
+    let encoded = BASE64_STANDARD.encode(&json);
+
+    Ok(Json(ExportCacheResponse {
+        ok: true,
+        error: None,
+        blob: Some(encoded),
+    }))
+}
+```
+
+**Rules:**
+- The blob is opaque to the host.  The host encrypts and stores it as-is.
+- Prefer a format you can deserialize in `restore_cache` (e.g. JSON, then
+  base64-encoded to fit in the string field).
+- Do **not** include network tokens (OAuth, session tokens) in the blob.
+  After a cache restore the guest is offline -- stale tokens are useless and
+  a security risk.  Include only the decrypted vault data needed to serve
+  secrets.
+- If the guest is locked or has no data, return `ok: false`.
+
+### `restore_cache`
+
+Called by the host during an offline unlock when readiness probes fail.  The
+host decrypts the cache file and passes the original blob back to the guest.
+
+```rust
+#[plugin_fn]
+pub fn restore_cache(
+    Json(req): Json<RestoreCacheRequest>,
+) -> FnResult<Json<SimpleResponse>> {
+    let json = BASE64_STANDARD.decode(&req.blob)
+        .map_err(|e| Error::msg(format!("base64 decode: {e}")))?;
+    let vault: VaultState = serde_json::from_slice(&json)
+        .map_err(|e| Error::msg(format!("deserialize: {e}")))?;
+
+    let mut guard = STATE.lock();
+    let state = guard.as_mut()
+        .ok_or_else(|| Error::msg("not initialised"))?;
+    state.vault = Some(vault);
+
+    Ok(Json(SimpleResponse {
+        ok: true,
+        error: None,
+    }))
+}
+```
+
+**Rules:**
+- The blob is exactly what the guest returned from `export_cache`.  The host
+  performs authenticated decryption before passing it -- if the MAC fails
+  the host never calls `restore_cache`.
+- After `restore_cache`, the guest should be in a state where data-access
+  functions (`list_items`, `get_secret_attr`, etc.) work, but network
+  operations are not expected to work.
+- The guest must **not** make network calls during `restore_cache`.
+
+### Lifecycle
+
+```
+Online unlock:
+  host: readiness probes pass
+  host: call guest unlock(password)
+  guest: authenticates, syncs, populates state
+  host: call guest export_cache()
+  host: encrypt blob → write cache file
+
+Offline unlock:
+  host: readiness probes fail
+  host: read cache file → decrypt blob
+  host: call guest init(config)     [fresh plugin if needed]
+  host: call guest restore_cache(blob)
+  host: status.cached = true
+
+Sync (online):
+  host: call guest sync()
+  guest: fetches remote, updates state
+  host: call guest export_cache()
+  host: encrypt blob → write cache file
+  host: status.cached = false       [data confirmed fresh]
+
+Sync (fails):
+  host: call guest sync() → error
+  host: status.cached = true        [data may be stale]
+
+Lock:
+  host: call guest lock()
+  host: zeroize cache key from memory
+  host: status.cached = false, last_cache_write unchanged
+```
+
+### Host-side encryption
+
+The host wraps the guest blob with:
+- **Key derivation:** `HKDF-SHA256(machine_key || password, salt=b"rosec-provider-cache-v1", info=provider_id, len=64)`
+  producing 32 bytes AES key + 32 bytes HMAC key.
+- **Encryption:** AES-256-CBC with PKCS7 padding + HMAC-SHA256 (encrypt-then-MAC).
+- **File format:** `[version 1B][timestamp 8B BE][IV 16B][ct_len 4B BE][ciphertext...][MAC 32B]`
+
+The guest does not need to know these details -- the blob it exports/imports
+is plaintext from the guest's perspective.
+
+### `ProviderStatus` fields
+
+| Field              | Type                  | Meaning                                              |
+|--------------------|-----------------------|------------------------------------------------------|
+| `cached`           | `bool`                | Data-quality signal: true when data has not been confirmed against the remote (offline unlock, failed sync). |
+| `offline_cache`    | `bool`                | Whether this provider supports offline caching (has `Capability::OfflineCache`). |
+| `last_cache_write` | `Option<SystemTime>`  | When the cache file was last written to disk (None = never). |
+
+The CLI shows `cached` as `"unlocked (cached)"` in `rosec provider list`
+and `rosec status` to alert the user that secrets may be stale.
+
 ## Checklist for new providers
 
 - [ ] All `#[plugin_fn]` exports return `Ok(Json(...))` for application errors
@@ -374,3 +545,6 @@ The poisoned-but-recovered mutex in the old instance is never used again.
 - [ ] No passwords or tokens in error messages or logs
 - [ ] If using WASI file I/O on storage that could be network-mounted
       (e.g. home directories), TCP probe declared for the file server
+- [ ] If supporting offline cache: `capabilities` includes `"offline_cache"`,
+      `export_cache` serializes in-memory state (without network tokens),
+      `restore_cache` deserializes it and makes data-access functions work

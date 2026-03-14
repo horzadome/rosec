@@ -98,6 +98,8 @@ pub enum Capability {
     KeyWrapping,
     /// Provider supports password changes ([`Provider::change_password`]).
     PasswordChange,
+    /// Provider supports offline cache export/restore (`export_cache`, `restore_cache`).
+    OfflineCache,
 }
 
 /// Check that `provider` declares `cap`; return `ProviderError::NotSupported` if not.
@@ -258,6 +260,22 @@ pub struct ItemUpdate {
 pub struct ProviderStatus {
     pub locked: bool,
     pub last_sync: Option<SystemTime>,
+    /// True when in-memory data has not been confirmed against the remote.
+    ///
+    /// **Set on:** offline unlock (restore_cache path), failed sync
+    /// (network dropped, data is stale).
+    ///
+    /// **Cleared on:** successful online unlock, successful sync.
+    ///
+    /// **Reset on:** lock (no data at all).
+    ///
+    /// This is a data-quality signal, not a provenance signal.
+    /// Combined with `last_sync`, consumers can assess staleness severity.
+    pub cached: bool,
+    /// Whether this provider supports offline caching.
+    pub offline_cache: bool,
+    /// When the cache file was last written to disk.
+    pub last_cache_write: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1368,6 +1386,9 @@ mod tests {
             Ok(ProviderStatus {
                 locked: true,
                 last_sync: None,
+                cached: false,
+                offline_cache: false,
+                last_cache_write: None,
             })
         }
         async fn unlock(&self, _input: UnlockInput) -> Result<(), ProviderError> {

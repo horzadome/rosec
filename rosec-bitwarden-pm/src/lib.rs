@@ -1565,11 +1565,15 @@ pub fn get_ssh_private_key(
 
 /// Return the provider's capabilities.
 ///
-/// Bitwarden PM supports: Sync, Ssh (NOT Write, NOT PasswordChange).
+/// Bitwarden PM supports: Sync, Ssh, OfflineCache (NOT Write, NOT PasswordChange).
 #[plugin_fn]
 pub fn capabilities(_input: ()) -> FnResult<Json<CapabilitiesResponse>> {
     Ok(Json(CapabilitiesResponse {
-        capabilities: vec!["sync".to_string(), "ssh".to_string()],
+        capabilities: vec![
+            "sync".to_string(),
+            "ssh".to_string(),
+            "offline_cache".to_string(),
+        ],
     }))
 }
 
@@ -1656,5 +1660,121 @@ pub fn readiness_probes(_input: ()) -> FnResult<Json<ReadinessProbesResponse>> {
             expected_status: 200,
             timeout_secs: 5,
         }],
+    }))
+}
+
+// ── Offline cache ────────────────────────────────────────────────
+
+/// Export the current vault state as an opaque cache blob.
+///
+/// Serializes the entire `VaultState` (keys + decrypted ciphers) to JSON,
+/// base64-encodes it, and returns the result.  The host will wrap this in
+/// an additional encryption layer before persisting to disk.
+///
+/// Returns an error response if the provider is locked (no vault state).
+#[plugin_fn]
+pub fn export_cache(_input: ()) -> FnResult<Json<ExportCacheResponse>> {
+    use base64::Engine;
+
+    let guard = STATE.lock();
+    let Some(state) = guard.as_ref() else {
+        return Ok(Json(ExportCacheResponse {
+            ok: false,
+            error: Some("not initialised".to_string()),
+            error_kind: Some(ErrorKind::Locked),
+            blob_b64: None,
+        }));
+    };
+    let Some(auth) = &state.auth else {
+        return Ok(Json(ExportCacheResponse {
+            ok: false,
+            error: Some("provider is locked".to_string()),
+            error_kind: Some(ErrorKind::Locked),
+            blob_b64: None,
+        }));
+    };
+
+    match auth.vault.to_cache_blob() {
+        Ok(blob) => {
+            let blob_b64 =
+                base64::engine::general_purpose::STANDARD.encode(&blob);
+            Ok(Json(ExportCacheResponse {
+                ok: true,
+                error: None,
+                error_kind: None,
+                blob_b64: Some(blob_b64),
+            }))
+        }
+        Err(e) => Ok(Json(ExportCacheResponse {
+            ok: false,
+            error: Some(format!("cache export failed: {e}")),
+            error_kind: Some(ErrorKind::Other),
+            blob_b64: None,
+        })),
+    }
+}
+
+/// Restore vault state from a cache blob previously exported by `export_cache`.
+///
+/// Decodes the base64 blob, deserializes the `VaultState`, and sets it as
+/// the current auth state.  This is used for offline unlock when the network
+/// is unavailable.
+///
+/// The restored vault has no access/refresh tokens — only the decrypted
+/// vault data.  Network operations (sync, check_remote_changed) will fail
+/// until a full online unlock is performed.
+#[plugin_fn]
+pub fn restore_cache(Json(input): Json<RestoreCacheRequest>) -> FnResult<Json<SimpleResponse>> {
+    use base64::Engine;
+
+    let blob = match base64::engine::general_purpose::STANDARD.decode(&input.blob_b64) {
+        Ok(b) => b,
+        Err(e) => {
+            return Ok(Json(SimpleResponse {
+                ok: false,
+                error: Some(format!("base64 decode failed: {e}")),
+                error_kind: Some(ErrorKind::InvalidInput),
+                two_factor_methods: None,
+            }));
+        }
+    };
+
+    let vault = match vault::VaultState::from_cache_blob(&blob) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(Json(SimpleResponse {
+                ok: false,
+                error: Some(format!("cache restore failed: {e}")),
+                error_kind: Some(ErrorKind::Other),
+                two_factor_methods: None,
+            }));
+        }
+    };
+
+    let mut guard = STATE.lock();
+    let Some(state) = guard.as_mut() else {
+        return Ok(Json(SimpleResponse {
+            ok: false,
+            error: Some("not initialised".to_string()),
+            error_kind: Some(ErrorKind::Locked),
+            two_factor_methods: None,
+        }));
+    };
+
+    // Set auth state with the restored vault but no network tokens.
+    // The guest is now "unlocked" in offline mode — data access works
+    // but sync/refresh will fail.
+    state.auth = Some(AuthState {
+        access_token: Zeroizing::new(String::new()),
+        refresh_token: None,
+        protected_key: Zeroizing::new(String::new()),
+        vault,
+    });
+
+    Ok(Json(SimpleResponse {
+        ok: true,
+        error: None,
+        error_kind: None,
+        two_factor_methods: None,
     }))
 }

@@ -398,6 +398,9 @@ impl Provider for LocalVault {
         Ok(ProviderStatus {
             locked,
             last_sync: None,
+            cached: false,
+            offline_cache: false,
+            last_cache_write: None,
         })
     }
 
