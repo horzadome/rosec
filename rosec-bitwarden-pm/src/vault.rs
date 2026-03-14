@@ -4,7 +4,7 @@
 //! Changes: tracing → extism_pdk logging, anyhow → BitwardenError, crate::api → guest api types.
 
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -255,37 +255,11 @@ pub struct VaultState {
     folder_names: HashMap<String, String>,
     /// All decrypted ciphers.
     ciphers: Vec<DecryptedCipher>,
-    /// Timestamp of last sync (stored as epoch seconds for portability).
-    #[serde(with = "opt_system_time_epoch")]
+    /// Timestamp of last sync.  Runtime-only — not included in the cache
+    /// blob so that the blob hash stays stable when vault contents haven't
+    /// changed (the host tracks `last_sync_time` independently).
+    #[serde(skip)]
     last_sync: Option<SystemTime>,
-}
-
-/// Serde helper: serialize `Option<SystemTime>` as `Option<u64>` epoch seconds.
-mod opt_system_time_epoch {
-    use super::*;
-
-    pub fn serialize<S: serde::Serializer>(
-        time: &Option<SystemTime>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match time {
-            Some(t) => {
-                let secs = t
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or(Duration::ZERO)
-                    .as_secs();
-                serializer.serialize_some(&secs)
-            }
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<SystemTime>, D::Error> {
-        let opt: Option<u64> = Option::deserialize(deserializer)?;
-        Ok(opt.map(|secs| UNIX_EPOCH + Duration::from_secs(secs)))
-    }
 }
 
 impl VaultState {
