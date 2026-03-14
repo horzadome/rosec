@@ -28,6 +28,7 @@ const CLIENT_VERSION: &str = "2025.1.0";
 pub struct ServerUrls {
     pub api_url: String,
     pub identity_url: String,
+    pub notifications_url: String,
 }
 
 impl ServerUrls {
@@ -37,6 +38,7 @@ impl ServerUrls {
         Self {
             api_url: format!("{base}/api"),
             identity_url: format!("{base}/identity"),
+            notifications_url: format!("{base}/notifications"),
         }
     }
 
@@ -45,6 +47,7 @@ impl ServerUrls {
         Self {
             api_url: "https://api.bitwarden.com".to_string(),
             identity_url: "https://identity.bitwarden.com".to_string(),
+            notifications_url: "https://notifications.bitwarden.com".to_string(),
         }
     }
 
@@ -53,6 +56,7 @@ impl ServerUrls {
         Self {
             api_url: "https://api.bitwarden.eu".to_string(),
             identity_url: "https://identity.bitwarden.eu".to_string(),
+            notifications_url: "https://notifications.bitwarden.eu".to_string(),
         }
     }
 }

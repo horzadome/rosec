@@ -104,6 +104,12 @@ pub enum Capability {
     /// the host's per-provider `offline_cache` config to be `true` (default).
     /// See [`ProviderEntry::offline_cache`](crate::config::ProviderEntry::offline_cache).
     OfflineCache,
+    /// Provider supports real-time notifications via a host-managed WebSocket.
+    ///
+    /// The guest implements `get_notification_config` (returns a WebSocket URL +
+    /// optional handshake) and `parse_notification` (classifies received frames
+    /// as sync, lock, or ignore).  The host manages the connection lifecycle.
+    Notifications,
 }
 
 /// Check that `provider` declares `cap`; return `ProviderError::NotSupported` if not.

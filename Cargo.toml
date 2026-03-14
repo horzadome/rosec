@@ -50,6 +50,7 @@ rpassword = "7"
 libc = "0.2"
 toml_edit = "0.25"
 futures-util = { version = "0.3", features = ["sink"] }
+tokio-websockets = { version = "0.13", features = ["client", "rustls-native-roots", "sha1_smol", "fastrand"] }
 wildmatch = "2.6.1"
 chrono = { version = "0.4", features = ["serde"] }
 semver = { version = "1", features = ["serde"] }

@@ -508,3 +508,69 @@ pub enum ErrorKind {
     TwoFactorRequired,
     Other,
 }
+
+// ---------------------------------------------------------------------------
+// Real-time notifications (Capability::Notifications)
+// ---------------------------------------------------------------------------
+
+/// Response from the guest's `get_notification_config` function.
+///
+/// Called by the host after a successful online unlock or sync to obtain
+/// WebSocket subscription details.  The guest performs any negotiate steps
+/// internally (via its HTTP capability) and returns a ready-to-connect URL.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotificationConfigResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub error_kind: Option<ErrorKind>,
+    /// The subscription to establish.  `None` when `ok` is `false`.
+    #[serde(default)]
+    pub subscription: Option<WebSocketSubscription>,
+}
+
+/// Everything the host needs to establish a WebSocket connection.
+///
+/// The guest builds the full URL (including any auth tokens in query
+/// params) and handles any protocol-specific negotiate steps internally.
+/// The host is a generic WebSocket client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSocketSubscription {
+    /// Full WebSocket URL, ready to connect.
+    /// e.g. `"wss://notifications.example.com/hub?access_token=<jwt>"`
+    pub url: String,
+    /// Optional HTTP headers for the WebSocket upgrade request.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Optional message to send immediately after WebSocket connect
+    /// (e.g. a protocol handshake frame).
+    #[serde(default)]
+    pub handshake_message: Option<String>,
+}
+
+/// A raw WebSocket text frame passed to the guest for parsing.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotificationFrame {
+    /// The raw text content of the WebSocket message.
+    pub text: String,
+}
+
+/// Guest's interpretation of a received notification frame.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotificationAction {
+    /// What the host should do in response to this frame.
+    pub action: NotificationActionKind,
+}
+
+/// Actions the host can take in response to a notification frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationActionKind {
+    /// Trigger a sync (fires `on_remote_sync_nudge`).
+    Sync,
+    /// Lock the provider (fires `on_remote_lock_nudge`).
+    Lock,
+    /// Ignore this frame (ping, ack, handshake response, unknown).
+    Ignore,
+}

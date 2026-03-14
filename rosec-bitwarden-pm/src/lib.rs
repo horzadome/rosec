@@ -1044,10 +1044,25 @@ pub fn init(Json(req): Json<InitRequest>) -> FnResult<Json<InitResponse>> {
         req.options.get("api_url").and_then(|v| v.as_str()),
         req.options.get("identity_url").and_then(|v| v.as_str()),
     ) {
-        (Some(api), Some(identity)) => ServerUrls {
-            api_url: api.to_string(),
-            identity_url: identity.to_string(),
-        },
+        (Some(api), Some(identity)) => {
+            // Derive notifications URL from api_url by stripping "/api"
+            // and appending "/notifications", or fallback to "{api}/notifications".
+            let notifications_url = req
+                .options
+                .get("notifications_url")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| {
+                    api.strip_suffix("/api")
+                        .map(|base| format!("{base}/notifications"))
+                        .unwrap_or_else(|| format!("{api}/notifications"))
+                });
+            ServerUrls {
+                api_url: api.to_string(),
+                identity_url: identity.to_string(),
+                notifications_url,
+            }
+        }
         _ => match req.options.get("base_url").and_then(|v| v.as_str()) {
             Some(base) => ServerUrls::from_base(base),
             None => {
@@ -1568,7 +1583,8 @@ pub fn get_ssh_private_key(
 
 /// Return the provider's capabilities.
 ///
-/// Bitwarden PM supports: Sync, Ssh, OfflineCache (NOT Write, NOT PasswordChange).
+/// Bitwarden PM supports: Sync, Ssh, OfflineCache, Notifications
+/// (NOT Write, NOT PasswordChange).
 #[plugin_fn]
 pub fn capabilities(_input: ()) -> FnResult<Json<CapabilitiesResponse>> {
     Ok(Json(CapabilitiesResponse {
@@ -1576,6 +1592,7 @@ pub fn capabilities(_input: ()) -> FnResult<Json<CapabilitiesResponse>> {
             "sync".to_string(),
             "ssh".to_string(),
             "offline_cache".to_string(),
+            "notifications".to_string(),
         ],
     }))
 }
@@ -1843,4 +1860,211 @@ pub fn restore_cache(Json(input): Json<RestoreCacheRequest>) -> FnResult<Json<Si
         error_kind: None,
         two_factor_methods: None,
     }))
+}
+
+// ── Real-time notifications ─────────────────────────────────────
+
+/// SignalR record separator — every frame is terminated by this byte.
+const SIGNALR_RS: char = '\x1e';
+
+/// Bitwarden `PushType` values (from `server/src/Core/Enums/PushType.cs`).
+///
+/// The SignalR hub sends all events via `ReceiveMessage` with the actual
+/// event kind as a numeric value in `arguments[0].type`.
+mod push_type {
+    pub const SYNC_CIPHER_UPDATE: u32 = 0;
+    pub const SYNC_CIPHER_CREATE: u32 = 1;
+    pub const SYNC_LOGIN_DELETE: u32 = 2;
+    pub const SYNC_FOLDER_DELETE: u32 = 3;
+    pub const SYNC_CIPHERS: u32 = 4;
+    pub const SYNC_VAULT: u32 = 5;
+    pub const SYNC_ORG_KEYS: u32 = 6;
+    pub const SYNC_FOLDER_CREATE: u32 = 7;
+    pub const SYNC_FOLDER_UPDATE: u32 = 8;
+    pub const SYNC_CIPHER_DELETE: u32 = 9;
+    pub const SYNC_SETTINGS: u32 = 10;
+    pub const LOG_OUT: u32 = 11;
+
+    pub const SYNC_TYPES: &[u32] = &[
+        SYNC_CIPHER_UPDATE,
+        SYNC_CIPHER_CREATE,
+        SYNC_LOGIN_DELETE,
+        SYNC_FOLDER_DELETE,
+        SYNC_CIPHERS,
+        SYNC_VAULT,
+        SYNC_ORG_KEYS,
+        SYNC_FOLDER_CREATE,
+        SYNC_FOLDER_UPDATE,
+        SYNC_CIPHER_DELETE,
+        SYNC_SETTINGS,
+    ];
+}
+
+/// Minimal SignalR invocation message for frame parsing.
+#[derive(serde::Deserialize)]
+struct SignalRInvocation {
+    target: Option<String>,
+    #[serde(default)]
+    arguments: Vec<SignalRArgument>,
+}
+
+#[derive(serde::Deserialize)]
+struct SignalRArgument {
+    #[serde(rename = "type")]
+    push_type: Option<u32>,
+}
+
+/// Return the WebSocket subscription config for Bitwarden's SignalR hub.
+///
+/// Performs the SignalR negotiate step (HTTP POST) internally using the
+/// Extism PDK HTTP capability.  Returns a ready-to-connect WebSocket URL
+/// with the access token in the query string, plus the SignalR JSON
+/// handshake as the `handshake_message`.
+///
+/// Returns an error if not authenticated (no access token).
+#[plugin_fn]
+pub fn get_notification_config(
+    _input: (),
+) -> FnResult<Json<protocol::NotificationConfigResponse>> {
+    let guard = STATE.lock();
+    let Some(state) = guard.as_ref() else {
+        return Ok(Json(protocol::NotificationConfigResponse {
+            ok: false,
+            error: Some("not initialised".to_string()),
+            error_kind: Some(protocol::ErrorKind::Locked),
+            subscription: None,
+        }));
+    };
+    let Some(auth) = &state.auth else {
+        return Ok(Json(protocol::NotificationConfigResponse {
+            ok: false,
+            error: Some("provider is locked".to_string()),
+            error_kind: Some(protocol::ErrorKind::Locked),
+            subscription: None,
+        }));
+    };
+
+    let notifications_url = &state.config.urls.notifications_url;
+    let access_token = &auth.access_token;
+
+    // ── Negotiate ────────────────────────────────────────────────
+    let negotiate_url = format!(
+        "{}/hub/negotiate?negotiateVersion=1",
+        notifications_url.trim_end_matches('/')
+    );
+
+    let negotiate_req = extism_pdk::HttpRequest::new(&negotiate_url)
+        .with_method("POST")
+        .with_header("Authorization", format!("Bearer {}", access_token.as_str()));
+
+    match extism_pdk::http::request::<()>(&negotiate_req, None) {
+        Ok(resp) => {
+            let status = resp.status_code();
+            if !(200..300).contains(&(status as i32)) {
+                extism_pdk::warn!(
+                    "SignalR negotiate returned HTTP {status}"
+                );
+                // Non-fatal — proceed without negotiate (some Vaultwarden
+                // instances don't support it).
+            }
+        }
+        Err(e) => {
+            extism_pdk::warn!("SignalR negotiate failed: {e}");
+            // Non-fatal — try connecting anyway.
+        }
+    }
+
+    // ── Build WebSocket URL ──────────────────────────────────────
+    let (is_secure, without_schema) =
+        if let Some(s) = notifications_url.strip_prefix("https://") {
+            (true, s)
+        } else if let Some(s) = notifications_url.strip_prefix("http://") {
+            (false, s)
+        } else {
+            return Ok(Json(protocol::NotificationConfigResponse {
+                ok: false,
+                error: Some(format!(
+                    "unsupported schema in notifications URL: {notifications_url}"
+                )),
+                error_kind: Some(protocol::ErrorKind::Other),
+                subscription: None,
+            }));
+        };
+
+    let (host, base_path) = match without_schema.split_once('/') {
+        Some((h, p)) => (h, format!("{p}/hub")),
+        None => (without_schema, "hub".to_string()),
+    };
+
+    let ws_schema = if is_secure { "wss" } else { "ws" };
+    let ws_url = format!(
+        "{ws_schema}://{host}/{base_path}?access_token={}",
+        access_token.as_str()
+    );
+
+    // SignalR JSON hub protocol handshake.
+    let handshake = format!("{{\"protocol\":\"json\",\"version\":1}}{SIGNALR_RS}");
+
+    Ok(Json(protocol::NotificationConfigResponse {
+        ok: true,
+        error: None,
+        error_kind: None,
+        subscription: Some(protocol::WebSocketSubscription {
+            url: ws_url,
+            headers: std::collections::HashMap::new(),
+            handshake_message: Some(handshake),
+        }),
+    }))
+}
+
+/// Parse a raw WebSocket frame from the Bitwarden SignalR hub.
+///
+/// Classifies each `\x1e`-delimited sub-frame as sync, lock, or ignore.
+/// If a frame contains multiple sub-frames and at least one is a sync or
+/// lock event, the most important action wins (lock > sync > ignore).
+#[plugin_fn]
+pub fn parse_notification(
+    Json(frame): Json<protocol::NotificationFrame>,
+) -> FnResult<Json<protocol::NotificationAction>> {
+    use protocol::NotificationActionKind;
+
+    let mut result = NotificationActionKind::Ignore;
+
+    for sub_frame in frame.text.split(SIGNALR_RS) {
+        let sub_frame = sub_frame.trim();
+        if sub_frame.is_empty() {
+            continue;
+        }
+
+        let inv: SignalRInvocation = match serde_json::from_str(sub_frame) {
+            Ok(i) => i,
+            Err(_) => {
+                // Unparseable frame (ping, ack, handshake response, etc.)
+                continue;
+            }
+        };
+
+        let Some(target) = inv.target else {
+            // No target — likely a ping frame (type 6).
+            continue;
+        };
+
+        if target != "ReceiveMessage" {
+            continue;
+        }
+
+        let Some(pt) = inv.arguments.first().and_then(|a| a.push_type) else {
+            continue;
+        };
+
+        if pt == push_type::LOG_OUT {
+            // Lock trumps everything.
+            result = NotificationActionKind::Lock;
+            break;
+        } else if push_type::SYNC_TYPES.contains(&pt) && result != NotificationActionKind::Lock {
+            result = NotificationActionKind::Sync;
+        }
+    }
+
+    Ok(Json(protocol::NotificationAction { action: result }))
 }

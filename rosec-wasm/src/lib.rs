@@ -28,10 +28,13 @@
 //! | `capabilities`           | *(empty)*                | `CapabilitiesResponse`       |
 //! | `export_cache`           | *(empty)*                | `ExportCacheResponse`        |
 //! | `restore_cache`          | `RestoreCacheRequest`    | `SimpleResponse`             |
+//! | `get_notification_config`| *(empty)*                | `NotificationConfigResponse` |
+//! | `parse_notification`     | `NotificationFrame`      | `NotificationAction`         |
 
 pub mod cache;
 pub mod discovery;
 pub mod keys;
+pub mod notifications;
 pub mod protocol;
 mod provider;
 mod wasm_cred;

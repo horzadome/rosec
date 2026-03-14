@@ -449,3 +449,48 @@ pub enum ErrorKind {
     TwoFactorRequired,
     Other,
 }
+
+// ── Real-time notifications ─────────────────────────────────────
+
+/// Response from `get_notification_config`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotificationConfigResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub error_kind: Option<ErrorKind>,
+    #[serde(default)]
+    pub subscription: Option<WebSocketSubscription>,
+}
+
+/// WebSocket connection details for the host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSocketSubscription {
+    pub url: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub handshake_message: Option<String>,
+}
+
+/// A raw WebSocket frame passed to `parse_notification`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotificationFrame {
+    pub text: String,
+}
+
+/// Guest's interpretation of a notification frame.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct NotificationAction {
+    pub action: NotificationActionKind,
+}
+
+/// Actions the host takes in response to a notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationActionKind {
+    Sync,
+    Lock,
+    Ignore,
+}

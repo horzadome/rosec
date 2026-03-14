@@ -32,3 +32,6 @@ rand = { workspace = true }
 ureq = "3"
 url = "2"
 glob = "0.3"
+tokio-websockets = { workspace = true }
+futures-util = { workspace = true }
+http = "1"

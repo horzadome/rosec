@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -73,7 +74,7 @@ pub struct WasmProviderConfig {
 /// is `Send + Sync` but `call` takes `&mut self`.
 pub struct WasmProvider {
     config: WasmProviderConfig,
-    plugin: Mutex<Plugin>,
+    plugin: Arc<Mutex<Plugin>>,
     /// Stored manifest for plugin recreation after a WASM trap.
     manifest: Manifest,
     /// Capabilities queried once from the guest at construction time.
@@ -110,6 +111,10 @@ pub struct WasmProvider {
     /// SHA-256 hash of the last blob written to the cache file.
     /// Used to skip redundant writes when the guest state hasn't changed.
     last_cache_blob_hash: std::sync::Mutex<Option<[u8; 32]>>,
+    /// Handle to the real-time notifications background task.
+    /// Present when the provider is unlocked and declares `Capability::Notifications`.
+    /// Dropped on lock (cancels the WebSocket connection).
+    notifications_handle: std::sync::Mutex<Option<crate::notifications::NotificationsHandle>>,
 }
 
 impl std::fmt::Debug for WasmProvider {
@@ -207,7 +212,7 @@ impl WasmProvider {
 
         Ok(Self {
             config,
-            plugin: Mutex::new(plugin),
+            plugin: Arc::new(Mutex::new(plugin)),
             manifest,
             capabilities,
             attribute_descriptors,
@@ -221,6 +226,7 @@ impl WasmProvider {
             cached: std::sync::atomic::AtomicBool::new(false),
             last_cache_write: std::sync::Mutex::new(None),
             last_cache_blob_hash: std::sync::Mutex::new(None),
+            notifications_handle: std::sync::Mutex::new(None),
         })
     }
 
@@ -653,6 +659,60 @@ impl WasmProvider {
         }
     }
 
+    /// Start or restart the notifications background task.
+    ///
+    /// Drops any existing handle (cancelling the old connection), then spawns
+    /// a new task that calls `get_notification_config` on the guest, connects
+    /// the WebSocket, and forwards frames via `parse_notification`.
+    ///
+    /// No-op if the provider doesn't declare `Capability::Notifications`.
+    fn start_notifications(&self) {
+        if !self.capabilities().contains(&Capability::Notifications) {
+            return;
+        }
+
+        // Drop existing handle first (cancels old connection).
+        *self
+            .notifications_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+
+        // Clone the callbacks for the notification task.
+        let on_sync_nudge = self
+            .callbacks
+            .read()
+            .ok()
+            .and_then(|cbs| cbs.on_remote_sync_nudge.clone());
+        let on_lock_nudge = self
+            .callbacks
+            .read()
+            .ok()
+            .and_then(|cbs| cbs.on_remote_lock_nudge.clone());
+
+        let config = crate::notifications::NotificationsConfig {
+            provider_id: self.config.id.clone(),
+            plugin: Arc::clone(&self.plugin),
+            readiness_probes: self.readiness_probes.clone(),
+            allowed_hosts: self.config.allowed_hosts.clone(),
+            on_sync_nudge,
+            on_lock_nudge,
+        };
+
+        let handle = crate::notifications::start(config);
+        *self
+            .notifications_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    /// Stop the notifications background task (if running).
+    fn stop_notifications(&self) {
+        *self
+            .notifications_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     /// Derive the cache key from `password` + machine key + provider ID and
     /// store it in `self.cache_key`.
     ///
@@ -972,6 +1032,10 @@ impl Provider for WasmProvider {
                 self.try_export_cache(&mut plugin);
             }
 
+            // Start real-time notifications (if the guest supports it).
+            // Must be called after unlock so the guest has a valid token.
+            self.start_notifications();
+
             self.fire_callback(|cbs| {
                 if let Some(ref cb) = cbs.on_unlocked {
                     cb();
@@ -994,6 +1058,9 @@ impl Provider for WasmProvider {
     }
 
     async fn lock(&self) -> Result<(), ProviderError> {
+        // Stop notifications first (drops WebSocket before clearing auth).
+        self.stop_notifications();
+
         let mut plugin = self.plugin.lock().await;
         let resp: SimpleResponse = self.call_json_no_input(&mut plugin, "lock")?;
         if resp.ok {
@@ -1035,6 +1102,11 @@ impl Provider for WasmProvider {
             return Err(e);
         }
 
+        // Snapshot the cached flag before sync — if we were cached and
+        // sync succeeds, we need to (re)start notifications because
+        // the access token was refreshed during recovery.
+        let was_cached = self.cached.load(std::sync::atomic::Ordering::Relaxed);
+
         let mut plugin = self.plugin.lock().await;
         if !plugin.function_exists("sync") {
             return Err(ProviderError::NotSupported);
@@ -1053,6 +1125,16 @@ impl Provider for WasmProvider {
             // Export and persist cache for offline use.
             if self.offline_cache_enabled() {
                 self.try_export_cache(&mut plugin);
+            }
+
+            // Drop the plugin lock before starting notifications (which
+            // needs to acquire it to call get_notification_config).
+            drop(plugin);
+
+            // (Re)start notifications if we just recovered from cached mode
+            // (token was refreshed) or if no notification task is running.
+            if was_cached {
+                self.start_notifications();
             }
 
             self.fire_callback(|cbs| {
@@ -1385,7 +1467,7 @@ const MAX_PROBE_TIMEOUT_SECS: u64 = 30;
 /// When `timeout_override` is `Some(d)`, the probe timeout is clamped to
 /// `d` regardless of what the guest declared.  This is used in quick mode
 /// to fail fast when the network is down.
-fn evaluate_probe(
+pub(crate) fn evaluate_probe(
     probe: &crate::protocol::ReadinessProbe,
     allowed_hosts: &[String],
     timeout_override: Option<Duration>,
@@ -1543,7 +1625,7 @@ fn init_guest(
 /// plugin should be recreated.  Serialization failures happen before or
 /// after the WASM call and do not affect the instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CallOutcome {
+pub(crate) enum CallOutcome {
     /// No WASM call failure — the error (if any) is from serialization.
     Clean,
     /// `plugin.call()` returned an error — the instance may be corrupted.
@@ -1552,7 +1634,7 @@ enum CallOutcome {
 
 /// Result of a guest call: the value or an error, plus whether the WASM
 /// call itself failed (requiring plugin recreation).
-type GuestCallResult<T> = (Result<T, ProviderError>, CallOutcome);
+pub(crate) type GuestCallResult<T> = (Result<T, ProviderError>, CallOutcome);
 
 /// Execute `plugin.call()`, classify errors, and deserialize the JSON
 /// output on success.
@@ -1588,7 +1670,7 @@ fn dispatch_and_deserialize<O: DeserializeOwned>(
 }
 
 /// Call a guest function with JSON input, deserialize JSON output.
-fn call_guest_json<I: Serialize, O: DeserializeOwned>(
+pub(crate) fn call_guest_json<I: Serialize, O: DeserializeOwned>(
     plugin: &mut Plugin,
     func: &str,
     input: &I,
@@ -1638,7 +1720,7 @@ fn call_guest_json_sensitive<I: Serialize, O: DeserializeOwned>(
 }
 
 /// Call a guest function with no input (empty bytes), deserialize JSON output.
-fn call_guest_json_no_input<O: DeserializeOwned>(
+pub(crate) fn call_guest_json_no_input<O: DeserializeOwned>(
     plugin: &mut Plugin,
     func: &str,
 ) -> GuestCallResult<O> {
@@ -1743,6 +1825,7 @@ fn parse_capability(s: &str) -> Option<Capability> {
         "key_wrapping" | "KeyWrapping" => Some(Capability::KeyWrapping),
         "password_change" | "PasswordChange" => Some(Capability::PasswordChange),
         "offline_cache" | "OfflineCache" => Some(Capability::OfflineCache),
+        "notifications" | "Notifications" => Some(Capability::Notifications),
         _ => None,
     }
 }
