@@ -4716,22 +4716,23 @@ fn build_item_toml(
     out.push_str("[attributes]\n");
     let mut sorted_attrs: Vec<_> = pub_attrs
         .iter()
-        .filter(|(k, _)| !matches!(k.as_str(), "rosec:type" | "rosec:provider" | "xdg:schema"))
+        .filter(|(k, _)| !k.starts_with("rosec:") && !k.starts_with("xdg:"))
         .collect();
     sorted_attrs.sort_by_key(|(k, _)| k.as_str());
     for (k, v) in &sorted_attrs {
-        out.push_str(&format!("{} = {}\n", k, toml_quote(v)));
+        out.push_str(&format!("{} = {}\n", toml_key(k), toml_quote(v)));
     }
     out.push('\n');
 
     // [secrets] section
     out.push_str("[secrets]\n");
     for (k, v) in secrets {
+        let key = toml_key(k);
         // Multi-line values use triple-quoted TOML strings.
         if v.contains('\n') {
-            out.push_str(&format!("{k} = \"\"\"\n{v}\"\"\"\n"));
+            out.push_str(&format!("{key} = \"\"\"\n{v}\"\"\"\n"));
         } else {
-            out.push_str(&format!("{} = {}\n", k, toml_quote(v)));
+            out.push_str(&format!("{key} = {}\n", toml_quote(v)));
         }
     }
 
@@ -4741,6 +4742,18 @@ fn build_item_toml(
 /// TOML-safe quoting: wraps in double quotes, escaping backslashes and quotes.
 fn toml_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// TOML-safe key: bare keys may only contain `[A-Za-z0-9_-]`.  Anything else
+/// (e.g. dots, colons) must be quoted.
+fn toml_key(k: &str) -> String {
+    if k.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        k.to_string()
+    } else {
+        toml_quote(k)
+    }
 }
 
 /// `rosec item edit` — edit an existing item via $EDITOR.

@@ -1328,6 +1328,11 @@ async fn config_watcher(
         // tasks pick up the new values on their next tick without a restart.
         let old_config = state.live_config();
 
+        // Track whether dedup-relevant state changed so we can rebuild the
+        // cache once at the end, ensuring all D-Bus clients see the new
+        // dedup results immediately.
+        let mut dedup_changed = false;
+
         if new_config.service.dedup_strategy != old_config.service.dedup_strategy
             || new_config.service.dedup_time_fallback != old_config.service.dedup_time_fallback
         {
@@ -1342,6 +1347,30 @@ async fn config_watcher(
                 dedup_time_fallback = ?new_config.service.dedup_time_fallback,
                 "hot-reload: service dedup config updated"
             );
+            dedup_changed = true;
+        }
+
+        // Reorder providers to match the new config ordering.  This affects
+        // the Priority dedup strategy and tie-breaking in Newest.
+        let config_order: Vec<String> = new_config
+            .provider
+            .iter()
+            .filter(|e| e.enabled)
+            .map(|e| e.id.clone())
+            .collect();
+        if state.reorder_providers(&config_order) {
+            tracing::info!("hot-reload: provider order updated");
+            dedup_changed = true;
+        }
+
+        // If dedup config or provider order changed, force a cache rebuild
+        // so D-Bus clients see corrected results immediately.
+        if dedup_changed {
+            tracing::info!("hot-reload: rebuilding cache for new dedup/ordering config");
+            let state2 = Arc::clone(&state);
+            if let Err(e) = state2.rebuild_cache().await {
+                tracing::warn!(error = %e, "hot-reload: cache rebuild failed after dedup config change");
+            }
         }
         if new_config.service.refresh_interval_secs != old_config.service.refresh_interval_secs {
             tracing::info!(

@@ -499,6 +499,44 @@ impl ServiceState {
             .push(id);
     }
 
+    /// Reorder `provider_order` to match the given config ordering.
+    ///
+    /// Provider ordering affects the `Priority` dedup strategy and
+    /// tie-breaking in `Newest`.  When the user reorders providers in
+    /// config without changing their fingerprints, the hot-reload loop
+    /// must call this so the new ordering takes effect.
+    ///
+    /// Returns `true` if the ordering actually changed.
+    pub fn reorder_providers(&self, new_order: &[String]) -> bool {
+        let mut order = self
+            .provider_order
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        // Build the desired ordering: keep only IDs that are currently
+        // present in provider_order (don't add unknown IDs).
+        let current: HashSet<&str> = order.iter().map(String::as_str).collect();
+        let reordered: Vec<String> = new_order
+            .iter()
+            .filter(|id| current.contains(id.as_str()))
+            .cloned()
+            .collect();
+        // Append any IDs that exist in the current order but are missing
+        // from new_order (defensive — shouldn't happen in practice).
+        let new_set: HashSet<&str> = new_order.iter().map(String::as_str).collect();
+        let mut result = reordered;
+        for id in order.iter() {
+            if !new_set.contains(id.as_str()) {
+                result.push(id.clone());
+            }
+        }
+        if *order != result {
+            *order = result;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Hot-remove a provider at runtime.
     ///
     /// Locks the provider first to zeroize in-memory secrets, then drops it.

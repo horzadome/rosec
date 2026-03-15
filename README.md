@@ -510,6 +510,87 @@ Run `rosec provider auth <id> --force` and paste the new token when prompted.
 fusermount3 -uz "$XDG_RUNTIME_DIR/rosec/ssh"
 ```
 
+**Chrome / Vivaldi / Chromium shows "Encrypted keystore changed or is now unavailable"**
+
+This happens when Chromium-based browsers find their "Chrome Safe Storage"
+encryption key has a different value than expected.  The most common cause when
+running rosec is **cross-provider duplication**: the same item exists in two
+providers (e.g. `gnome-keyring` and your `local` vault) with different secret
+values, and deduplication picks the wrong copy.
+
+Chromium identifies its key by searching for
+`application=chrome xdg:schema=chrome_libsecret_os_crypt_password_v2` (or the
+`_v1` variant).  Vivaldi, Brave, and other Chromium forks also use
+`application=chrome`.
+
+*Diagnose — find the duplicates:*
+
+Temporarily set `dedup_strategy = "none"` in your config so both copies are
+visible:
+
+```toml
+# ~/.config/rosec/config.toml
+[service]
+dedup_strategy = "none"
+```
+
+Then search for the duplicate items:
+
+```bash
+rosec search application=chrome
+```
+
+If two items appear from different providers with the same label but different
+`rosec:provider` values, you have cross-provider duplication.
+
+*Fix — keep the correct copy:*
+
+1. Identify which provider holds the **original** secret (typically the one your
+   browser was using before rosec — often `gnome-keyring`).
+
+2. Set `dedup_strategy = "priority"` and list that provider **first** in your
+   config so its copy wins:
+
+   ```toml
+   [service]
+   dedup_strategy = "priority"
+
+   # provider listed first wins dedup
+   [[provider]]
+   id = "gnome-keyring"
+   kind = "gnome-keyring"
+
+   [[provider]]
+   id = "local"
+   kind = "local"
+   # ...remaining providers...
+   ```
+
+3. Restart your browser to verify it no longer shows the error.
+
+4. *(Optional)* Migrate the correct secret into your preferred vault and remove
+   the stale copy:
+
+   ```bash
+   # Export the correct item from gnome-keyring
+   rosec item export <item-id> > chrome-key.toml
+
+   # Import into your local vault
+   rosec item import --provider=local < chrome-key.toml
+
+   # Delete the stale copy from the local vault (the old wrong one)
+   rosec item delete <stale-item-id>
+   ```
+
+   After migrating, you can switch back to `dedup_strategy = "newest"` or
+   remove the explicit strategy to use the default.
+
+> **Why does this happen?**  When rosec replaced `gnome-keyring-daemon` as the
+> Secret Service provider, Chromium's `CreateItem` call stored a new encryption
+> key in rosec's write target (your local vault).  The original key in
+> gnome-keyring was still present but had a different value.  Depending on which
+> copy won deduplication, Chromium could see the wrong key on its next startup.
+
 ---
 
 ## Shell integration

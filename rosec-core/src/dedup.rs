@@ -27,9 +27,19 @@ pub fn dedup(
 
     let mut by_key: HashMap<DedupKey, Vec<ItemMeta>> = HashMap::new();
     for item in items.drain(..) {
+        // Exclude rosec-internal attributes (`rosec:*`) and freedesktop
+        // schema metadata (`xdg:*`) from the dedup key.  The `rosec:*` attrs
+        // are stamped by the service layer or provider plugins and carry
+        // per-provider metadata (e.g. `rosec:provider`, `rosec:type`,
+        // `rosec:gnome-keyring:item-id`).  The `xdg:schema` attr records which
+        // libsecret schema created the item — it is not application-facing
+        // identity and may differ across providers.  Two items from different
+        // providers that share the same label and the same client-visible
+        // attributes should be considered duplicates.
         let mut attrs: Vec<(String, String)> = item
             .attributes
             .iter()
+            .filter(|(k, _)| !k.starts_with("rosec:") && !k.starts_with("xdg:"))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         attrs.sort();
@@ -198,5 +208,125 @@ mod tests {
         let result = dedup(vec![a, b], config, &map);
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].provider_id, "b");
+    }
+
+    /// Items from different providers that share the same label and
+    /// client-visible attributes must be grouped together, even when
+    /// rosec-internal attributes (`rosec:*`) differ.  This mirrors the
+    /// Chrome/Vivaldi scenario where a "Chrome Safe Storage" item with
+    /// `application=chrome` exists in both a local vault and gnome-keyring,
+    /// with gnome-keyring items carrying extra `rosec:gnome-keyring:*`
+    /// metadata.
+    #[test]
+    fn dedup_ignores_rosec_internal_attributes() {
+        let mut local_attrs = Attributes::new();
+        local_attrs.insert("application".into(), "chrome".into());
+        local_attrs.insert(
+            "xdg:schema".into(),
+            "chrome_libsecret_os_crypt_password_v2".into(),
+        );
+        local_attrs.insert("rosec:provider".into(), "local".into());
+        local_attrs.insert("rosec:type".into(), "generic".into());
+
+        let mut gk_attrs = Attributes::new();
+        gk_attrs.insert("application".into(), "chrome".into());
+        gk_attrs.insert(
+            "xdg:schema".into(),
+            "chrome_libsecret_os_crypt_password_v2".into(),
+        );
+        gk_attrs.insert("rosec:provider".into(), "gnome-keyring".into());
+        gk_attrs.insert("rosec:type".into(), "generic".into());
+        gk_attrs.insert("rosec:gnome-keyring:item-id".into(), "3".into());
+        gk_attrs.insert("rosec:gnome-keyring:keyring".into(), "Login".into());
+
+        let local_item = ItemMeta {
+            id: "local-1".into(),
+            provider_id: "local".into(),
+            label: "Chrome Safe Storage".into(),
+            attributes: local_attrs,
+            created: None,
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(120)),
+            locked: false,
+        };
+
+        let gk_item = ItemMeta {
+            id: "gk-3".into(),
+            provider_id: "gnome-keyring".into(),
+            label: "Chrome Safe Storage".into(),
+            attributes: gk_attrs,
+            created: None,
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(60)),
+            locked: false,
+        };
+
+        let config = DedupConfig {
+            strategy: DedupStrategy::Priority,
+            time_fallback: DedupTimeFallback::Created,
+        };
+        // gnome-keyring has higher priority (lower index) than local
+        let map = provider_priority_map(vec!["gnome-keyring".into(), "local".into()]);
+        let result = dedup(vec![local_item, gk_item], config, &map);
+
+        assert_eq!(result.items.len(), 1, "should collapse into a single item");
+        assert_eq!(
+            result.items[0].provider_id, "gnome-keyring",
+            "gnome-keyring has higher priority"
+        );
+    }
+
+    /// Items from different providers may differ on `xdg:schema` (or lack it
+    /// entirely).  The dedup key should ignore `xdg:*` attributes so these
+    /// are still recognised as duplicates.
+    #[test]
+    fn dedup_ignores_xdg_schema_mismatch() {
+        let mut gk_attrs = Attributes::new();
+        gk_attrs.insert("application".into(), "chrome".into());
+        gk_attrs.insert(
+            "xdg:schema".into(),
+            "chrome_libsecret_os_crypt_password_v2".into(),
+        );
+        gk_attrs.insert("rosec:provider".into(), "gnome-keyring".into());
+
+        // Local item created via import — no xdg:schema at all.
+        let mut local_attrs = Attributes::new();
+        local_attrs.insert("application".into(), "chrome".into());
+        local_attrs.insert("rosec:provider".into(), "local".into());
+
+        let gk_item = ItemMeta {
+            id: "gk-3".into(),
+            provider_id: "gnome-keyring".into(),
+            label: "Chrome Safe Storage".into(),
+            attributes: gk_attrs,
+            created: None,
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(60)),
+            locked: false,
+        };
+
+        let local_item = ItemMeta {
+            id: "local-imported".into(),
+            provider_id: "local".into(),
+            label: "Chrome Safe Storage".into(),
+            attributes: local_attrs,
+            created: None,
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(200)),
+            locked: false,
+        };
+
+        let config = DedupConfig {
+            strategy: DedupStrategy::Newest,
+            time_fallback: DedupTimeFallback::Created,
+        };
+        let map = provider_priority_map(vec!["local".into(), "gnome-keyring".into()]);
+        let result = dedup(vec![gk_item, local_item], config, &map);
+
+        assert_eq!(
+            result.items.len(),
+            1,
+            "xdg:schema mismatch should not prevent dedup"
+        );
+        assert_eq!(
+            result.items[0].provider_id, "local",
+            "local item is newer and should win"
+        );
     }
 }

@@ -39,6 +39,21 @@ impl SecretItem {
     pub fn new(state: ItemState) -> Self {
         Self { state }
     }
+
+    /// Live lock state for this item.
+    ///
+    /// Reads from the shared `items_cache` which is kept up-to-date by
+    /// `rebuild_cache_inner()`.  Falls back to the registration-time
+    /// snapshot if the item has been evicted from the cache (shouldn't
+    /// happen in practice).
+    fn is_locked(&self) -> bool {
+        self.state
+            .items_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&self.state.path).map(|m| m.locked))
+            .unwrap_or(self.state.meta.locked)
+    }
 }
 
 #[interface(name = "org.freedesktop.Secret.Item")]
@@ -55,7 +70,7 @@ impl SecretItem {
 
     #[zbus(property)]
     fn locked(&self) -> bool {
-        self.state.meta.locked
+        self.is_locked()
     }
 
     /// Unix timestamp when the item was created (0 if unknown).
@@ -88,7 +103,7 @@ impl SecretItem {
 
         let session = session.as_str();
         ensure_session(&self.state.sessions, session)?;
-        if self.state.meta.locked {
+        if self.is_locked() {
             return Err(SecretServiceError::IsLocked("item is locked".to_string()));
         }
         let aes_key = self
@@ -132,7 +147,7 @@ impl SecretItem {
     }
 
     fn set_secret(&self, _secret: SecretStruct) -> Result<(), SecretServiceError> {
-        if self.state.meta.locked {
+        if self.is_locked() {
             return Err(SecretServiceError::IsLocked("item is locked".to_string()));
         }
         Err(SecretServiceError::NotSupported(
@@ -154,7 +169,7 @@ impl SecretItem {
 
         // Check if the provider is locked — if so, return a prompt path so the
         // client can trigger unlock before retrying.
-        if self.state.meta.locked {
+        if self.is_locked() {
             let provider_id = self.state.provider.id().to_string();
             let item_id = self.state.meta.id.clone();
             let item_path = self.state.path.clone();
@@ -375,5 +390,49 @@ mod tests {
             .get_secret(ObjectPath::try_from(session.as_str()).unwrap())
             .await;
         assert!(result.is_err());
+    }
+
+    /// An item registered while locked should become accessible after the
+    /// cache is updated to reflect the provider being unlocked.
+    #[tokio::test]
+    async fn get_secret_succeeds_after_cache_unlocks_item() {
+        let sessions = Arc::new(SessionManager::new());
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+        let items_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let service_state = test_service_state(Arc::clone(&provider)).await;
+        let path = "/org/freedesktop/secrets/item/mock/three".to_string();
+        let state = ItemState {
+            meta: meta(true), // registered as locked
+            path: path.clone(),
+            provider,
+            sessions: sessions.clone(),
+            return_attr_patterns: vec!["secret".to_string()],
+            tokio_handle: tokio::runtime::Handle::current(),
+            items_cache: Arc::clone(&items_cache),
+            service_state,
+        };
+        let item = SecretItem::new(state);
+
+        // Confirm it's locked via the D-Bus property.
+        assert!(item.locked());
+
+        // Simulate cache rebuild after provider unlocks.
+        {
+            let mut cache = items_cache.lock().expect("test lock");
+            cache.insert(path, meta(false));
+        }
+
+        // Now the item should report unlocked.
+        assert!(!item.locked());
+
+        // And GetSecret should succeed.
+        let session = match sessions.open_session("plain", &zvariant::Value::from("")) {
+            Ok((_, path)) => path,
+            Err(err) => panic!("open_session failed: {err}"),
+        };
+        let result = item
+            .get_secret(ObjectPath::try_from(session.as_str()).unwrap())
+            .await;
+        assert!(result.is_ok());
     }
 }
