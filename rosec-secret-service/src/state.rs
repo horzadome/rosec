@@ -127,6 +127,19 @@ pub struct ServiceState {
     /// need the result (D-Bus `SyncProvider`) await the lock; background callers
     /// (timer, SignalR nudge) use `try_lock` and skip if already in progress.
     sync_in_progress: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-provider prompt serialization: ensures at most one active prompt
+    /// subprocess per provider at a time.
+    ///
+    /// When multiple D-Bus clients race to `Unlock()` the same provider (e.g.
+    /// after sleep/resume), each gets its own `SecretPrompt` object and calls
+    /// `Prompt()`.  The second `run_prompt_task` awaits this lock, and when it
+    /// acquires it, checks whether the provider is still locked.  If the first
+    /// prompt already unlocked it, the second emits `Completed(success)`
+    /// immediately without showing a GUI dialog.
+    ///
+    /// This matches gnome-keyring-daemon's `unlock_prompt_queue` serialization
+    /// approach — only one password dialog is shown at a time per provider.
+    prompt_in_progress: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Timestamp of the last client activity (D-Bus method call).
     last_activity: Mutex<Option<SystemTime>>,
     /// Timestamp when any provider was first unlocked (for max-unlocked policy).
@@ -260,6 +273,7 @@ impl ServiceState {
             conn,
             unlock_in_progress: tokio::sync::Mutex::new(()),
             sync_in_progress: std::sync::Mutex::new(HashMap::new()),
+            prompt_in_progress: std::sync::Mutex::new(HashMap::new()),
             last_activity: Mutex::new(None),
             unlocked_since: Mutex::new(None),
             unlocked_since_map: Mutex::new(HashMap::new()),
@@ -629,7 +643,8 @@ impl ServiceState {
     /// Kill the active prompt subprocess (if any) and remove it from the registry.
     ///
     /// Sends SIGTERM to the child PID. Safe to call even if the child has already
-    /// exited (the signal is silently ignored).
+    /// exited (the signal is silently ignored).  Also deregisters the D-Bus
+    /// object so stale prompt objects do not accumulate.
     pub fn cancel_prompt(&self, prompt_path: &str) {
         let pid = self
             .active_prompts
@@ -645,13 +660,58 @@ impl ServiceState {
             }
             tracing::debug!(prompt = %prompt_path, pid, "prompt child terminated");
         }
+
+        self.deregister_prompt_object(prompt_path);
     }
 
     /// Remove a completed prompt from the registry without killing the child.
+    ///
+    /// Also deregisters the D-Bus object so stale prompt objects do not
+    /// accumulate on the object server.
     pub fn finish_prompt(&self, prompt_path: &str) {
         if let Ok(mut map) = self.active_prompts.lock() {
             map.remove(prompt_path);
         }
+        self.deregister_prompt_object(prompt_path);
+    }
+
+    /// Remove a `SecretPrompt` D-Bus object from the object server.
+    ///
+    /// Safe to call even if no object is registered at the path (returns
+    /// silently).  Uses `spawn_on_tokio` because zbus object removal is async.
+    fn deregister_prompt_object(&self, prompt_path: &str) {
+        let conn = self.conn.clone();
+        let path = prompt_path.to_string();
+        self.spawn_on_tokio(async move {
+            if let Err(e) = conn
+                .object_server()
+                .remove::<crate::prompt::SecretPrompt, _>(path.as_str())
+                .await
+            {
+                tracing::debug!(
+                    prompt = %path,
+                    error = %e,
+                    "failed to deregister prompt object (may already be removed)"
+                );
+            }
+        });
+    }
+
+    /// Get or create a per-provider Tokio mutex for serializing prompt tasks.
+    ///
+    /// Follows the same lazy-init pattern as `sync_mutex_for`.  When multiple
+    /// clients trigger `Unlock()` for the same provider, the second prompt task
+    /// awaits this mutex.  After acquiring it, the task checks whether the
+    /// provider was already unlocked by the first prompt and skips the GUI
+    /// dialog if so.
+    pub(crate) fn prompt_mutex_for(&self, provider_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self
+            .prompt_in_progress
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(provider_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Record that client activity has occurred (resets idle timer).
@@ -876,7 +936,6 @@ impl ServiceState {
             let status = child
                 .wait()
                 .map_err(|e| FdoError::Failed(format!("SSH_ASKPASS wait error: {e}")))?;
-            self.finish_prompt(&prompt_path);
 
             if !status.success() || password.is_empty() {
                 return Err(FdoError::Failed(
@@ -955,7 +1014,6 @@ impl ServiceState {
                     let status = child
                         .wait()
                         .map_err(|e| FdoError::Failed(format!("rosec-prompt wait: {e}")))?;
-                    self.finish_prompt(&prompt_path);
 
                     if !status.success() {
                         return Err(FdoError::Failed("prompt cancelled".to_string()));
@@ -1016,11 +1074,10 @@ impl ServiceState {
         // read_hidden() — the same code path used by UnlockWithTty, minus
         // the D-Bus fd-passing overhead.
         if has_tty {
-            return self.builtin_tty_prompt(&prompt_path, provider_id, label);
+            return self.builtin_tty_prompt(provider_id, label);
         }
 
         // ── 4. Headless — cannot prompt ────────────────────────────────────
-        self.finish_prompt(&prompt_path);
         Err(FdoError::Failed(format!(
             "headless: no display, no TTY, and SSH_ASKPASS is not set — \
              run `rosec auth {provider_id}` to unlock manually"
@@ -1142,7 +1199,6 @@ impl ServiceState {
         let status = child
             .wait()
             .map_err(|e| FdoError::Failed(format!("rosec-prompt wait: {e}")))?;
-        self.finish_prompt(&prompt_path_owned);
 
         if !status.success() {
             return Err(FdoError::Failed("prompt cancelled".to_string()));
@@ -1174,7 +1230,6 @@ impl ServiceState {
     ///   error paths.
     fn builtin_tty_prompt(
         &self,
-        prompt_path: &str,
         provider_id: &str,
         label: &str,
     ) -> Result<Zeroizing<String>, FdoError> {
@@ -1204,8 +1259,6 @@ impl ServiceState {
 
         let password = crate::tty::read_hidden(fd, None)
             .map_err(|e| FdoError::Failed(format!("built-in TTY prompt read error: {e}")))?;
-
-        self.finish_prompt(prompt_path);
 
         if password.is_empty() {
             return Err(FdoError::Failed(

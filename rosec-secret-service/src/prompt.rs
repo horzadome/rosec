@@ -168,6 +168,42 @@ async fn run_prompt_task(
         }
     }
 
+    // ── Prompt serialization (gnome-keyring unlock_prompt_queue pattern) ──
+    //
+    // Acquire a per-provider mutex so that only one prompt GUI subprocess runs
+    // at a time.  If another client's prompt is already in progress for this
+    // provider, we wait for it to finish.  When we acquire the lock, we check
+    // whether the provider is still locked — if the first prompt succeeded,
+    // we emit Completed(success) immediately without showing a second dialog.
+    let prompt_mutex = state.prompt_mutex_for(&provider_id);
+    let _prompt_guard = prompt_mutex.lock().await;
+
+    // Check if the provider was unlocked while we waited in the queue.
+    let already_unlocked = match state.provider_by_id(&provider_id) {
+        Some(p) => p.status().await.map(|s| !s.locked).unwrap_or(false),
+        None => false,
+    };
+    if already_unlocked {
+        tracing::debug!(
+            provider = %provider_id,
+            "provider already unlocked by another prompt — skipping"
+        );
+        // Delegate to on_unlock_success so that any deferred operation
+        // (CreateItem / DeleteItem) stashed by this prompt is still executed,
+        // the cache is synced, and the Completed signal is emitted.  The empty
+        // password is harmless — opportunistic_sweep with an empty string
+        // won't unlock anything.
+        on_unlock_success(
+            &state,
+            &prompt_path,
+            &provider_id,
+            Zeroizing::new(String::new()),
+            &ctxt,
+        )
+        .await;
+        return;
+    }
+
     let mut attempt = 0u32;
 
     tracing::debug!(provider = %provider_id, %label, "run_prompt_task started");
