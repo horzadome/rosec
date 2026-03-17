@@ -17,8 +17,18 @@ mod enable;
 
 /// D-Bus wire type for `org.rosec.Daemon.ProviderList` entries.
 ///
-/// Fields: `(id, name, kind, locked, cached, offline_cache, last_cache_write_epoch, last_sync_epoch)`.
-type ProviderEntry = (String, String, String, bool, bool, bool, u64, u64);
+/// Fields: `(id, name, kind, locked, cached, offline_cache, last_cache_write_epoch, last_sync_epoch, capabilities)`.
+type ProviderEntry = (
+    String,
+    String,
+    String,
+    bool,
+    bool,
+    bool,
+    u64,
+    u64,
+    Vec<String>,
+);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -969,30 +979,35 @@ async fn cmd_provider_list() -> Result<()> {
             name: String,
             kind: String,
             state: String,
+            caps: String,
             sync: String,
         }
 
         let mut rows: Vec<RowData> = entries
             .iter()
-            .map(|(id, name, kind, locked, cached, _, _, last_sync)| {
-                let state = match (*locked, *cached) {
-                    (true, _) => "locked".to_string(),
-                    (false, true) => "unlocked (cached)".to_string(),
-                    (false, false) => "unlocked".to_string(),
-                };
-                let sync = if *locked {
-                    String::new()
-                } else {
-                    format_relative_time(*last_sync, now_epoch)
-                };
-                RowData {
-                    id: id.clone(),
-                    name: name.clone(),
-                    kind: kind.clone(),
-                    state,
-                    sync,
-                }
-            })
+            .map(
+                |(id, name, kind, locked, cached, _, _, last_sync, capabilities)| {
+                    let state = match (*locked, *cached) {
+                        (true, _) => "locked".to_string(),
+                        (false, true) => "unlocked (cached)".to_string(),
+                        (false, false) => "unlocked".to_string(),
+                    };
+                    let sync = if *locked {
+                        String::new()
+                    } else {
+                        format_relative_time(*last_sync, now_epoch)
+                    };
+                    let caps = capability_codes(capabilities);
+                    RowData {
+                        id: id.clone(),
+                        name: name.clone(),
+                        kind: kind.clone(),
+                        state,
+                        caps,
+                        sync,
+                    }
+                },
+            )
             .collect();
 
         for entry in &disabled {
@@ -1001,6 +1016,7 @@ async fn cmd_provider_list() -> Result<()> {
                 name: entry.id.clone(),
                 kind: entry.kind.clone(),
                 state: "disabled".to_string(),
+                caps: String::new(),
                 sync: String::new(),
             });
         }
@@ -1008,6 +1024,12 @@ async fn cmd_provider_list() -> Result<()> {
         let id_w = rows.iter().map(|r| r.id.len()).max().unwrap_or(2).max(2);
         let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
         let kind_w = rows.iter().map(|r| r.kind.len()).max().unwrap_or(4).max(4);
+        let caps_w = rows
+            .iter()
+            .map(|r| r.caps.len())
+            .max()
+            .unwrap_or(0)
+            .max("CAPS".len());
         let state_w = rows.iter().map(|r| r.state.len()).max().unwrap_or(5).max(5);
         let sync_w = rows.iter().map(|r| r.sync.len()).max().unwrap_or(0).max(
             if rows.iter().any(|r| !r.sync.is_empty()) {
@@ -1019,7 +1041,7 @@ async fn cmd_provider_list() -> Result<()> {
 
         let has_sync_col = sync_w > 0;
 
-        // Priority: ID > NAME > KIND > STATE > SYNC (fit to terminal).
+        // Priority: ID > NAME > KIND > CAPS > STATE > SYNC (fit to terminal).
         let mut cols = vec![
             ColSpec {
                 natural: id_w,
@@ -1034,6 +1056,11 @@ async fn cmd_provider_list() -> Result<()> {
             ColSpec {
                 natural: kind_w,
                 min: 4,
+                allocated: 0,
+            },
+            ColSpec {
+                natural: caps_w,
+                min: "CAPS".len(),
                 allocated: 0,
             },
             ColSpec {
@@ -1054,18 +1081,19 @@ async fn cmd_provider_list() -> Result<()> {
         let id_w = cols[0].allocated;
         let name_w = cols[1].allocated;
         let kind_w = cols[2].allocated;
-        let state_w = cols[3].allocated;
-        let sync_w = if has_sync_col { cols[4].allocated } else { 0 };
+        let caps_w = cols[3].allocated;
+        let state_w = cols[4].allocated;
+        let sync_w = if has_sync_col { cols[5].allocated } else { 0 };
 
         if has_sync_col {
             println!(
-                "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<state_w$}  LAST SYNC",
-                "ID", "NAME", "KIND", "STATE",
+                "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<caps_w$}  {:<state_w$}  LAST SYNC",
+                "ID", "NAME", "KIND", "CAPS", "STATE",
             );
         } else {
             println!(
-                "{:<id_w$}  {:<name_w$}  {:<kind_w$}  STATE",
-                "ID", "NAME", "KIND",
+                "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<caps_w$}  STATE",
+                "ID", "NAME", "KIND", "CAPS",
             );
         }
         let sep_w = id_w
@@ -1074,6 +1102,8 @@ async fn cmd_provider_list() -> Result<()> {
             + 2
             + kind_w
             + 2
+            + caps_w
+            + 2
             + state_w
             + if has_sync_col { 2 + sync_w } else { 0 };
         println!("{}", "\u{2500}".repeat(sep_w));
@@ -1081,23 +1111,28 @@ async fn cmd_provider_list() -> Result<()> {
         for row in &rows {
             if has_sync_col {
                 println!(
-                    "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<state_w$}  {}",
+                    "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<caps_w$}  {:<state_w$}  {}",
                     trunc(&row.id, id_w),
                     trunc(&row.name, name_w),
                     trunc(&row.kind, kind_w),
+                    trunc(&row.caps, caps_w),
                     trunc(&row.state, state_w),
                     trunc(&row.sync, sync_w),
                 );
             } else {
                 println!(
-                    "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {}",
+                    "{:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<caps_w$}  {}",
                     trunc(&row.id, id_w),
                     trunc(&row.name, name_w),
                     trunc(&row.kind, kind_w),
+                    trunc(&row.caps, caps_w),
                     trunc(&row.state, state_w),
                 );
             }
         }
+        println!(
+            "\nCAPS: S=Sync W=Write s=Ssh K=KeyWrapping P=PasswordChange C=Cache N=Notifications"
+        );
         return Ok(());
     }
 
@@ -1907,6 +1942,7 @@ async fn cmd_status() -> Result<()> {
             id: String,
             name: String,
             kind: String,
+            caps: String,
             state: String,
             sync: String,
         }
@@ -1919,7 +1955,17 @@ async fn cmd_status() -> Result<()> {
         let mut rows: Vec<RowData> = providers
             .iter()
             .map(
-                |(id, name, kind, locked, cached, _offline_cache, _last_cache_write, last_sync)| {
+                |(
+                    id,
+                    name,
+                    kind,
+                    locked,
+                    cached,
+                    _offline_cache,
+                    _last_cache_write,
+                    last_sync,
+                    capabilities,
+                )| {
                     let state = match (*locked, *cached) {
                         (true, _) => "locked".to_string(),
                         (false, true) => "unlocked (cached)".to_string(),
@@ -1930,10 +1976,12 @@ async fn cmd_status() -> Result<()> {
                     } else {
                         format_relative_time(*last_sync, now_epoch)
                     };
+                    let caps = capability_codes(capabilities);
                     RowData {
                         id: id.clone(),
                         name: name.clone(),
                         kind: kind.clone(),
+                        caps,
                         state,
                         sync,
                     }
@@ -1946,6 +1994,7 @@ async fn cmd_status() -> Result<()> {
                 id: entry.id.clone(),
                 name: entry.id.clone(),
                 kind: entry.kind.clone(),
+                caps: String::new(),
                 state: "disabled".to_string(),
                 sync: String::new(),
             });
@@ -1954,6 +2003,12 @@ async fn cmd_status() -> Result<()> {
         let id_w = rows.iter().map(|r| r.id.len()).max().unwrap_or(2).max(2);
         let name_w = rows.iter().map(|r| r.name.len()).max().unwrap_or(4).max(4);
         let kind_w = rows.iter().map(|r| r.kind.len()).max().unwrap_or(4).max(4);
+        let caps_w = rows
+            .iter()
+            .map(|r| r.caps.len())
+            .max()
+            .unwrap_or(0)
+            .max("CAPS".len());
         let state_w = rows.iter().map(|r| r.state.len()).max().unwrap_or(5).max(5);
         let sync_w = rows.iter().map(|r| r.sync.len()).max().unwrap_or(0).max(
             if rows.iter().any(|r| !r.sync.is_empty()) {
@@ -1965,7 +2020,7 @@ async fn cmd_status() -> Result<()> {
 
         let has_sync_col = sync_w > 0;
 
-        // Priority ordering: ID > NAME > KIND > STATE > SYNC
+        // Priority ordering: ID > NAME > KIND > CAPS > STATE > SYNC
         let mut cols = vec![
             ColSpec {
                 natural: id_w,
@@ -1980,6 +2035,11 @@ async fn cmd_status() -> Result<()> {
             ColSpec {
                 natural: kind_w,
                 min: 4,
+                allocated: 0,
+            },
+            ColSpec {
+                natural: caps_w,
+                min: "CAPS".len(),
                 allocated: 0,
             },
             ColSpec {
@@ -2000,19 +2060,20 @@ async fn cmd_status() -> Result<()> {
         let id_w = cols[0].allocated;
         let name_w = cols[1].allocated;
         let kind_w = cols[2].allocated;
-        let state_w = cols[3].allocated;
-        let sync_w = if has_sync_col { cols[4].allocated } else { 0 };
+        let caps_w = cols[3].allocated;
+        let state_w = cols[4].allocated;
+        let sync_w = if has_sync_col { cols[5].allocated } else { 0 };
 
         // Header
         if has_sync_col {
             println!(
-                "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<state_w$}  LAST SYNC",
-                "ID", "NAME", "KIND", "STATE",
+                "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<caps_w$}  {:<state_w$}  LAST SYNC",
+                "ID", "NAME", "KIND", "CAPS", "STATE",
             );
         } else {
             println!(
-                "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  STATE",
-                "ID", "NAME", "KIND",
+                "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<caps_w$}  STATE",
+                "ID", "NAME", "KIND", "CAPS",
             );
         }
         let sep_w = id_w
@@ -2021,6 +2082,8 @@ async fn cmd_status() -> Result<()> {
             + 2
             + kind_w
             + 2
+            + caps_w
+            + 2
             + state_w
             + if has_sync_col { 2 + sync_w } else { 0 };
         println!("  {}", "\u{2500}".repeat(sep_w));
@@ -2028,19 +2091,21 @@ async fn cmd_status() -> Result<()> {
         for row in &rows {
             if has_sync_col {
                 println!(
-                    "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<state_w$}  {}",
+                    "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<caps_w$}  {:<state_w$}  {}",
                     trunc(&row.id, id_w),
                     trunc(&row.name, name_w),
                     trunc(&row.kind, kind_w),
+                    trunc(&row.caps, caps_w),
                     trunc(&row.state, state_w),
                     trunc(&row.sync, sync_w),
                 );
             } else {
                 println!(
-                    "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  {}",
+                    "  {:<id_w$}  {:<name_w$}  {:<kind_w$}  {:<caps_w$}  {}",
                     trunc(&row.id, id_w),
                     trunc(&row.name, name_w),
                     trunc(&row.kind, kind_w),
+                    trunc(&row.caps, caps_w),
                     trunc(&row.state, state_w),
                 );
             }
@@ -2144,7 +2209,10 @@ async fn cmd_sync() -> Result<()> {
     // Fetch the list of providers so we know which ones to sync.
     let providers: Vec<ProviderEntry> = proxy.call("ProviderList", &()).await?;
 
-    for (id, _name, _kind, _locked, ..) in &providers {
+    for (id, _name, _kind, _locked, _, _, _, _, capabilities) in &providers {
+        if !capabilities.iter().any(|c| c == "Sync") {
+            continue;
+        }
         eprint!("Syncing '{id}'...");
         match proxy.call::<_, _, u32>("SyncProvider", &(id,)).await {
             Ok(count) => {
@@ -2204,9 +2272,13 @@ async fn preemptive_sync(conn: &Connection) -> Result<()> {
 
     let futures: Vec<_> = providers
         .into_iter()
-        .filter(|(_, _, _, locked, _, _, _, last_sync)| {
-            // Skip locked providers and providers synced within the last 60 s.
+        .filter(|(_, _, _, locked, _, _, _, last_sync, capabilities)| {
+            // Skip locked providers, providers without Sync capability,
+            // and providers synced within the last 60 s.
             if *locked {
+                return false;
+            }
+            if !capabilities.iter().any(|c| c == "Sync") {
                 return false;
             }
             *last_sync == 0 || now_epoch.saturating_sub(*last_sync) >= 60
@@ -2651,6 +2723,29 @@ fn format_relative_time(epoch_secs: u64, now_epoch: u64) -> String {
     } else {
         format!("{}d ago", delta / 86400)
     }
+}
+
+/// Build a compact capability string from the D-Bus capability list.
+///
+/// Each capability maps to a single character:
+///   S = Sync, W = Write, s = Ssh, K = KeyWrapping,
+///   P = PasswordChange, C = OfflineCache, N = Notifications
+fn capability_codes(caps: &[String]) -> String {
+    let mut out = String::new();
+    for (name, code) in [
+        ("Sync", 'S'),
+        ("Write", 'W'),
+        ("Ssh", 's'),
+        ("KeyWrapping", 'K'),
+        ("PasswordChange", 'P'),
+        ("OfflineCache", 'C'),
+        ("Notifications", 'N'),
+    ] {
+        if caps.iter().any(|c| c == name) {
+            out.push(code);
+        }
+    }
+    out
 }
 
 fn trunc(s: &str, max: usize) -> String {

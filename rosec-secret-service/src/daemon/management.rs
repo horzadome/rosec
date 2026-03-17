@@ -94,6 +94,8 @@ impl RosecManagement {
             let id = p.id().to_string();
             let name = p.name().to_string();
             let kind = p.kind().to_string();
+            let capabilities: Vec<String> =
+                p.capabilities().iter().map(|c| format!("{c:?}")).collect();
             let status = self
                 .state
                 .run_on_tokio(async move { p.status().await })
@@ -116,6 +118,7 @@ impl RosecManagement {
                 offline_cache: status.offline_cache,
                 last_cache_write,
                 last_sync,
+                capabilities,
             });
         }
         Ok(entries)
@@ -794,6 +797,8 @@ pub struct ProviderListEntry {
     pub last_cache_write: u64,
     /// When this provider last synced successfully (epoch seconds, 0 = never).
     pub last_sync: u64,
+    /// Capabilities declared by this provider (e.g. `["Sync", "Write", "Ssh"]`).
+    pub capabilities: Vec<String>,
 }
 
 /// A single auth-field descriptor returned by `GetAuthFields`.

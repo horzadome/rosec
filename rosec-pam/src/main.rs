@@ -56,8 +56,18 @@ const PAM_IGNORE: i32 = 25;
 
 /// D-Bus wire type for `org.rosec.Daemon.ProviderList` entries.
 ///
-/// Fields: `(id, name, kind, locked, cached, offline_cache, last_cache_write_epoch, last_sync_epoch)`.
-type ProviderEntry = (String, String, String, bool, bool, bool, u64, u64);
+/// Fields: `(id, name, kind, locked, cached, offline_cache, last_cache_write_epoch, last_sync_epoch, capabilities)`.
+type ProviderEntry = (
+    String,
+    String,
+    String,
+    bool,
+    bool,
+    bool,
+    u64,
+    u64,
+    Vec<String>,
+);
 
 /// Log a debug message to syslog. TEMPORARY — remove before release.
 fn debug_log(msg: &str) {
