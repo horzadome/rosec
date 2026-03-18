@@ -2310,12 +2310,12 @@ async fn preemptive_sync(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Returns `true` if the daemon reports at least one locked provider.
+/// Returns `true` if the daemon reports at least one locked provider that has
+/// the `Sync` capability.
 ///
-/// Used by `cmd_search` with `--sync` to distinguish "genuinely no results"
-/// from "empty because the metadata cache was never populated" (cold start with
-/// all providers locked).
-async fn any_providers_locked(conn: &Connection) -> Result<bool> {
+/// Used by `cmd_search` with `--sync` to decide whether an unlock prompt is
+/// worthwhile — there is no point prompting for a provider that cannot sync.
+async fn any_syncable_providers_locked(conn: &Connection) -> Result<bool> {
     let proxy = zbus::Proxy::new(
         conn,
         "org.freedesktop.secrets",
@@ -2324,7 +2324,11 @@ async fn any_providers_locked(conn: &Connection) -> Result<bool> {
     )
     .await?;
     let providers: Vec<ProviderEntry> = proxy.call("ProviderList", &()).await?;
-    Ok(providers.iter().any(|(_, _, _, locked, ..)| *locked))
+    Ok(providers
+        .iter()
+        .any(|(_, _, _, locked, _, _, _, _, capabilities)| {
+            *locked && capabilities.iter().any(|c| c == "Sync")
+        }))
 }
 
 /// Output format for `rosec search`.
@@ -2622,17 +2626,12 @@ async fn cmd_search(args: &[String]) -> Result<()> {
         Err(e) => return Err(e),
     };
 
-    // With --sync, trigger unlock and retry when:
-    //   (a) results are all locked (items exist but collection is locked), OR
-    //   (b) both lists are empty AND the daemon has locked providers — the
-    //       metadata cache is cold (never synced) because all providers started
-    //       locked and preemptive_sync skipped them.
-    // Skipped entirely when --no-unlock is set (no_unlock implies !sync, but
-    // belt-and-suspenders guard here for clarity).
-    let needs_unlock = !no_unlock
-        && sync
-        && ((!locked.is_empty() && unlocked.is_empty())
-            || (unlocked.is_empty() && locked.is_empty() && any_providers_locked(&conn).await?));
+    // With --sync, trigger unlock whenever any syncable provider is still
+    // locked.  Previous logic only unlocked when *all* results were locked or
+    // empty, which silently skipped locked providers when at least one unlocked
+    // provider already returned results.  The user asked for --sync — honour
+    // that by unlocking every syncable provider so the search covers everything.
+    let needs_unlock = !no_unlock && sync && any_syncable_providers_locked(&conn).await?;
     let (unlocked, locked) = if needs_unlock {
         trigger_unlock(&conn).await?;
         preemptive_sync(&conn).await?;
@@ -4208,10 +4207,7 @@ async fn cmd_item_list(args: &[String]) -> Result<()> {
         Err(e) => return Err(e),
     };
 
-    let needs_unlock = !no_unlock
-        && sync
-        && ((!locked.is_empty() && unlocked.is_empty())
-            || (unlocked.is_empty() && locked.is_empty() && any_providers_locked(&conn).await?));
+    let needs_unlock = !no_unlock && sync && any_syncable_providers_locked(&conn).await?;
     let (unlocked, locked) = if needs_unlock {
         trigger_unlock(&conn).await?;
         preemptive_sync(&conn).await?;
