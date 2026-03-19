@@ -10,30 +10,24 @@
 //! passed through a pipe fd (SCM_RIGHTS), never as a D-Bus message payload,
 //! so it is invisible to `dbus-monitor`.
 //!
-//! # Scope: screen unlock only, not initial login
+//! # Invocation
 //!
-//! This helper only works during **re-authentication** (screen unlock), not at
-//! initial login.  At initial login the user's D-Bus session bus does not exist
-//! yet and rosecd has not started, so `$DBUS_SESSION_BUS_ADDRESS` is unset and
-//! the connection will fail.  The helper returns `PAM_IGNORE` silently in that
-//! case, which means login is never blocked — vaults simply remain locked until
-//! the user unlocks them interactively (e.g. via `rosec provider auth`).
+//! Normally called by `pam_rosec.so`, which handles both **initial login** and
+//! **screen unlock**.  `pam_rosec.so` drops privileges to the target user before
+//! exec, polls for the session bus to appear, and passes the stashed password on
+//! stdin.
 //!
-//! For screen-unlock use, rosecd is already running and the session bus is
-//! available, so the helper can connect, pass the password through the pipe,
-//! and have the daemon unlock the vaults transparently.
+//! Can also be invoked standalone via `pam_exec.so` in screen-locker PAM configs.
+//! In that mode initial login is not supported — `pam_exec` runs as root without
+//! privilege dropping, so connecting to the user session bus will fail silently.
 //!
 //! # PAM configuration
 //!
-//! Add to the appropriate PAM config for your screen locker
-//! (e.g. `/etc/pam.d/hyprlock`, `/etc/pam.d/swaylock`):
+//! Prefer `pam_rosec.so` (see README).  For a standalone fallback via `pam_exec`:
 //!
 //! ```text
 //! auth  optional  pam_exec.so  expose_authtok quiet /usr/lib/rosec/rosec-pam-unlock
 //! ```
-//!
-//! Do NOT add this to `/etc/pam.d/system-login` or `/etc/pam.d/login` —
-//! it will silently fail there (PAM_IGNORE) and has no effect at initial login.
 //!
 //! # Security
 //!
@@ -202,14 +196,31 @@ fn ensure_session_bus_env() {
 
     if !has_dbus {
         let bus_path = format!("unix:path={runtime_dir}/bus");
-        // Only set if the socket actually exists.
+        // Poll for the socket — systemd activates the user bus asynchronously.
         let socket_path = format!("{runtime_dir}/bus");
-        if std::path::Path::new(&socket_path).exists() {
+        const POLL_MS: u64 = 200;
+        const MAX_WAIT_SECS: u64 = 15;
+        let mut found = std::path::Path::new(&socket_path).exists();
+        if !found {
+            debug_log(&format!(
+                "bus socket {socket_path} not yet present, polling up to {MAX_WAIT_SECS}s"
+            ));
+            for _ in 0..(MAX_WAIT_SECS * 1000 / POLL_MS) {
+                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
+                if std::path::Path::new(&socket_path).exists() {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if found {
             debug_log(&format!("setting DBUS_SESSION_BUS_ADDRESS={bus_path}"));
             // SAFETY: This binary is single-threaded at this point.
             unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &bus_path) };
         } else {
-            debug_log(&format!("bus socket {socket_path} does not exist"));
+            debug_log(&format!(
+                "bus socket {socket_path} did not appear within {MAX_WAIT_SECS}s"
+            ));
         }
     }
 }
