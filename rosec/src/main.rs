@@ -4510,13 +4510,37 @@ fn parse_item_toml(content: &str) -> Result<ParsedItem> {
     let mut secrets: HashMap<String, Vec<u8>> = HashMap::new();
     if let Some(secrets_table) = doc.get("secrets").and_then(|v| v.as_table()) {
         for (k, v) in secrets_table {
-            let val = match v {
-                toml::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            // Skip empty secrets — the user left the placeholder untouched.
-            if !val.is_empty() {
-                secrets.insert(k.clone(), val.into_bytes());
+            match v {
+                // Plain string → UTF-8 bytes (common case: passwords, TOML, notes).
+                toml::Value::String(s) => {
+                    if !s.is_empty() {
+                        secrets.insert(k.clone(), s.as_bytes().to_vec());
+                    }
+                }
+                // Inline table with `base64` key → decode binary secret.
+                toml::Value::Table(tbl) => {
+                    if let Some(toml::Value::String(b64)) = tbl.get("base64") {
+                        use base64::Engine;
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(b64)
+                            .map_err(|e| anyhow::anyhow!("secret \"{k}\": invalid base64: {e}"))?;
+                        if !bytes.is_empty() {
+                            secrets.insert(k.clone(), bytes);
+                        }
+                    } else {
+                        bail!(
+                            "secret \"{k}\": inline table must have a \"base64\" key \
+                             (e.g. {{ base64 = \"...\" }})"
+                        );
+                    }
+                }
+                other => {
+                    // Fallback: stringify non-string scalar values.
+                    let val = other.to_string();
+                    if !val.is_empty() {
+                        secrets.insert(k.clone(), val.into_bytes());
+                    }
+                }
             }
         }
     }
@@ -4717,7 +4741,8 @@ struct FetchedItemData {
     label: String,
     item_type: String,
     pub_attrs: HashMap<String, String>,
-    secrets: Vec<(String, String)>,
+    /// Secret name → raw bytes (may not be valid UTF-8).
+    secrets: Vec<(String, Vec<u8>)>,
 }
 
 /// Fetch a full item's data (label, public attributes, secret names + values)
@@ -4758,14 +4783,13 @@ async fn fetch_full_item(conn: &zbus::Connection, item_path: &str) -> Result<Fet
         .await
         .unwrap_or_default();
 
-    let mut secrets: Vec<(String, String)> = Vec::new();
+    let mut secrets: Vec<(String, Vec<u8>)> = Vec::new();
     for name in &secret_names {
         let bytes: Vec<u8> = secrets_proxy
             .call("GetSecretAttribute", &(&item_obj_path, name.as_str()))
             .await
             .unwrap_or_default();
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        secrets.push((name.clone(), text));
+        secrets.push((name.clone(), bytes));
     }
 
     Ok(FetchedItemData {
@@ -4782,12 +4806,19 @@ async fn fetch_full_item(conn: &zbus::Connection, item_path: &str) -> Result<Fet
 /// `[secrets]`.  Internal/reserved attributes (`rosec:type`, `rosec:provider`,
 /// `xdg:schema`) are omitted from `[attributes]` since they are handled by
 /// `[item].type` or are read-only.
+///
+/// Secret values that are valid UTF-8 are emitted as plain TOML strings.
+/// Binary (non-UTF-8) values are emitted as inline tables:
+///   `key = { base64 = "..." }`
+/// so that the import side can distinguish and decode them losslessly.
 fn build_item_toml(
     label: &str,
     item_type: &str,
     pub_attrs: &HashMap<String, String>,
-    secrets: &[(String, String)],
+    secrets: &[(String, Vec<u8>)],
 ) -> String {
+    use base64::Engine;
+
     let mut out = String::new();
 
     out.push_str(&format!("# rosec item — type: {item_type}\n"));
@@ -4819,20 +4850,83 @@ fn build_item_toml(
     out.push_str("[secrets]\n");
     for (k, v) in secrets {
         let key = toml_key(k);
-        // Multi-line values use triple-quoted TOML strings.
-        if v.contains('\n') {
-            out.push_str(&format!("{key} = \"\"\"\n{v}\"\"\"\n"));
-        } else {
-            out.push_str(&format!("{key} = {}\n", toml_quote(v)));
+        match std::str::from_utf8(v) {
+            Ok(text) => {
+                // Valid UTF-8: emit as a plain TOML string.
+                if text.contains('\n') {
+                    out.push_str(&format!("{key} = \"\"\"\n{}\"\"\"\n", toml_escape(text)));
+                } else {
+                    out.push_str(&format!("{key} = {}\n", toml_quote(text)));
+                }
+            }
+            Err(_) => {
+                // Binary data: base64-encode into an inline table.
+                let encoded = base64::engine::general_purpose::STANDARD.encode(v);
+                out.push_str(&format!("{key} = {{ base64 = \"{}\" }}\n", encoded));
+            }
         }
     }
 
     out
 }
 
-/// TOML-safe quoting: wraps in double quotes, escaping backslashes and quotes.
+/// TOML-safe quoting: wraps in double quotes, escaping backslashes, quotes,
+/// and control characters (which are not allowed unescaped in TOML basic
+/// strings).
 fn toml_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{0008}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{000C}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            // All other control characters (U+0000..U+001F, U+007F) must use
+            // the \uXXXX escape.
+            c if c.is_control() => {
+                let cp = c as u32;
+                if cp <= 0xFFFF {
+                    out.push_str(&format!("\\u{cp:04X}"));
+                } else {
+                    out.push_str(&format!("\\U{cp:08X}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Escape a string for use inside TOML triple-quoted (multi-line basic)
+/// strings.  Newlines are preserved, but control characters and backslashes
+/// are escaped.
+fn toml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push('\n'), // preserved in multi-line strings
+            '\u{000C}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => {
+                let cp = c as u32;
+                if cp <= 0xFFFF {
+                    out.push_str(&format!("\\u{cp:04X}"));
+                } else {
+                    out.push_str(&format!("\\U{cp:08X}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// TOML-safe key: bare keys may only contain `[A-Za-z0-9_-]`.  Anything else

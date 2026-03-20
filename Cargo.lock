@@ -3811,6 +3811,7 @@ name = "rosec"
 version = "0.0.20"
 dependencies = [
  "anyhow",
+ "base64",
  "futures-util",
  "libc",
  "rosec-core",
