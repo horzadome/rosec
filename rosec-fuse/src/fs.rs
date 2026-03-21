@@ -252,9 +252,9 @@ fn make_attr(ino: INodeNo, kind: FileType, size: u64, nlink: u32, mtime: SystemT
         crtime: UNIX_EPOCH,
         kind,
         perm: if kind == FileType::Directory {
-            0o555
+            0o500
         } else {
-            0o444
+            0o400
         },
         nlink,
         uid,
