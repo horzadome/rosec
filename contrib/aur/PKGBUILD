@@ -172,6 +172,8 @@ package() {
         "${pkgdir}/usr/share/bash-completion/completions/rosec"
     install -Dm644 contrib/zsh/_rosec \
         "${pkgdir}/usr/share/zsh/site-functions/_rosec"
+    install -Dm644 contrib/fish/rosec.fish \
+        "${pkgdir}/usr/share/fish/vendor_completions.d/rosec.fish"
 
     # Docs
     install -Dm644 README.md \
