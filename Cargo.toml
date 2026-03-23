@@ -71,3 +71,10 @@ signature = "2"
 
 # Dev dependencies for git hooks
 husky-rs = "0.3"
+
+# Patch ssh-key and ssh-encoding with the fixed version from the upstream 'stable' branch.
+# Work around RSA signing bug in ssh-key 0.6.7.
+# Remove when ssh-key 0.6.8 is released with the fix.
+[patch.crates-io]
+ssh-key = { git = "https://github.com/RustCrypto/SSH", branch = "stable", package = "ssh-key" }
+ssh-encoding = { git = "https://github.com/RustCrypto/SSH", branch = "stable", package = "ssh-encoding" }
