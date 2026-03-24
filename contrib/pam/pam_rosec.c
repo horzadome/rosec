@@ -67,6 +67,8 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <grp.h>
+#include <pwd.h>
 
 #include <security/pam_modules.h>
 #include <security/pam_ext.h>
@@ -259,6 +261,18 @@ run_unlock_helper(const char *password, const char *username)
             dup2(devnull, STDERR_FILENO);
             if (devnull > STDERR_FILENO)
                 close(devnull);
+        }
+
+        /* Drop privileges before exec — display managers run PAM as root
+         * and dbus-broker rejects root connections to user session buses. */
+        if (getuid() == 0 && username) {
+            struct passwd *pw = getpwnam(username);
+            if (pw == NULL)
+                _exit(1);
+            if (initgroups(username, pw->pw_gid) < 0 ||
+                setgid(pw->pw_gid) < 0 ||
+                setuid(pw->pw_uid) < 0)
+                _exit(1);
         }
 
         /*
@@ -552,6 +566,17 @@ run_chauthtok_helper(const char *old_password, const char *new_password,
             dup2(devnull, STDERR_FILENO);
             if (devnull > STDERR_FILENO)
                 close(devnull);
+        }
+
+        /* Drop privileges (same reasoning as run_unlock_helper). */
+        if (getuid() == 0 && username) {
+            struct passwd *pw = getpwnam(username);
+            if (pw == NULL)
+                _exit(1);
+            if (initgroups(username, pw->pw_gid) < 0 ||
+                setgid(pw->pw_gid) < 0 ||
+                setuid(pw->pw_uid) < 0)
+                _exit(1);
         }
 
         if (username)
