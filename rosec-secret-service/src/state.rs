@@ -101,7 +101,9 @@ pub struct ServiceState {
     pub items: Arc<Mutex<HashMap<String, ItemMeta>>>,
     pub registered_items: Arc<Mutex<HashSet<String>>>,
     pub last_sync: Arc<Mutex<Option<SystemTime>>>,
-    pub conn: Connection,
+    /// The active D-Bus connection.  Behind `RwLock` so it can be swapped
+    /// from a private bus to the session bus during live migration.
+    conn: RwLock<Connection>,
     /// Persistent metadata cache that survives provider lock/unlock cycles.
     ///
     /// Per the Secret Service spec, `SearchItems` is a metadata-only operation
@@ -270,7 +272,7 @@ impl ServiceState {
             items: Arc::new(Mutex::new(HashMap::new())),
             registered_items: Arc::new(Mutex::new(HashSet::new())),
             last_sync: Arc::new(Mutex::new(None)),
-            conn,
+            conn: RwLock::new(conn),
             unlock_in_progress: tokio::sync::Mutex::new(()),
             sync_in_progress: std::sync::Mutex::new(HashMap::new()),
             prompt_in_progress: std::sync::Mutex::new(HashMap::new()),
@@ -285,6 +287,33 @@ impl ServiceState {
             prompt_config: RwLock::new(prompt_config),
             live_config: Arc::new(RwLock::new(initial_config)),
         }
+    }
+
+    /// Return a clone of the active D-Bus connection.
+    ///
+    /// `Connection` is internally `Arc`-based, so cloning is cheap.
+    pub fn conn(&self) -> Connection {
+        self.conn.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Replace the active D-Bus connection (used during private→session bus
+    /// migration).  Callers must re-register objects on the new connection's
+    /// `ObjectServer` after swapping.
+    pub fn swap_conn(&self, new_conn: Connection) {
+        let mut guard = self.conn.write().unwrap_or_else(|e| e.into_inner());
+        *guard = new_conn;
+    }
+
+    /// Clear the set of registered D-Bus item paths.
+    ///
+    /// Used during bus migration so that `register_items()` re-registers
+    /// all items on the new connection's `ObjectServer`.
+    pub fn clear_registered_items(&self) {
+        let mut registered = self
+            .registered_items
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registered.clear();
     }
 
     /// Atomically replace the live config.
@@ -680,7 +709,7 @@ impl ServiceState {
     /// Safe to call even if no object is registered at the path (returns
     /// silently).  Uses `spawn_on_tokio` because zbus object removal is async.
     fn deregister_prompt_object(&self, prompt_path: &str) {
-        let conn = self.conn.clone();
+        let conn = self.conn();
         let path = prompt_path.to_string();
         self.spawn_on_tokio(async move {
             if let Err(e) = conn
@@ -1647,7 +1676,8 @@ impl ServiceState {
             .map(|r| r.contains(path))
             .unwrap_or(false);
         if already_registered {
-            let server = self.conn.object_server();
+            let conn = self.conn();
+            let server = conn.object_server();
             // Ignore errors — the object might already be gone.
             let _ = server.remove::<SecretItem, _>(path).await;
             if let Ok(mut registered) = self.registered_items.lock() {
@@ -2107,7 +2137,8 @@ impl ServiceState {
         self: &Arc<Self>,
         entries: &[(String, ItemMeta)],
     ) -> Result<(), FdoError> {
-        let server = self.conn.object_server();
+        let conn = self.conn();
+        let server = conn.object_server();
         let mut pending = Vec::new();
         {
             let registered = self.registered_items.lock().map_err(|_| {

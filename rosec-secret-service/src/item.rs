@@ -187,10 +187,8 @@ impl SecretItem {
                 provider_id,
                 Arc::clone(&self.state.service_state),
             );
-            let _: bool = self
-                .state
-                .service_state
-                .conn
+            let conn = self.state.service_state.conn();
+            let _: bool = conn
                 .object_server()
                 .at(prompt_path.clone(), prompt_obj)
                 .await

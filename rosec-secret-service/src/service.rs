@@ -64,7 +64,8 @@ impl SecretService {
 
         // Register the org.freedesktop.Secret.Session object at the session path
         let session_obj = SecretSession::new(path.clone(), Arc::clone(&self.state.sessions));
-        let server = self.state.conn.object_server();
+        let conn = self.state.conn();
+        let server = conn.object_server();
         server
             .at(path.clone(), session_obj)
             .await
@@ -302,9 +303,8 @@ impl SecretService {
                 let prompt_path = self.state.allocate_prompt(&provider_id);
                 let prompt_obj =
                     SecretPrompt::new(prompt_path.clone(), provider_id, Arc::clone(&self.state));
-                self.state
-                    .conn
-                    .object_server()
+                let conn = self.state.conn();
+                conn.object_server()
                     .at(prompt_path.clone(), prompt_obj)
                     .await
                     .map_err(map_zbus_error)?;

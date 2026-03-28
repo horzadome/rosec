@@ -165,10 +165,8 @@ impl SecretCollection {
                 provider_id,
                 Arc::clone(&self.state.service_state),
             );
-            self.state
-                .service_state
-                .conn
-                .object_server()
+            let conn = self.state.service_state.conn();
+            conn.object_server()
                 .at(prompt_path.clone(), prompt_obj)
                 .await
                 .map_err(map_zbus_error)?;

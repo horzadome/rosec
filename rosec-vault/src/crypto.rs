@@ -273,7 +273,7 @@ mod tests {
         let vault_key = generate_vault_key();
         let password = b"test-password";
 
-        let entry = wrap_vault_key(&*vault_key, password, Some("test".to_string())).unwrap();
+        let entry = wrap_vault_key(&vault_key, password, Some("test".to_string())).unwrap();
         let unwrapped = unwrap_vault_key(&entry, password).unwrap();
 
         assert!(unwrapped.is_some());
@@ -286,7 +286,7 @@ mod tests {
         let password = b"correct-password";
         let wrong = b"wrong-password";
 
-        let entry = wrap_vault_key(&*vault_key, password, None).unwrap();
+        let entry = wrap_vault_key(&vault_key, password, None).unwrap();
         let unwrapped = unwrap_vault_key(&entry, wrong).unwrap();
 
         assert!(unwrapped.is_none());
@@ -298,8 +298,8 @@ mod tests {
         let pw1 = b"password-one";
         let pw2 = b"password-two";
 
-        let entry1 = wrap_vault_key(&*vault_key, pw1, Some("master".to_string())).unwrap();
-        let entry2 = wrap_vault_key(&*vault_key, pw2, Some("login".to_string())).unwrap();
+        let entry1 = wrap_vault_key(&vault_key, pw1, Some("master".to_string())).unwrap();
+        let entry2 = wrap_vault_key(&vault_key, pw2, Some("login".to_string())).unwrap();
 
         let unwrapped1 = unwrap_vault_key(&entry1, pw1).unwrap().unwrap();
         let unwrapped2 = unwrap_vault_key(&entry2, pw2).unwrap().unwrap();

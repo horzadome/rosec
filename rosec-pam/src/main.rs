@@ -46,7 +46,7 @@
 use std::io::Read as _;
 use std::os::unix::io::FromRawFd as _;
 
-use zeroize::Zeroize as _;
+use zeroize::Zeroizing;
 
 /// Exit codes for pam_exec. PAM_SUCCESS = 0, PAM_IGNORE = 25.
 /// We use PAM_SUCCESS on success and PAM_IGNORE on any failure so that
@@ -69,19 +69,21 @@ type ProviderEntry = (
     Vec<String>,
 );
 
-/// Log a debug message to syslog. TEMPORARY — remove before release.
-fn debug_log(msg: &str) {
-    // Use libc syslog directly to avoid pulling in a logging framework.
-    // SAFETY: We pass a valid format string and C string.
-    unsafe {
-        libc::openlog(
-            c"rosec-pam-unlock".as_ptr(),
-            libc::LOG_PID | libc::LOG_NDELAY,
-            libc::LOG_AUTH,
-        );
-        // Build a CString for the message.
-        if let Ok(cmsg) = std::ffi::CString::new(msg) {
-            libc::syslog(libc::LOG_DEBUG, c"%s".as_ptr(), cmsg.as_ptr());
+/// Log a debug message to syslog.  Only active in debug builds — release
+/// builds compile this to a no-op so no sensitive data reaches syslog.
+fn debug_log(_msg: &str) {
+    #[cfg(debug_assertions)]
+    {
+        // SAFETY: We pass a valid format string and C string.
+        unsafe {
+            libc::openlog(
+                c"rosec-pam-unlock".as_ptr(),
+                libc::LOG_PID | libc::LOG_NDELAY,
+                libc::LOG_AUTH,
+            );
+            if let Ok(cmsg) = std::ffi::CString::new(_msg) {
+                libc::syslog(libc::LOG_DEBUG, c"%s".as_ptr(), cmsg.as_ptr());
+            }
         }
     }
 }
@@ -152,7 +154,7 @@ fn run() -> Result<(), ()> {
     // need them to reach the user's session bus.
     ensure_session_bus_env();
 
-    let mut password = read_password_from_stdin().map_err(|e| {
+    let password = read_password_from_stdin().map_err(|e| {
         debug_log(&format!("failed to read password from stdin: {e:?}"));
     })?;
     if password.is_empty() {
@@ -162,12 +164,8 @@ fn run() -> Result<(), ()> {
 
     debug_log(&format!("read {} bytes from stdin", password.len()));
 
-    let result = unlock_vaults(&password);
-
-    // Zeroize the password regardless of outcome.
-    password.zeroize();
-
-    result
+    // password is Zeroizing<Vec<u8>> — zeroized automatically on drop.
+    unlock_vaults(&password)
 }
 
 /// Ensure `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` are set.
@@ -259,8 +257,8 @@ fn username_to_uid(name: &str) -> Option<u32> {
 ///
 /// pam_exec sends the password null-terminated on stdin. We read until EOF
 /// or the first null byte, whichever comes first.
-fn read_password_from_stdin() -> Result<Vec<u8>, ()> {
-    let mut buf = Vec::with_capacity(256);
+fn read_password_from_stdin() -> Result<Zeroizing<Vec<u8>>, ()> {
+    let mut buf = Zeroizing::new(Vec::with_capacity(256));
 
     // Read all available stdin. pam_exec closes the write end after
     // sending the password, so read_to_end will return once done.
@@ -327,12 +325,41 @@ fn unlock_vaults(password: &[u8]) -> Result<(), ()> {
     rt.block_on(unlock_vaults_async(password))
 }
 
+/// Connect to rosecd, trying the session bus first, then the private bus socket.
+async fn pam_connect() -> Result<zbus::Connection, ()> {
+    debug_log("attempting connection to rosecd");
+
+    // Try session bus first.
+    if let Ok(conn) = zbus::Connection::session().await {
+        debug_log("connected via session bus");
+        return Ok(conn);
+    }
+
+    // Fall back to private bus socket at $XDG_RUNTIME_DIR/rosec/bus.
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let socket = format!("{runtime_dir}/rosec/bus");
+        if std::path::Path::new(&socket).exists() {
+            let addr = format!("unix:path={socket}");
+            debug_log(&format!("trying private bus at {addr}"));
+            match zbus::connection::Builder::address(&*addr) {
+                Ok(builder) => match builder.build().await {
+                    Ok(conn) => {
+                        debug_log("connected via private bus");
+                        return Ok(conn);
+                    }
+                    Err(e) => debug_log(&format!("private bus connect failed: {e}")),
+                },
+                Err(e) => debug_log(&format!("private bus address parse failed: {e}")),
+            }
+        }
+    }
+
+    debug_log("no connection to rosecd available");
+    Err(())
+}
+
 async fn unlock_vaults_async(password: &[u8]) -> Result<(), ()> {
-    debug_log("connecting to session bus");
-    let conn = zbus::Connection::session().await.map_err(|e| {
-        debug_log(&format!("D-Bus session connect failed: {e}"));
-    })?;
-    debug_log("connected to session bus");
+    let conn = pam_connect().await?;
 
     let proxy = zbus::Proxy::new(
         &conn,
@@ -419,35 +446,37 @@ async fn unlock_vaults_async(password: &[u8]) -> Result<(), ()> {
 // chauthtok mode — password change
 // ═══════════════════════════════════════════════════════════════════
 
+type ZeroVec = Zeroizing<Vec<u8>>;
+
 /// Read two NUL-terminated password strings from stdin.
 ///
 /// Protocol: `<old_password>\0<new_password>\0<EOF>`.
-fn read_two_passwords_from_stdin() -> Result<(Vec<u8>, Vec<u8>), ()> {
+fn read_two_passwords_from_stdin() -> Result<(ZeroVec, ZeroVec), ()> {
     use std::io::Read as _;
-    let mut buf = Vec::with_capacity(512);
+    // Zeroizing wraps the combined buffer so the concatenated passwords are
+    // scrubbed on drop — the sliced-out copies below get their own Zeroizing.
+    let mut buf = Zeroizing::new(Vec::with_capacity(512));
     std::io::stdin().read_to_end(&mut buf).map_err(|_| ())?;
 
     // Find the first NUL separator.
     let sep = buf.iter().position(|&b| b == 0).ok_or(())?;
-    let old_pw = buf[..sep].to_vec();
+    let mut old_pw = Zeroizing::new(buf[..sep].to_vec());
 
     // Everything after the first NUL is the new password (strip trailing NUL).
     let rest = &buf[sep + 1..];
-    let new_pw = if rest.last() == Some(&0) {
+    let mut new_pw = Zeroizing::new(if rest.last() == Some(&0) {
         rest[..rest.len() - 1].to_vec()
     } else {
         rest.to_vec()
-    };
+    });
 
     // Strip trailing newlines.
-    let strip_trailing_nl = |mut v: Vec<u8>| -> Vec<u8> {
-        if v.last() == Some(&b'\n') {
-            v.pop();
-        }
-        v
-    };
-    let old_pw = strip_trailing_nl(old_pw);
-    let new_pw = strip_trailing_nl(new_pw);
+    if old_pw.last() == Some(&b'\n') {
+        old_pw.pop();
+    }
+    if new_pw.last() == Some(&b'\n') {
+        new_pw.pop();
+    }
 
     if old_pw.is_empty() || new_pw.is_empty() {
         return Err(());
@@ -459,7 +488,7 @@ fn read_two_passwords_from_stdin() -> Result<(Vec<u8>, Vec<u8>), ()> {
 fn run_chauthtok() -> Result<(), ()> {
     ensure_session_bus_env();
 
-    let (mut old_pw, mut new_pw) = read_two_passwords_from_stdin().map_err(|()| {
+    let (old_pw, new_pw) = read_two_passwords_from_stdin().map_err(|()| {
         debug_log("failed to read old/new passwords from stdin");
     })?;
 
@@ -469,12 +498,8 @@ fn run_chauthtok() -> Result<(), ()> {
         new_pw.len()
     ));
 
-    let result = change_vault_passwords(&old_pw, &new_pw);
-
-    old_pw.zeroize();
-    new_pw.zeroize();
-
-    result
+    // old_pw and new_pw are Zeroizing<Vec<u8>> — zeroized automatically on drop.
+    change_vault_passwords(&old_pw, &new_pw)
 }
 
 fn change_vault_passwords(old_password: &[u8], new_password: &[u8]) -> Result<(), ()> {
@@ -487,10 +512,7 @@ fn change_vault_passwords(old_password: &[u8], new_password: &[u8]) -> Result<()
 }
 
 async fn change_vault_passwords_async(old_password: &[u8], new_password: &[u8]) -> Result<(), ()> {
-    debug_log("connecting to session bus (chauthtok)");
-    let conn = zbus::Connection::session().await.map_err(|e| {
-        debug_log(&format!("D-Bus session connect failed: {e}"));
-    })?;
+    let conn = pam_connect().await?;
 
     let proxy = zbus::Proxy::new(
         &conn,

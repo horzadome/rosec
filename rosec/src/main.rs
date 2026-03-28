@@ -368,7 +368,31 @@ fn cmd_provider_kinds() {
 }
 
 async fn conn() -> Result<Connection> {
-    Ok(Connection::session().await?)
+    // 1. Explicit override via ROSEC_SOCKET env var.
+    if let Ok(socket) = std::env::var("ROSEC_SOCKET") {
+        let addr = format!("unix:path={socket}");
+        return Ok(zbus::connection::Builder::address(&*addr)?.build().await?);
+    }
+
+    // 2. Try the session bus.
+    if let Ok(c) = Connection::session().await {
+        return Ok(c);
+    }
+
+    // 3. Fall back to the private bus socket at $XDG_RUNTIME_DIR/rosec/bus.
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        let socket = std::path::Path::new(&runtime_dir).join("rosec").join("bus");
+        if socket.exists() {
+            let addr = format!("unix:path={}", socket.display());
+            return Ok(zbus::connection::Builder::address(&*addr)?.build().await?);
+        }
+    }
+
+    // Nothing worked.
+    Err(anyhow::anyhow!(
+        "cannot connect to rosecd: no session bus, ROSEC_SOCKET not set, \
+         and $XDG_RUNTIME_DIR/rosec/bus not found"
+    ))
 }
 
 /// Poll rosecd's `ProviderList` until `id` appears (max 3 s, 200 ms intervals).

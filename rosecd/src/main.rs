@@ -1,4 +1,6 @@
 mod bootstrap;
+#[cfg(feature = "private-socket")]
+mod bus;
 mod ssh;
 
 use std::collections::HashSet;
@@ -92,7 +94,19 @@ async fn run() -> Result<()> {
         })
         .collect();
 
+    // Establish the D-Bus connection.  With the `private-socket` feature,
+    // this tries the session bus first and falls back to an embedded private
+    // bus broker when the session bus is unavailable (e.g. during initial
+    // login).  Without the feature, this is a direct session bus connection.
+    #[cfg(feature = "private-socket")]
+    let (conn, bus_mode, bus_config) = {
+        let bus_config = parse_bus_config();
+        let (conn, mode) = bus::establish_connection(&bus_config).await?;
+        (conn, mode, bus_config)
+    };
+    #[cfg(not(feature = "private-socket"))]
     let conn = zbus::Connection::session().await?;
+
     let state = register_objects_with_full_config(
         &conn,
         providers,
@@ -116,7 +130,6 @@ async fn run() -> Result<()> {
         )
         .await
     {
-        // Query the bus for the current owner's PID and comm so the user knows what to kill.
         let owner_info = bus_name_owner_info(&conn, "org.freedesktop.secrets").await;
         anyhow::bail!("cannot claim org.freedesktop.secrets: {e}\n{owner_info}");
     }
@@ -144,12 +157,34 @@ async fn run() -> Result<()> {
         });
     }
 
-    // Register lifecycle event callbacks on every provider via the Provider
-    // trait.  Nudge callbacks (sync / lock) are set as fields on
-    // ProviderCallbacks before calling set_event_callbacks().
-    // Must be done after `state` and `ssh_manager` are created.
     wire_provider_callbacks(&state, &ssh_manager);
 
+    // When running on a private bus, spawn a watcher that polls for the
+    // session bus and migrates to it when available.
+    #[cfg(feature = "private-socket")]
+    if let bus::BusMode::Private { ref socket_path } = bus_mode {
+        if bus_config.no_migrate {
+            tracing::info!(
+                socket = %socket_path.display(),
+                "rosecd ready on private bus (migration disabled)"
+            );
+        } else {
+            tracing::info!(
+                socket = %socket_path.display(),
+                interval_ms = bus_config.migrate_interval.as_millis() as u64,
+                "rosecd ready on private bus, watching for session bus"
+            );
+            let watcher_state = Arc::clone(&state);
+            let interval = bus_config.migrate_interval;
+            tokio::spawn(async move {
+                bus::session_bus_watcher(watcher_state, interval).await;
+            });
+        }
+    } else {
+        tracing::info!("rosecd ready on session bus");
+    }
+
+    #[cfg(not(feature = "private-socket"))]
     tracing::info!("rosecd ready on session bus");
 
     // Config file watcher — hot-reload providers when config.toml changes.
@@ -1559,19 +1594,72 @@ fn parse_config_path() -> PathBuf {
             std::process::exit(0);
         }
         if args[i] == "--help" || args[i] == "-h" {
-            eprintln!("Usage: rosecd [--config <path>]");
+            eprintln!("Usage: rosecd [OPTIONS]");
             eprintln!();
             eprintln!("Options:");
             eprintln!(
-                "  -c, --config <path>  Path to config file (default: $XDG_CONFIG_HOME/rosec/config.toml)"
+                "  -c, --config <path>          Config file (default: $XDG_CONFIG_HOME/rosec/config.toml)"
             );
-            eprintln!("  -V, --version        Show version");
-            eprintln!("  -h, --help           Show this help message");
+            #[cfg(feature = "private-socket")]
+            {
+                eprintln!(
+                    "      --socket <path>          Run on a private bus at <path> (no session bus)"
+                );
+                eprintln!(
+                    "      --no-migrate             Stay on private bus, never migrate to session bus"
+                );
+                eprintln!(
+                    "      --migrate-interval <s>   Session bus poll interval in seconds (default: 1)"
+                );
+            }
+            eprintln!("  -V, --version                Show version");
+            eprintln!("  -h, --help                   Show this help message");
             std::process::exit(0);
         }
         i += 1;
     }
     default_config_path()
+}
+
+#[cfg(feature = "private-socket")]
+fn parse_bus_config() -> bus::BusConfig {
+    let args: Vec<String> = std::env::args().collect();
+    let mut config = bus::BusConfig::default();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--socket" {
+            i += 1;
+            config.socket_path = Some(
+                args.get(i)
+                    .unwrap_or_else(|| {
+                        eprintln!("error: --socket requires a path argument");
+                        std::process::exit(1);
+                    })
+                    .into(),
+            );
+            config.no_migrate = true;
+        } else if let Some(path) = args[i].strip_prefix("--socket=") {
+            config.socket_path = Some(path.into());
+            config.no_migrate = true;
+        } else if args[i] == "--no-migrate" {
+            config.no_migrate = true;
+        } else if args[i] == "--migrate-interval" {
+            i += 1;
+            let secs: f64 = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("error: --migrate-interval requires a numeric value");
+                std::process::exit(1);
+            });
+            config.migrate_interval = std::time::Duration::from_secs_f64(secs);
+        } else if let Some(val) = args[i].strip_prefix("--migrate-interval=") {
+            let secs: f64 = val.parse().unwrap_or_else(|_| {
+                eprintln!("error: --migrate-interval requires a numeric value");
+                std::process::exit(1);
+            });
+            config.migrate_interval = std::time::Duration::from_secs_f64(secs);
+        }
+        i += 1;
+    }
+    config
 }
 
 fn default_config_path() -> PathBuf {

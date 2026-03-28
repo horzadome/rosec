@@ -250,11 +250,12 @@ impl RosecManagement {
         // Race the auth task against peer-disconnect.  If the caller exits
         // before the task finishes, signal the cancel pipe and abort the task
         // so its spawn_blocking thread unblocks via poll().
+        let conn = self.state.conn();
         let result = wait_for_task_or_peer_exit(
             handle,
             cancel_w,
             header.sender().map(|s| s.as_str().to_string()),
-            &self.state.conn,
+            &conn,
         )
         .await;
 
@@ -309,11 +310,12 @@ impl RosecManagement {
             res
         });
 
+        let conn = self.state.conn();
         let result = wait_for_task_or_peer_exit(
             handle,
             cancel_w,
             header.sender().map(|s| s.as_str().to_string()),
-            &self.state.conn,
+            &conn,
         )
         .await;
 

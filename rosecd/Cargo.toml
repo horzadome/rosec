@@ -27,6 +27,10 @@ futures-util = { workspace = true }
 notify = { workspace = true }
 libc = { workspace = true }
 uuid = { workspace = true }
+busd = { workspace = true, optional = true }
+
+[features]
+private-socket = ["dep:busd"]
 
 [dev-dependencies]
 husky-rs = { workspace = true }

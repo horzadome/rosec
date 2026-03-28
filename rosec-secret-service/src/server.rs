@@ -151,3 +151,57 @@ pub async fn register_objects_with_full_config(
 
     Ok(state)
 }
+
+/// Register all top-level D-Bus objects on `conn` using an **existing**
+/// `ServiceState`.  Used during private→session bus migration to re-register
+/// the same service handlers on the new connection.
+///
+/// Does **not** re-register dynamic `SecretItem` objects — call
+/// `state.clear_registered_items()` + `state.rebuild_cache()` after swapping
+/// the connection for that.
+pub async fn re_register_top_level_objects(
+    conn: &Connection,
+    state: &Arc<ServiceState>,
+) -> zbus::Result<()> {
+    let paths = ObjectPaths::new();
+    let server = conn.object_server();
+
+    server
+        .at(paths.service.clone(), SecretService::new(Arc::clone(state)))
+        .await?;
+    server
+        .at("/org/rosec/Daemon", RosecManagement::new(Arc::clone(state)))
+        .await?;
+    server
+        .at("/org/rosec/Search", RosecSearch::new(Arc::clone(state)))
+        .await?;
+    server
+        .at("/org/rosec/Secrets", RosecSecrets::new(Arc::clone(state)))
+        .await?;
+    server
+        .at("/org/rosec/Items", RosecItems::new(Arc::clone(state)))
+        .await?;
+
+    let collection_state = CollectionState {
+        label: "default".to_string(),
+        items: Arc::clone(&state.items),
+        providers: state.providers_ordered(),
+        service_state: Arc::clone(state),
+        sessions: Arc::clone(&state.sessions),
+        tokio_handle: tokio::runtime::Handle::current(),
+    };
+    server
+        .at(
+            paths.collection_default.clone(),
+            SecretCollection::new(collection_state.clone()),
+        )
+        .await?;
+    server
+        .at(
+            "/org/freedesktop/secrets/aliases/default",
+            SecretCollection::new(collection_state),
+        )
+        .await?;
+
+    Ok(())
+}
