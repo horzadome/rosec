@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod daemon;
 pub mod error;
 pub mod item;
+pub mod portal;
 pub mod prompt;
 pub mod server;
 pub mod service;
@@ -12,6 +13,7 @@ pub mod state;
 pub mod tty;
 pub mod unlock;
 
+pub use portal::PortalSecret;
 pub use service::SecretService;
 pub use state::ServiceState;
 

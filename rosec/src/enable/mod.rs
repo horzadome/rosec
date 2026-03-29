@@ -16,6 +16,9 @@ const TEMPLATE_SERVICE: &str = include_str!("templates/rosecd.service");
 const TEMPLATE_SOCKET: &str = include_str!("templates/rosecd.socket");
 const TEMPLATE_DBUS_SECRETS: &str = include_str!("templates/org.freedesktop.secrets.service");
 const TEMPLATE_DBUS_KEYRING_MASK: &str = include_str!("templates/org.gnome.keyring.service");
+const TEMPLATE_PORTAL: &str = include_str!("templates/rosec.portal");
+const TEMPLATE_PORTAL_DBUS: &str =
+    include_str!("templates/org.freedesktop.impl.portal.desktop.rosec.service");
 
 /// Placeholder in templates replaced with the resolved `rosecd` binary path.
 const ROSECD_PLACEHOLDER: &str = "@@ROSECD@@";
@@ -26,6 +29,8 @@ const ROSECD_PLACEHOLDER: &str = "@@ROSECD@@";
 
 const DBUS_SECRETS_SERVICE: &str = "org.freedesktop.secrets.service";
 const DBUS_KEYRING_SERVICE: &str = "org.gnome.keyring.service";
+const DBUS_PORTAL_SERVICE: &str = "org.freedesktop.impl.portal.desktop.rosec.service";
+const PORTAL_FILE: &str = "rosec.portal";
 const SYSTEMD_SERVICE_UNIT: &str = "rosecd.service";
 const SYSTEMD_SOCKET_UNIT: &str = "rosecd.socket";
 
@@ -71,6 +76,17 @@ fn user_dbus_services_dir() -> Result<PathBuf> {
             PathBuf::from(home).join(".local/share")
         });
     Ok(data_home.join("dbus-1/services"))
+}
+
+/// Return `~/.local/share/xdg-desktop-portal/portals/`.
+fn user_portals_dir() -> Result<PathBuf> {
+    let data_home = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| String::from("/tmp"));
+            PathBuf::from(home).join(".local/share")
+        });
+    Ok(data_home.join("xdg-desktop-portal/portals"))
 }
 
 /// Return `~/.config/systemd/user/`.
@@ -282,23 +298,10 @@ fn unmask_gnome_keyring_systemd_socket() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// `rosec enable [flags]`
-pub fn cmd_enable(args: &[String]) -> Result<()> {
-    let mut enable_systemd = true;
-    let mut mask = false;
-    let mut force = false;
-
-    for arg in args {
-        match arg.as_str() {
-            "--no-systemd" => enable_systemd = false,
-            "--mask" => mask = true,
-            "--force" | "-f" => force = true,
-            "--help" | "-h" => {
-                print_enable_help();
-                return Ok(());
-            }
-            other => bail!("unknown flag: {other}\nrun `rosec enable --help` for usage"),
-        }
-    }
+pub fn cmd_enable(args: crate::cli::EnableArgs) -> Result<()> {
+    let enable_systemd = !args.no_systemd;
+    let mask = args.mask;
+    let force = args.force;
 
     // --- resolve rosecd binary path ------------------------------------------
 
@@ -306,9 +309,12 @@ pub fn cmd_enable(args: &[String]) -> Result<()> {
     println!("using rosecd: {}", rosecd.display());
 
     let dbus_dir = user_dbus_services_dir()?;
+    let portals_dir = user_portals_dir()?;
     let systemd_dir = user_systemd_dir()?;
     let secrets_path = dbus_dir.join(DBUS_SECRETS_SERVICE);
     let keyring_path = dbus_dir.join(DBUS_KEYRING_SERVICE);
+    let portal_dbus_path = dbus_dir.join(DBUS_PORTAL_SERVICE);
+    let portal_path = portals_dir.join(PORTAL_FILE);
     let service_path = systemd_dir.join(SYSTEMD_SERVICE_UNIT);
     let socket_path = systemd_dir.join(SYSTEMD_SOCKET_UNIT);
 
@@ -382,6 +388,21 @@ pub fn cmd_enable(args: &[String]) -> Result<()> {
         mask_gnome_keyring_systemd_socket()?;
     }
 
+    // --- install portal files -------------------------------------------------
+
+    let portal_dbus_contents = render(TEMPLATE_PORTAL_DBUS, &rosecd);
+    if install_file(&portal_dbus_path, &portal_dbus_contents)? {
+        println!("installed {}", portal_dbus_path.display());
+    } else {
+        println!("unchanged {}", portal_dbus_path.display());
+    }
+
+    if install_file(&portal_path, TEMPLATE_PORTAL)? {
+        println!("installed {}", portal_path.display());
+    } else {
+        println!("unchanged {}", portal_path.display());
+    }
+
     // --- install systemd user units ------------------------------------------
 
     if enable_systemd {
@@ -418,24 +439,16 @@ pub fn cmd_enable(args: &[String]) -> Result<()> {
 }
 
 /// `rosec disable [flags]`
-pub fn cmd_disable(args: &[String]) -> Result<()> {
-    let mut disable_systemd = true;
-
-    for arg in args {
-        match arg.as_str() {
-            "--no-systemd" => disable_systemd = false,
-            "--help" | "-h" => {
-                print_disable_help();
-                return Ok(());
-            }
-            other => bail!("unknown flag: {other}\nrun `rosec disable --help` for usage"),
-        }
-    }
+pub fn cmd_disable(args: crate::cli::DisableArgs) -> Result<()> {
+    let disable_systemd = !args.no_systemd;
 
     let dbus_dir = user_dbus_services_dir()?;
+    let portals_dir = user_portals_dir()?;
     let systemd_dir = user_systemd_dir()?;
     let secrets_path = dbus_dir.join(DBUS_SECRETS_SERVICE);
     let keyring_path = dbus_dir.join(DBUS_KEYRING_SERVICE);
+    let portal_dbus_path = dbus_dir.join(DBUS_PORTAL_SERVICE);
+    let portal_path = portals_dir.join(PORTAL_FILE);
     let service_path = systemd_dir.join(SYSTEMD_SERVICE_UNIT);
     let socket_path = systemd_dir.join(SYSTEMD_SOCKET_UNIT);
 
@@ -452,6 +465,11 @@ pub fn cmd_disable(args: &[String]) -> Result<()> {
 
     if remove_file_if_exists(&secrets_path)? {
         println!("removed {}", secrets_path.display());
+        removed_any = true;
+    }
+
+    if remove_file_if_exists(&portal_dbus_path)? {
+        println!("removed {}", portal_dbus_path.display());
         removed_any = true;
     }
 
@@ -481,6 +499,13 @@ pub fn cmd_disable(args: &[String]) -> Result<()> {
 
     unmask_gnome_keyring_systemd_socket()?;
 
+    // --- remove portal file ---------------------------------------------------
+
+    if remove_file_if_exists(&portal_path)? {
+        println!("removed {}", portal_path.display());
+        removed_any = true;
+    }
+
     // --- remove systemd unit files -------------------------------------------
 
     if disable_systemd {
@@ -509,78 +534,4 @@ pub fn cmd_disable(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Help text
-// ---------------------------------------------------------------------------
-
-fn print_enable_help() {
-    println!(
-        "\
-rosec enable - activate rosec as the Secret Service provider
-
-USAGE:
-    rosec enable [flags]
-
-Generates and installs user-local D-Bus activation files and systemd user
-units so that org.freedesktop.secrets is handled by rosecd.
-
-The rosecd binary path is resolved automatically (sibling of the rosec
-binary, or from $PATH) and embedded into all generated files.
-
-FILES INSTALLED:
-    ~/.local/share/dbus-1/services/org.freedesktop.secrets.service
-        Routes D-Bus activation of org.freedesktop.secrets to rosecd.
-
-    ~/.config/systemd/user/rosecd.service
-        systemd user service unit with the resolved rosecd path.
-
-    ~/.config/systemd/user/rosecd.socket
-        systemd user socket unit for private-socket activation.
-
-FILES INSTALLED WITH --mask:
-    ~/.local/share/dbus-1/services/org.gnome.keyring.service
-        Masks gnome-keyring D-Bus auto-activation. User-local files
-        take priority over system-wide /usr/share/dbus-1/services/.
-
-    ~/.config/autostart/gnome-keyring-secrets.desktop
-        Hides the gnome-keyring XDG autostart entry so your desktop
-        session does not launch it automatically.
-
-    systemctl --user mask gnome-keyring-daemon.socket
-        Masks the gnome-keyring systemd user socket.
-
-FLAGS:
-    --no-systemd    Do not install/enable systemd user units
-    --mask          Suppress gnome-keyring (D-Bus, autostart, systemd socket)
-    --force, -f     Overwrite existing files even if already enabled
-
-NOTES:
-    This command does NOT modify any system files or conflict with
-    installed packages. All files are written to user-local directories.
-    Run `rosec disable` to reverse all changes."
-    );
-}
-
-fn print_disable_help() {
-    println!(
-        "\
-rosec disable - deactivate rosec as the Secret Service provider
-
-USAGE:
-    rosec disable [flags]
-
-Removes all files installed by `rosec enable`:
-  - D-Bus activation files from ~/.local/share/dbus-1/services/
-  - systemd user units from ~/.config/systemd/user/
-  - gnome-keyring autostart overrides from ~/.config/autostart/
-  - gnome-keyring systemd socket mask (systemctl --user unmask)
-
-FLAGS:
-    --no-systemd    Do not remove/disable systemd user units
-
-NOTES:
-    Only removes files that rosec created. If gnome-keyring was masked,
-    the mask files are removed and the systemd socket is unmasked,
-    allowing gnome-keyring to resume handling Secret Service requests."
-    );
-}
+// Help text is now handled by clap derive in cli.rs.

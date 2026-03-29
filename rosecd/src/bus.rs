@@ -188,6 +188,17 @@ pub async fn session_bus_watcher(state: Arc<ServiceState>, interval: Duration) {
             .await
         {
             Ok(_) => {
+                // Also claim the portal bus name on the session bus.
+                if let Err(e) = session_conn
+                    .request_name_with_flags(
+                        "org.freedesktop.impl.portal.desktop.rosec",
+                        RequestNameFlags::DoNotQueue.into(),
+                    )
+                    .await
+                {
+                    tracing::warn!("could not claim portal bus name on session bus: {e}");
+                }
+
                 // Name claimed — proceed with migration.
                 match migrate_to_session_bus(&state, &session_conn).await {
                     Ok(()) => {
@@ -196,8 +207,11 @@ pub async fn session_bus_watcher(state: Arc<ServiceState>, interval: Duration) {
                     }
                     Err(e) => {
                         tracing::warn!("migration to session bus failed: {e}");
-                        // Release the name since migration failed.
+                        // Release names since migration failed.
                         let _ = session_conn.release_name("org.freedesktop.secrets").await;
+                        let _ = session_conn
+                            .release_name("org.freedesktop.impl.portal.desktop.rosec")
+                            .await;
                         // Retry on next tick — might be transient.
                         continue;
                     }

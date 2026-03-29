@@ -134,6 +134,19 @@ async fn run() -> Result<()> {
         anyhow::bail!("cannot claim org.freedesktop.secrets: {e}\n{owner_info}");
     }
 
+    // Claim the portal bus name so xdg-desktop-portal can discover us.
+    // Non-fatal: the portal works without its own name if rosecd already owns
+    // org.freedesktop.secrets, but having a dedicated name is cleaner.
+    if let Err(e) = conn
+        .request_name_with_flags(
+            "org.freedesktop.impl.portal.desktop.rosec",
+            RequestNameFlags::DoNotQueue.into(),
+        )
+        .await
+    {
+        tracing::warn!("could not claim portal bus name: {e}");
+    }
+
     // Start the SSH agent and FUSE filesystem.  Returns None if XDG_RUNTIME_DIR
     // is unset or FUSE is unavailable — the daemon continues without SSH
     // agent support.

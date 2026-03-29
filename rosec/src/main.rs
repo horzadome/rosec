@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Read};
 use std::path::PathBuf;
 
+use clap::Parser;
 use sha2::{Digest, Sha256};
 
 use anyhow::{Result, bail};
@@ -13,7 +14,10 @@ use rosec_core::WasmPreference;
 use rosec_core::config::Config;
 use rosec_core::config_edit;
 
+mod cli;
 mod enable;
+
+use cli::*;
 
 /// D-Bus wire type for `org.rosec.Daemon.ProviderList` entries.
 ///
@@ -39,277 +43,27 @@ async fn main() -> Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("help");
+    let cli = Cli::parse();
 
-    match cmd {
-        // provider / providers are full aliases for the same subcommand tree
-        "provider" | "providers" => cmd_provider(&args[1..]).await,
-        "config" => cmd_config(&args[1..]),
-        "status" => cmd_status().await,
-        "sync" | "refresh" => cmd_sync().await,
-        "search" => cmd_search(&args[1..]).await,
-        "item" | "items" => cmd_item(&args[1..]).await,
-        "get" => cmd_get(&args[1..]).await,
-        "inspect" => cmd_inspect(&args[1..]).await,
-        "lock" => cmd_lock().await,
-        "unlock" => cmd_unlock().await,
-        "enable" => enable::cmd_enable(&args[1..]),
-        "disable" => enable::cmd_disable(&args[1..]),
-        "--version" | "-V" | "version" => {
-            println!(
-                "rosec {} ({})",
-                env!("ROSEC_VERSION"),
-                env!("ROSEC_GIT_SHA")
-            );
-            Ok(())
-        }
-        "help" | "--help" | "-h" => {
-            print_help();
-            Ok(())
-        }
-        other => {
-            print_help();
-            bail!("unknown command: {other}");
-        }
+    match cli.command {
+        Commands::Provider { action } => cmd_provider(action).await,
+        Commands::Config { action } => cmd_config(action),
+        Commands::Status => cmd_status().await,
+        Commands::Sync => cmd_sync().await,
+        Commands::Search(args) => cmd_search(args).await,
+        Commands::Item { action } => cmd_item(action).await,
+        Commands::Get(args) => cmd_get(args).await,
+        Commands::Inspect(args) => cmd_inspect(args).await,
+        Commands::Lock => cmd_lock().await,
+        Commands::Unlock => cmd_unlock().await,
+        Commands::Enable(args) => enable::cmd_enable(args),
+        Commands::Disable(args) => enable::cmd_disable(args),
     }
 }
 
-fn print_help() {
-    println!(
-        "\
-rosec - read-only secret service CLI
-
-USAGE:
-    rosec <command> [args...]
-
-COMMANDS:
-    provider <subcommand>               Manage providers (alias: providers)
-      list                              List all configured providers and their state
-      add <kind> [options]              Add a provider to the config file
-      remove <id>                       Remove a provider (local vaults: offers to delete the file)
-      attach --path <file> [--id <id>]  Attach an existing vault file to the config
-      detach <id>                       Remove provider from config (file stays on disk)
-      add-password <id>                 Add a new unlock password to a local vault provider
-      remove-password <id> <entry-id>   Remove a password from a local vault provider
-      list-passwords <id>               List unlock passwords for a local vault provider
-      change-password <id>              Change the unlock password for a provider
-      auth <id>                         Authenticate/unlock a provider
-      kinds                             List available provider kinds
-
-    config <subcommand>                 Read or modify config.toml
-      show                              Print the current effective configuration
-      get <key>                         Print the value of one setting (e.g. autolock.idle_timeout_minutes)
-      set <key> <value>                 Update a setting in config.toml (daemon hot-reloads automatically)
-
-    status                              Show daemon status
-    sync                                Sync providers with remote servers (alias: refresh)
-    search [-s] [--format=<fmt>] [--show-path] [key=value]...
-                                        Search items by attributes (no args = list all)
-    item <subcommand>                   Manage items (alias: items)
-      list [--provider=<id>] [--type=<type>] [filters...]
-                                        List items (same as search, with convenience filters)
-      add [--provider=<id>] [--type=<type>] [--generate-ssh-key]
-                                        Create a new item via $EDITOR (TOML template)
-      edit <id>                         Edit an existing item via $EDITOR
-      delete <id>                       Delete an item (with confirmation)
-
-    get <id>                            Print the secret value only (pipeable)
-    inspect <id>                        Show full item detail: label, attributes, secret
-    lock                                Lock all providers
-    unlock                              Unlock (triggers GUI/TTY prompt)
-    enable [flags]                      Activate rosec as the Secret Service provider
-    disable [flags]                     Deactivate rosec (remove D-Bus overrides)
-    help                                Show this help
-
-PROVIDER KINDS:
-    local                               Local encrypted vault (file on disk)
-    bitwarden                           Bitwarden Password Manager
-    bitwarden-sm                        Bitwarden Secrets Manager
-
-OUTPUT FORMATS (--format):
-    table                               Aligned columns: TYPE | NAME | USERNAME | URI | ID  [default]
-    kv                                  Key=value pairs, one attribute per line per item
-    json                                JSON array of objects (always includes full path)
-
-FLAGS:
-    --show-path                         Also print the full D-Bus object path for each item
-                                        (useful when calling GetSecret directly via D-Bus/libsecret)
-
-SEARCH FILTERS:
-    Pass one or more key=value pairs to filter by public attributes:
-      type=login                        Only login items
-      username=alice                    Items with username 'alice'
-      type=login username=alice         Combine filters (AND)
-      uri=github.com                    Items with a matching URI attribute
-
-    Common attribute names: type, username, uri, folder, name
-
-NOTES:
-    If a provider is locked when running 'search' or 'get', you will be
-    prompted for credentials automatically and the operation retried.
-
-    The 16-char hex ID shown in 'search' output is unique and stable.
-    Pass it directly to 'rosec get'.
-
-EXAMPLES:
-    rosec provider add local                                # create a new local vault (auto ID + path)
-    rosec provider add local --id work --path ~/vaults/work.vault
-    rosec provider attach --path /mnt/shared/team.vault     # attach an existing vault file
-    rosec provider list                                     # show all providers
-    rosec provider auth personal                            # unlock a provider
-    rosec provider add-password personal                    # add a second unlock password
-    rosec provider remove-password personal <entry-id>      # remove a password
-    rosec provider detach work                              # remove from config (file stays)
-    rosec provider remove old-vault                         # remove provider (prompts to delete vault file)
-
-    rosec provider add bitwarden email=you@example.com      # ID auto-generated from email
-    rosec provider add bitwarden-sm organization_id=uuid
-    rosec provider add bitwarden --id work email=work@corp.com region=eu
-    rosec provider auth bitwarden-3f8a1c2d
-    rosec provider remove bitwarden-3f8a1c2d
-    rosec providers list       # 'providers' is a full alias for 'provider'
-
-    rosec search                                            # list all items
-    rosec search type=login                                 # only login items
-    rosec search username=alice                             # search by username
-    rosec search type=login username=alice                  # combine filters
-    rosec search --format=json type=login                   # JSON output (includes path)
-    rosec search --format=kv uri=github.com                 # key=value output
-    rosec search --show-path type=login                     # table with D-Bus path column
-    rosec search -s type=login                             # sync/unlock, then search
-
-    rosec get a1b2c3d4e5f60718                              # print secret value only (pipeable)
-    rosec get a1b2c3d4e5f60718 | xclip -sel clip            # copy secret to clipboard
-
-    rosec inspect a1b2c3d4e5f60718                          # full label + attributes + secret
-    rosec inspect -s a1b2c3d4e5f60718                       # sync/unlock then inspect
-    rosec inspect -s --all-attrs a1b2c3d4e5f60718           # include sensitive attrs (password, totp…)
-    rosec inspect --all-attrs --format=json a1b2c3d4e5f60718 # JSON with all attrs
-    rosec inspect /org/freedesktop/secrets/collection/default/… # full D-Bus path
-
-    rosec item list                                         # list all items (same as rosec search)
-    rosec item list --provider=local-default                # only items from a specific provider
-    rosec item list --type=login                            # only login items
-    rosec item add                                          # create a generic item via $EDITOR
-    rosec item add --type=login                             # create a login item
-    rosec item add --type=ssh-key --generate-ssh-key        # generate + store an SSH key
-    rosec item edit a1b2c3d4e5f60718                        # edit item via $EDITOR
-    rosec item delete a1b2c3d4e5f60718                      # delete with confirmation
-
-    rosec enable                                            # activate rosec as Secret Service
-    rosec enable --mask                                     # also suppress gnome-keyring
-    rosec enable --no-systemd                               # skip systemd enable/start
-    rosec disable                                           # deactivate, restore gnome-keyring"
-    );
-}
-
-fn print_search_help() {
-    println!(
-        "\
-rosec search - search vault items by attribute
-
-USAGE:
-    rosec search [flags] [key=value]...
-
-FLAGS:
-    -s, --sync          Sync providers before searching; also unlocks if needed
-    --no-unlock         Never prompt for credentials — only show cached/unlocked items
-    --format=<fmt>      Output format: table (default), kv, json
-    --show-path         Include the full D-Bus object path in output
-    --help, -h          Show this help
-
-SEARCH FILTERS:
-    Pass one or more key=value pairs to filter by public attributes (AND semantics).
-    Glob metacharacters (*, ?, [...]) are accepted.
-    The special key 'name' matches the item label.
-
-EXAMPLES:
-    rosec search                                    list all items
-    rosec search -s                                 sync first, then list all
-    rosec search --no-unlock                        search without prompting
-    rosec search type=login                         only login items
-    rosec search username=alice                     items with username 'alice'
-    rosec search rosec:provider=personal            items from 'personal' provider
-    rosec search type=login username=alice          combine filters
-    rosec search name=\"GitHub*\"                     glob on item name
-    rosec search --format=json type=login           JSON output
-    rosec search --format=kv uri=github.com         key=value output
-    rosec search --show-path type=login             table with D-Bus path column"
-    );
-}
-
-fn print_inspect_help() {
-    println!(
-        "\
-rosec inspect - show full item detail
-
-USAGE:
-    rosec inspect [flags] <id>
-
-ARGUMENTS:
-    <id>                16-char hex item ID or full D-Bus object path
-
-FLAGS:
-    -a, --all-attrs     Also fetch and display sensitive attributes (password, totp,
-                        notes, card number, custom fields, etc.)
-    -s, --sync          Sync providers before inspecting; also unlocks if the item is
-                        not yet in the cache (e.g. after a fresh daemon start)
-    --format=<fmt>      Output format: human (default), kv, json
-    --help, -h          Show this help
-
-OUTPUT FORMATS:
-    human               Labelled sections with public and (if --all-attrs) sensitive attrs
-    kv                  Flat key=value pairs — one per line, pipe-friendly
-    json                JSON object with 'attributes', 'sensitive_attributes', and 'secret'
-
-EXAMPLES:
-    rosec inspect a1b2c3d4e5f60718
-    rosec inspect -s a1b2c3d4e5f60718
-    rosec inspect -s --all-attrs a1b2c3d4e5f60718
-    rosec inspect --all-attrs --format=kv a1b2c3d4e5f60718
-    rosec inspect --all-attrs --format=json a1b2c3d4e5f60718"
-    );
-}
-
-fn print_provider_help() {
-    println!(
-        "\
-rosec provider - manage providers
-
-USAGE:
-    rosec provider <subcommand> [args...]
-    rosec providers <subcommand> [args...]   (alias)
-
-SUBCOMMANDS:
-    list                              List all providers and their lock state
-    kinds                             List available provider kinds
-    auth <id> [--force]               Authenticate/unlock a provider
-    add <kind> [options]              Add a provider to config.toml
-    remove <id>                       Remove a provider (local vaults: offers to delete the file)
-    enable <id>                       Enable a disabled provider
-    disable <id>                      Temporarily disable a provider
-    attach --path <file> [--id <id>]  Attach an existing vault file to the config
-    detach <id>                       Remove provider from config (file stays on disk)
-    add-password <id> [--label <l>]   Add a new unlock password to a local vault provider
-    remove-password <id> <entry-id>   Remove a password from a local vault provider
-    list-passwords <id>               List unlock passwords for a local vault provider
-    change-password <id>              Change the unlock password for a provider
-
-NOTE:
-    Device registration (Bitwarden) and first-time token setup (SM) are handled
-    automatically during 'auth' when the provider requires them.  Use --force
-    to re-run registration even when stored credentials already exist (e.g. to
-    replace a rotated SM access token or re-register a Bitwarden device).
-
-OPTIONS for 'add':
-    --id <id>                 Override auto-generated ID (default: derived from email/org or path)
-    --path <path>             Path to the vault file (local vaults only)
-    --collection <name>       Collection label for grouping items
-    key=value ...             Provider options (email, region, base_url, etc.)
-    --config <path>           Config file to edit (default: ~/.config/rosec/config.toml)"
-    );
-}
+// ───────────────────────────────────────────────────────────────────────────
+// Command implementations
+// ───────────────────────────────────────────────────────────────────────────
 
 fn cmd_provider_kinds() {
     println!("Available provider kinds:\n");
@@ -931,33 +685,25 @@ async fn prompt_field(label: &str, placeholder: &str, kind: &str) -> Result<Zero
 // provider / providers subcommand tree
 // ---------------------------------------------------------------------------
 
-async fn cmd_provider(args: &[String]) -> Result<()> {
-    let sub = args.first().map(String::as_str).unwrap_or("list");
-    match sub {
-        "list" | "ls" => cmd_provider_list().await,
-        "auth" => cmd_provider_auth(&args[1..]).await,
-        "add" => cmd_provider_add(&args[1..]).await,
-        "remove" | "rm" => cmd_provider_remove(&args[1..]).await,
-        "enable" => cmd_provider_set_enabled(&args[1..], true).await,
-        "disable" => cmd_provider_set_enabled(&args[1..], false).await,
-        "attach" => cmd_provider_attach(&args[1..]).await,
-        "detach" => cmd_provider_detach(&args[1..]).await,
-        "add-password" => cmd_provider_add_password(&args[1..]).await,
-        "remove-password" => cmd_provider_remove_password(&args[1..]).await,
-        "list-passwords" => cmd_provider_list_passwords(&args[1..]).await,
-        "change-password" => cmd_provider_change_password(&args[1..]).await,
-        "kinds" => {
+async fn cmd_provider(action: Option<ProviderCommands>) -> Result<()> {
+    let action = action.unwrap_or(ProviderCommands::List);
+    match action {
+        ProviderCommands::List => cmd_provider_list().await,
+        ProviderCommands::Kinds => {
             cmd_provider_kinds();
             Ok(())
         }
-        "help" | "--help" | "-h" => {
-            print_provider_help();
-            Ok(())
-        }
-        other => {
-            print_provider_help();
-            bail!("unknown provider subcommand: {other}");
-        }
+        ProviderCommands::Auth(args) => cmd_provider_auth(&args).await,
+        ProviderCommands::Add(args) => cmd_provider_add(args).await,
+        ProviderCommands::Remove(args) => cmd_provider_remove(&args.id).await,
+        ProviderCommands::Enable(args) => cmd_provider_set_enabled(&args.id, true).await,
+        ProviderCommands::Disable(args) => cmd_provider_set_enabled(&args.id, false).await,
+        ProviderCommands::Attach(args) => cmd_provider_attach(args).await,
+        ProviderCommands::Detach(args) => cmd_provider_detach(&args.id).await,
+        ProviderCommands::AddPassword(args) => cmd_provider_add_password(args).await,
+        ProviderCommands::RemovePassword(args) => cmd_provider_remove_password(&args).await,
+        ProviderCommands::ListPasswords(args) => cmd_provider_list_passwords(&args.id).await,
+        ProviderCommands::ChangePassword(args) => cmd_provider_change_password(&args.id).await,
     }
 }
 
@@ -1221,19 +967,9 @@ async fn cmd_provider_list() -> Result<()> {
 /// Opens `/dev/tty` and passes the fd to `rosecd` via D-Bus fd-passing.
 /// All credential prompting happens inside the daemon — credentials never
 /// appear in any D-Bus message payload.
-async fn cmd_provider_auth(args: &[String]) -> Result<()> {
-    let mut provider_id: Option<&str> = None;
-    let mut force = false;
-    for arg in args {
-        match arg.as_str() {
-            "--force" | "-f" => force = true,
-            s if s.starts_with('-') => bail!("unknown option: {s}"),
-            _ if provider_id.is_none() => provider_id = Some(arg.as_str()),
-            _ => bail!("unexpected argument: {arg}"),
-        }
-    }
-    let provider_id =
-        provider_id.ok_or_else(|| anyhow::anyhow!("usage: rosec provider auth <id> [--force]"))?;
+async fn cmd_provider_auth(args: &ProviderAuthArgs) -> Result<()> {
+    let provider_id = args.id.as_str();
+    let force = args.force;
 
     let conn = conn().await?;
     let proxy = zbus::Proxy::new(
@@ -1254,7 +990,7 @@ async fn cmd_provider_auth(args: &[String]) -> Result<()> {
 }
 
 /// `rosec provider add <kind> [--id <id>] [key=value ...]`
-async fn cmd_provider_add(args: &[String]) -> Result<()> {
+async fn cmd_provider_add(args: ProviderAddArgs) -> Result<()> {
     // Scan for discovered plugin kinds so we can validate and prompt correctly.
     let registry = rosec_wasm::discovery::scan_plugins(
         WasmPreference::default(),
@@ -1275,11 +1011,7 @@ async fn cmd_provider_add(args: &[String]) -> Result<()> {
     };
     let all_kinds_display = all_kinds.join(", ");
 
-    let kind = args.first().ok_or_else(|| {
-        anyhow::anyhow!(
-            "usage: rosec provider add <kind> [--id <id>] [key=value ...]\nKinds: {all_kinds_display}"
-        )
-    })?;
+    let kind = &args.kind;
 
     let is_builtin = config_edit::KNOWN_KINDS.contains(&kind.as_str());
     let is_discovered = registry.contains_kind(kind);
@@ -1288,52 +1020,19 @@ async fn cmd_provider_add(args: &[String]) -> Result<()> {
         bail!("unknown provider kind '{kind}'. Known kinds: {all_kinds_display}");
     }
 
-    // Parse --id, --path, --collection flags and key=value pairs from remaining args.
-    let mut custom_id: Option<String> = None;
-    let mut custom_path: Option<String> = None;
-    let mut collection: Option<String> = None;
+    // Extract flags and key=value pairs from clap-parsed args.
+    let custom_id: Option<String> = args.id;
+    let mut custom_path: Option<String> = args.path;
+    let mut collection: Option<String> = args.collection;
     let mut options: Vec<(String, String)> = Vec::new();
-    let mut i = 1usize;
-    while i < args.len() {
-        let arg = &args[i];
-        if arg == "--id" {
-            i += 1;
-            custom_id = Some(
-                args.get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--id requires a value"))?
-                    .clone(),
-            );
-        } else if let Some(id_val) = arg.strip_prefix("--id=") {
-            custom_id = Some(id_val.to_string());
-        } else if arg == "--path" {
-            i += 1;
-            custom_path = Some(
-                args.get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--path requires a value"))?
-                    .clone(),
-            );
-        } else if let Some(p) = arg.strip_prefix("--path=") {
-            custom_path = Some(p.to_string());
-        } else if arg == "--collection" {
-            i += 1;
-            collection = Some(
-                args.get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--collection requires a value"))?
-                    .clone(),
-            );
-        } else if let Some(c) = arg.strip_prefix("--collection=") {
-            collection = Some(c.to_string());
-        } else if let Some((k, v)) = arg.split_once('=')
-            && !k.starts_with("--config")
-        {
-            // Also capture path= and collection= as key=value syntax.
+    for opt in &args.options {
+        if let Some((k, v)) = opt.split_once('=') {
             match k {
                 "path" => custom_path = Some(v.to_string()),
                 "collection" => collection = Some(v.to_string()),
                 _ => options.push((k.to_string(), v.to_string())),
             }
         }
-        i += 1;
     }
 
     // Snapshot the keys already supplied on the command line.
@@ -1520,11 +1219,7 @@ fn derive_provider_id(
 ///
 /// For external providers, removes the config entry.
 /// For local vaults, also offers to delete the vault file from disk.
-async fn cmd_provider_remove(args: &[String]) -> Result<()> {
-    let id = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider remove <id>"))?;
-
+async fn cmd_provider_remove(id: &str) -> Result<()> {
     let cfg = config_path();
 
     // Check if this is a local vault with a path — if so, offer to delete the file.
@@ -1564,12 +1259,7 @@ async fn cmd_provider_remove(args: &[String]) -> Result<()> {
 }
 
 /// `rosec provider enable <id>` / `rosec provider disable <id>`
-async fn cmd_provider_set_enabled(args: &[String], enabled: bool) -> Result<()> {
-    let verb = if enabled { "enable" } else { "disable" };
-    let id = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider {verb} <id>"))?;
-
+async fn cmd_provider_set_enabled(id: &str, enabled: bool) -> Result<()> {
     let cfg = config_path();
     config_edit::set_provider_enabled(&cfg, id, enabled)?;
 
@@ -1585,65 +1275,12 @@ async fn cmd_provider_set_enabled(args: &[String], enabled: bool) -> Result<()> 
 /// `rosec provider attach --path <file> [--id <id>] [--collection <c>]`
 ///
 /// Adds an existing vault file to the config without creating it.
-async fn cmd_provider_attach(args: &[String]) -> Result<()> {
-    let mut custom_id: Option<String> = None;
-    let mut vault_path: Option<String> = None;
-    let mut collection: Option<String> = None;
-    let mut i = 0usize;
-
-    while i < args.len() {
-        let arg = &args[i];
-        match arg.as_str() {
-            "--id" => {
-                i += 1;
-                custom_id = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--id requires a value"))?
-                        .clone(),
-                );
-            }
-            a if a.starts_with("--id=") => {
-                custom_id = Some(a.strip_prefix("--id=").unwrap_or(a).to_string());
-            }
-            "--path" => {
-                i += 1;
-                vault_path = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--path requires a value"))?
-                        .clone(),
-                );
-            }
-            a if a.starts_with("--path=") => {
-                vault_path = Some(a.strip_prefix("--path=").unwrap_or(a).to_string());
-            }
-            "--collection" => {
-                i += 1;
-                collection = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--collection requires a value"))?
-                        .clone(),
-                );
-            }
-            a if a.starts_with("--collection=") => {
-                collection = Some(a.strip_prefix("--collection=").unwrap_or(a).to_string());
-            }
-            "--help" | "-h" => {
-                print_provider_help();
-                return Ok(());
-            }
-            other => bail!("unexpected argument: {other}"),
-        }
-        i += 1;
-    }
-
-    let vault_path = vault_path.ok_or_else(|| {
-        anyhow::anyhow!(
-            "--path is required\nusage: rosec provider attach --path <file> [--id <id>]"
-        )
-    })?;
+async fn cmd_provider_attach(args: ProviderAttachArgs) -> Result<()> {
+    let vault_path = args.path;
+    let collection = args.collection;
 
     // Derive ID from filename if not specified.
-    let id = match custom_id {
+    let id = match args.id {
         Some(id) => id,
         None => derive_vault_id_from_path(&vault_path),
     };
@@ -1660,10 +1297,7 @@ async fn cmd_provider_attach(args: &[String]) -> Result<()> {
 /// `rosec provider detach <id>`
 ///
 /// Removes the vault from the config file but leaves the vault file on disk.
-async fn cmd_provider_detach(args: &[String]) -> Result<()> {
-    let id = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider detach <id>"))?;
+async fn cmd_provider_detach(id: &str) -> Result<()> {
     let cfg = config_path();
     config_edit::remove_provider(&cfg, id)?;
     println!("Detached vault '{id}' from {}", cfg.display());
@@ -1678,46 +1312,11 @@ async fn cmd_provider_detach(args: &[String]) -> Result<()> {
 ///
 /// Add a new unlock password to a vault. The vault must be unlocked (running in
 /// rosecd).
-async fn cmd_provider_add_password(args: &[String]) -> Result<()> {
-    let mut vault_id: Option<&str> = None;
-    let mut label: Option<String> = None;
-    let mut i = 0usize;
-
-    while i < args.len() {
-        let arg = &args[i];
-        match arg.as_str() {
-            "--label" => {
-                i += 1;
-                label = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--label requires a value"))?
-                        .clone(),
-                );
-            }
-            a if a.starts_with("--label=") => {
-                label = Some(a.strip_prefix("--label=").unwrap_or(a).to_string());
-            }
-            "--help" | "-h" => {
-                print_provider_help();
-                return Ok(());
-            }
-            a if a.starts_with('-') => bail!("unknown flag: {a}"),
-            a => {
-                if vault_id.is_some() {
-                    bail!("unexpected argument: {a}");
-                }
-                vault_id = Some(a);
-            }
-        }
-        i += 1;
-    }
-
-    let vault_id = vault_id.ok_or_else(|| {
-        anyhow::anyhow!("usage: rosec provider add-password <id> [--label <label>]")
-    })?;
+async fn cmd_provider_add_password(args: ProviderAddPasswordArgs) -> Result<()> {
+    let vault_id = args.id.as_str();
 
     // Default label: user@hostname
-    let label = label.unwrap_or_else(default_password_label);
+    let label = args.label.unwrap_or_else(default_password_label);
 
     // Prompt for the new password.
     let pw = prompt_field("New password", "", "password").await?;
@@ -1750,11 +1349,7 @@ async fn cmd_provider_add_password(args: &[String]) -> Result<()> {
 ///
 /// List the wrapping entries (unlock passwords) for a vault. The vault must be
 /// unlocked. Shows the entry ID and label for each password.
-async fn cmd_provider_list_passwords(args: &[String]) -> Result<()> {
-    let vault_id = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider list-passwords <vault-id>"))?;
-
+async fn cmd_provider_list_passwords(vault_id: &str) -> Result<()> {
     let conn = conn().await?;
     let proxy = zbus::Proxy::new(
         &conn,
@@ -1764,7 +1359,7 @@ async fn cmd_provider_list_passwords(args: &[String]) -> Result<()> {
     )
     .await?;
 
-    let entries: Vec<(String, String)> = proxy.call("ListPasswords", &(vault_id.as_str(),)).await?;
+    let entries: Vec<(String, String)> = proxy.call("ListPasswords", &(vault_id,)).await?;
 
     if entries.is_empty() {
         println!("No password entries found for vault '{vault_id}'.");
@@ -1787,11 +1382,7 @@ async fn cmd_provider_list_passwords(args: &[String]) -> Result<()> {
 /// Change the unlock password for a vault.  Prompts for the current password,
 /// new password, and confirmation.  The wrapping entry matched by the old
 /// password is atomically replaced with a new one for the new password.
-async fn cmd_provider_change_password(args: &[String]) -> Result<()> {
-    let vault_id = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("usage: rosec provider change-password <vault-id>"))?;
-
+async fn cmd_provider_change_password(vault_id: &str) -> Result<()> {
     let old_pw = prompt_field("Current password", "", "password").await?;
     if old_pw.is_empty() {
         bail!("current password cannot be empty");
@@ -1820,10 +1411,7 @@ async fn cmd_provider_change_password(args: &[String]) -> Result<()> {
     .await?;
 
     let _: () = proxy
-        .call(
-            "ChangeProviderPassword",
-            &(vault_id.as_str(), old_fd, new_fd),
-        )
+        .call("ChangeProviderPassword", &(vault_id, old_fd, new_fd))
         .await?;
 
     println!("Password changed for vault '{vault_id}'.");
@@ -1834,12 +1422,9 @@ async fn cmd_provider_change_password(args: &[String]) -> Result<()> {
 ///
 /// Remove an unlock password from a vault. The vault must be unlocked and must
 /// have at least 2 passwords.
-async fn cmd_provider_remove_password(args: &[String]) -> Result<()> {
-    if args.len() < 2 {
-        bail!("usage: rosec provider remove-password <vault-id> <entry-id>");
-    }
-    let vault_id = &args[0];
-    let entry_id = &args[1];
+async fn cmd_provider_remove_password(args: &ProviderRemovePasswordArgs) -> Result<()> {
+    let vault_id = args.id.as_str();
+    let entry_id = args.entry_id.as_str();
 
     let conn = conn().await?;
     let proxy = zbus::Proxy::new(
@@ -1851,7 +1436,7 @@ async fn cmd_provider_remove_password(args: &[String]) -> Result<()> {
     .await?;
 
     // First list passwords to show the user what they're removing.
-    let entries: Vec<(String, String)> = proxy.call("ListPasswords", &(vault_id.as_str(),)).await?;
+    let entries: Vec<(String, String)> = proxy.call("ListPasswords", &(vault_id,)).await?;
 
     let target = entries
         .iter()
@@ -1868,9 +1453,7 @@ async fn cmd_provider_remove_password(args: &[String]) -> Result<()> {
 
     println!("Removing password entry: {entry_id} {label_display}");
 
-    let _: () = proxy
-        .call("RemovePassword", &(vault_id.as_str(), entry_id.as_str()))
-        .await?;
+    let _: () = proxy.call("RemovePassword", &(vault_id, entry_id)).await?;
 
     println!("Removed password entry '{entry_id}' from vault '{vault_id}'.");
     Ok(())
@@ -2364,15 +1947,13 @@ enum OutputFormat {
     Json,
 }
 
-impl OutputFormat {
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "human" => Some(Self::Human),
-            "table" => Some(Self::Table),
-            "kv" => Some(Self::Kv),
-            "json" => Some(Self::Json),
-            _ => None,
-        }
+/// Convert a clap `Format` enum to the internal `OutputFormat`.
+fn cli_format_to_output(f: Format) -> OutputFormat {
+    match f {
+        Format::Human => OutputFormat::Human,
+        Format::Table => OutputFormat::Table,
+        Format::Kv => OutputFormat::Kv,
+        Format::Json => OutputFormat::Json,
     }
 }
 
@@ -2571,37 +2152,18 @@ fn glob_matches(item: &ItemSummary, attrs: &HashMap<String, String>) -> bool {
     })
 }
 
-async fn cmd_search(args: &[String]) -> Result<()> {
-    // Parse --format flag, --show-path flag, --sync flag, --no-unlock flag, and k=v filters.
-    let mut format = OutputFormat::Table;
-    let mut show_path = false;
-    let mut sync = false;
-    let mut no_unlock = false;
+async fn cmd_search(args: SearchArgs) -> Result<()> {
+    let format = cli_format_to_output(args.format);
+    let show_path = args.show_path;
+    let sync = args.sync;
+    let no_unlock = args.no_unlock;
     let mut all_attrs: HashMap<String, String> = HashMap::new();
 
-    for arg in args {
-        if let Some(fmt_str) = arg.strip_prefix("--format=") {
-            match OutputFormat::parse(fmt_str) {
-                Some(f) => format = f,
-                None => {
-                    bail!("unknown format '{fmt_str}': use table, kv, or json");
-                }
-            }
-        } else if arg == "--format" {
-            bail!("--format requires a value: --format=table|kv|json");
-        } else if arg == "--show-path" {
-            show_path = true;
-        } else if arg == "--sync" || arg == "-s" {
-            sync = true;
-        } else if arg == "--no-unlock" {
-            no_unlock = true;
-        } else if arg == "--help" || arg == "-h" {
-            print_search_help();
-            return Ok(());
-        } else if let Some((key, value)) = arg.split_once('=') {
+    for filter in &args.filters {
+        if let Some((key, value)) = filter.split_once('=') {
             all_attrs.insert(key.to_string(), value.to_string());
         } else {
-            bail!("invalid argument: {arg}");
+            bail!("invalid filter: {filter} (expected key=value)");
         }
     }
 
@@ -3211,56 +2773,16 @@ async fn resolve_item_by_attrs(conn: &Connection, raw: &str) -> Result<(String, 
     }
 }
 
-async fn cmd_get(args: &[String]) -> Result<()> {
-    // Parse flags: --help / -h, --attr <name> / --attr=<name>, --sync, --no-unlock
-    let mut attr: Option<String> = None;
-    let mut sync = false;
-    let mut no_unlock = false;
-    let mut id: Option<&str> = None;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => {
-                print_get_help();
-                return Ok(());
-            }
-            "--sync" | "-s" => {
-                sync = true;
-            }
-            "--no-unlock" => {
-                no_unlock = true;
-            }
-            "--attr" => {
-                i += 1;
-                attr = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--attr requires a value"))?
-                        .clone(),
-                );
-            }
-            a if a.starts_with("--attr=") => {
-                attr = Some(a.strip_prefix("--attr=").unwrap_or(a).to_string());
-            }
-            a if a.starts_with('-') => {
-                bail!("unknown flag: {a}  (try `rosec get --help`)");
-            }
-            a => {
-                if id.is_some() {
-                    bail!("unexpected argument: {a}  (try `rosec get --help`)");
-                }
-                id = Some(a);
-            }
-        }
-        i += 1;
-    }
+async fn cmd_get(args: GetArgs) -> Result<()> {
+    let attr = args.attr;
+    let sync = args.sync;
+    let no_unlock = args.no_unlock;
 
     if sync && no_unlock {
         bail!("--sync and --no-unlock are mutually exclusive");
     }
 
-    let raw =
-        id.ok_or_else(|| anyhow::anyhow!("missing item path or ID  (try `rosec get --help`)"))?;
+    let raw = args.item.as_str();
 
     let conn = conn().await?;
 
@@ -3318,45 +2840,6 @@ async fn cmd_get(args: &[String]) -> Result<()> {
             }
         }
     }
-}
-
-fn print_get_help() {
-    println!(
-        "\
-rosec get - print a secret value
-
-USAGE:
-    rosec get [flags] [--attr <name>] <item>
-
-ARGUMENTS:
-    <item>          One of:
-                      16-char hex item ID       a1b2c3d4e5f60718
-                      D-Bus object path         /org/freedesktop/secrets/…
-                      Attribute filter           name=MY_API_KEY
-                    Attribute filters use key=value syntax.  Glob patterns
-                    are supported (name=*prod*, uri=*.example.com).
-                    Exactly one item must match.
-
-FLAGS:
-    -s, --sync      Sync providers before fetching if the cache is stale (>60 s).
-                    Skips the network call when data is already fresh.
-    --no-unlock     Never prompt for credentials — only use cached/unlocked items.
-                    Mutually exclusive with --sync.
-    --attr <name>   Print the named public attribute instead of the primary secret
-                    (e.g. username, uri, folder, sm.project).
-                    Use `rosec inspect <id>` to see all available attributes.
-    -h, --help      Show this help
-
-EXAMPLES:
-    rosec get a1b2c3d4e5f60718                    # by hex ID
-    rosec get name=MY_API_KEY                     # by exact name
-    rosec get 'name=*prod*'                       # by name glob
-    rosec get uri=github.com                      # by URI attribute
-    rosec get --sync name=MY_API_KEY              # sync first, then fetch
-    rosec get --no-unlock a1b2c3d4e5f60718        # no prompting
-    rosec get a1b2c3d4e5f60718 | xclip -sel clip  # pipe to clipboard
-    rosec get --attr username name=MY_API_KEY     # print username attribute"
-    );
 }
 
 /// Normalise an `--attr` value that may use dot-index syntax.
@@ -3472,40 +2955,11 @@ async fn cmd_get_inner(conn: &Connection, path: &str, attr: Option<&str>) -> Res
     }
 }
 
-async fn cmd_inspect(args: &[String]) -> Result<()> {
-    let mut all_attrs = false;
-    let mut sync = false;
-    let mut format = OutputFormat::Human;
-    let mut raw: Option<&str> = None;
-
-    for arg in args {
-        match arg.as_str() {
-            "--all-attrs" | "-a" => all_attrs = true,
-            "--sync" | "-s" => sync = true,
-            s if s.starts_with("--format=") => {
-                let fmt_str = &s["--format=".len()..];
-                match OutputFormat::parse(fmt_str) {
-                    Some(f) => format = f,
-                    None => {
-                        bail!("unknown format '{fmt_str}': use human, kv, or json");
-                    }
-                }
-            }
-            "--format" => {
-                bail!("--format requires a value: --format=human|kv|json");
-            }
-            "--help" | "-h" => {
-                print_inspect_help();
-                return Ok(());
-            }
-            s if raw.is_none() => raw = Some(s),
-            s => {
-                bail!("unexpected argument: {s}");
-            }
-        }
-    }
-
-    let raw = raw.ok_or_else(|| anyhow::anyhow!("missing item path or ID"))?;
+async fn cmd_inspect(args: InspectArgs) -> Result<()> {
+    let all_attrs = args.all_attrs;
+    let sync = args.sync;
+    let format = cli_format_to_output(args.format);
+    let raw = args.item.as_str();
 
     let conn = conn().await?;
 
@@ -3895,66 +3349,11 @@ static CONFIG_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
-fn print_config_help() {
-    println!(
-        "\
-rosec config - read or modify config.toml
-
-USAGE:
-    rosec config show
-    rosec config get <key>
-    rosec config set <key> <value>
-
-SUBCOMMANDS:
-    show            Print the current effective configuration as TOML
-    get <key>       Print the current value of a single setting
-    set <key> <value>
-                    Update a setting.  The daemon hot-reloads config.toml
-                    automatically — no restart required.
-
-SETTABLE KEYS:"
-    );
-    for (key, desc) in CONFIG_KEYS {
-        println!("    {key:<40}  {desc}");
-    }
-    println!(
-        "
-EXAMPLES:
-    rosec config show
-    rosec config get autolock.idle_timeout_minutes
-    rosec config set autolock.idle_timeout_minutes 30
-    rosec config set autolock.on_session_lock false
-    rosec config set service.refresh_interval_secs 120"
-    );
-}
-
-fn cmd_config(args: &[String]) -> Result<()> {
-    let sub = args.first().map(String::as_str).unwrap_or("help");
-    match sub {
-        "show" => cmd_config_show(),
-        "get" => {
-            let key = args
-                .get(1)
-                .ok_or_else(|| anyhow::anyhow!("missing key  (try `rosec config --help`)"))?;
-            cmd_config_get(key)
-        }
-        "set" => {
-            let key = args
-                .get(1)
-                .ok_or_else(|| anyhow::anyhow!("missing key  (try `rosec config --help`)"))?;
-            let value = args
-                .get(2)
-                .ok_or_else(|| anyhow::anyhow!("missing value  (try `rosec config --help`)"))?;
-            cmd_config_set(key, value)
-        }
-        "help" | "--help" | "-h" => {
-            print_config_help();
-            Ok(())
-        }
-        other => {
-            print_config_help();
-            bail!("unknown config subcommand: {other}");
-        }
+fn cmd_config(action: Option<ConfigCommands>) -> Result<()> {
+    match action {
+        None | Some(ConfigCommands::Show) => cmd_config_show(),
+        Some(ConfigCommands::Get { key }) => cmd_config_get(&key),
+        Some(ConfigCommands::Set { key, value }) => cmd_config_set(&key, &value),
     }
 }
 
@@ -4065,131 +3464,46 @@ fn cmd_config_set(key: &str, value: &str) -> Result<()> {
 // rosec item <subcommand>
 // ---------------------------------------------------------------------------
 
-async fn cmd_item(args: &[String]) -> Result<()> {
-    let sub = args.first().map(String::as_str).unwrap_or("help");
-    match sub {
-        "list" | "ls" => cmd_item_list(&args[1..]).await,
-        "add" | "new" | "create" => cmd_item_add(&args[1..]).await,
-        "edit" => cmd_item_edit(&args[1..]).await,
-        "delete" | "rm" | "remove" => cmd_item_delete(&args[1..]).await,
-        "export" => cmd_item_export(&args[1..]).await,
-        "import" => cmd_item_import(&args[1..]).await,
-        "help" | "--help" | "-h" => {
-            print_item_help();
-            Ok(())
-        }
-        other => {
-            print_item_help();
-            bail!("unknown item subcommand: {other}");
-        }
+async fn cmd_item(action: Option<ItemCommands>) -> Result<()> {
+    let action = action.unwrap_or(ItemCommands::List(ItemListArgs {
+        provider: None,
+        item_type: None,
+        format: Format::Table,
+        show_path: false,
+        sync: false,
+        no_unlock: false,
+        filters: Vec::new(),
+    }));
+    match action {
+        ItemCommands::List(args) => cmd_item_list(args).await,
+        ItemCommands::Add(args) => cmd_item_add(args).await,
+        ItemCommands::Edit(args) => cmd_item_edit(args).await,
+        ItemCommands::Delete(args) => cmd_item_delete(args).await,
+        ItemCommands::Export(args) => cmd_item_export(args).await,
+        ItemCommands::Import(args) => cmd_item_import(args).await,
     }
-}
-
-fn print_item_help() {
-    println!(
-        "\
-rosec item - manage items
-
-USAGE:
-    rosec item <subcommand> [args...]
-
-SUBCOMMANDS:
-    list [flags] [key=value]...         List items (delegates to search)
-    add [flags]                         Create a new item via $EDITOR
-    edit [flags] <item>                 Edit an existing item via $EDITOR
-    delete [flags] <item>               Delete an item (with confirmation)
-    export [flags] <item>               Export an item as TOML to stdout
-    import [flags]                      Import an item from TOML on stdin
-
-LIST FLAGS:
-    --provider=<id>                     Only items from this provider
-    --type=<type>                       Only items of this type (login, ssh-key, note, ...)
-    --format=<fmt>                      Output format: table (default), kv, json
-    --show-path                         Also print the full D-Bus object path
-    --sync, -s                          Sync/unlock providers before listing
-    --no-unlock                         Skip interactive unlock prompts
-
-ADD FLAGS:
-    --provider=<id>                     Target provider (default: first write-capable)
-    --type=<type>                       Item type: generic, login, ssh-key, note, card, identity
-    --generate-ssh-key                  Generate an ed25519 SSH key pair
-
-EDIT FLAGS:
-    --sync, -s                          Sync/unlock providers before editing
-
-DELETE FLAGS:
-    --sync, -s                          Sync/unlock providers before deleting
-    --yes, -y                           Skip confirmation prompt
-
-EXPORT FLAGS:
-    --sync, -s                          Sync/unlock providers before exporting
-
-IMPORT FLAGS:
-    --provider=<id>                     Target provider (default: first write-capable)
-
-ITEM IDENTIFIERS (<item>):
-    16-char hex item ID                 a1b2c3d4e5f60718
-    key=value attribute filter          name=My Login
-    full D-Bus object path              /org/freedesktop/secrets/collection/...
-
-EXAMPLES:
-    rosec item list                                         # list all items
-    rosec item list --provider=local-default                # items from one provider
-    rosec item list --type=login username=alice              # login items for alice
-    rosec item list --format=json --type=ssh-key             # SSH keys as JSON
-    rosec item add                                          # create generic item via $EDITOR
-    rosec item add --type=login --provider=local-default     # create login in specific vault
-    rosec item add --type=ssh-key --generate-ssh-key         # generate + store SSH key
-    rosec item edit a1b2c3d4e5f60718                         # edit item by ID
-    rosec item edit name=My\\ Login                           # edit item by name
-    rosec item delete a1b2c3d4e5f60718                       # delete with confirmation
-    rosec item delete -y a1b2c3d4e5f60718                    # delete without confirmation
-    rosec item export a1b2c3d4e5f60718                       # export item as TOML
-    rosec item export a1b2c3d4e5f60718 > backup.toml         # export to file
-    rosec item import < backup.toml                          # import from file
-    rosec item import --provider=my-vault < backup.toml      # import into specific provider
-    rosec item export <bitwarden-item> | rosec item import   # copy between providers"
-    );
 }
 
 /// `rosec item list` — delegates to the search infrastructure with convenience
 /// `--provider` and `--type` filters that get merged into the attribute query.
-async fn cmd_item_list(args: &[String]) -> Result<()> {
-    let mut format = OutputFormat::Table;
-    let mut show_path = false;
-    let mut sync = false;
-    let mut no_unlock = false;
+async fn cmd_item_list(args: ItemListArgs) -> Result<()> {
+    let format = cli_format_to_output(args.format);
+    let show_path = args.show_path;
+    let sync = args.sync;
+    let no_unlock = args.no_unlock;
     let mut all_attrs: HashMap<String, String> = HashMap::new();
 
-    for arg in args {
-        if let Some(fmt_str) = arg.strip_prefix("--format=") {
-            match OutputFormat::parse(fmt_str) {
-                Some(f) => format = f,
-                None => bail!("unknown format '{fmt_str}': use table, kv, or json"),
-            }
-        } else if arg == "--format" {
-            bail!("--format requires a value: --format=table|kv|json");
-        } else if let Some(prov) = arg.strip_prefix("--provider=") {
-            all_attrs.insert(rosec_core::ATTR_PROVIDER.to_string(), prov.to_string());
-        } else if arg == "--provider" {
-            bail!("--provider requires a value: --provider=<id>");
-        } else if let Some(typ) = arg.strip_prefix("--type=") {
-            all_attrs.insert(rosec_core::ATTR_TYPE.to_string(), typ.to_string());
-        } else if arg == "--type" {
-            bail!("--type requires a value: --type=login|ssh-key|note|...");
-        } else if arg == "--show-path" {
-            show_path = true;
-        } else if arg == "--sync" || arg == "-s" {
-            sync = true;
-        } else if arg == "--no-unlock" {
-            no_unlock = true;
-        } else if arg == "--help" || arg == "-h" {
-            print_item_help();
-            return Ok(());
-        } else if let Some((key, value)) = arg.split_once('=') {
+    if let Some(ref prov) = args.provider {
+        all_attrs.insert(rosec_core::ATTR_PROVIDER.to_string(), prov.clone());
+    }
+    if let Some(ref typ) = args.item_type {
+        all_attrs.insert(rosec_core::ATTR_TYPE.to_string(), typ.clone());
+    }
+    for filter in &args.filters {
+        if let Some((key, value)) = filter.split_once('=') {
             all_attrs.insert(key.to_string(), value.to_string());
         } else {
-            bail!("invalid argument: {arg}  (try `rosec item list --help`)");
+            bail!("invalid filter: {filter} (expected key=value)");
         }
     }
 
@@ -4640,32 +3954,15 @@ fn open_editor(initial_content: &str) -> Result<Option<String>> {
 /// 5. Parse the edited TOML
 /// 6. Call `CreateItemExtended` on `org.rosec.Items`
 /// 7. Print the created item path / ID
-async fn cmd_item_add(args: &[String]) -> Result<()> {
-    let mut provider_id = String::new();
-    let mut item_type = "generic".to_string();
-    let mut generate_ssh_key = false;
+async fn cmd_item_add(args: ItemAddArgs) -> Result<()> {
+    let provider_id = args.provider.unwrap_or_default();
+    let mut item_type = args.item_type;
+    let generate_ssh_key = args.generate_ssh_key;
 
-    for arg in args {
-        if let Some(prov) = arg.strip_prefix("--provider=") {
-            provider_id = prov.to_string();
-        } else if arg == "--provider" {
-            bail!("--provider requires a value: --provider=<id>");
-        } else if let Some(typ) = arg.strip_prefix("--type=") {
-            // Validate early.
-            typ.parse::<rosec_core::ItemType>()
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            item_type = typ.to_string();
-        } else if arg == "--type" {
-            bail!("--type requires a value: --type=login|ssh-key|note|card|identity|generic");
-        } else if arg == "--generate-ssh-key" {
-            generate_ssh_key = true;
-        } else if arg == "--help" || arg == "-h" {
-            print_item_help();
-            return Ok(());
-        } else {
-            bail!("unknown argument: {arg}  (try `rosec item add --help`)");
-        }
-    }
+    // Validate item type early.
+    item_type
+        .parse::<rosec_core::ItemType>()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if generate_ssh_key && item_type != "ssh-key" {
         // Auto-set the type when --generate-ssh-key is used without --type.
@@ -4973,31 +4270,9 @@ fn toml_key(k: &str) -> String {
 /// 4. Open $EDITOR
 /// 5. Parse the edited TOML
 /// 6. Call UpdateItem via D-Bus
-async fn cmd_item_edit(args: &[String]) -> Result<()> {
-    let mut sync = false;
-    let mut raw: Option<&str> = None;
-
-    for arg in args {
-        match arg.as_str() {
-            "--sync" | "-s" => sync = true,
-            "--help" | "-h" => {
-                print_item_help();
-                return Ok(());
-            }
-            a if a.starts_with('-') => {
-                bail!("unknown flag: {a}  (try `rosec item edit --help`)");
-            }
-            a => {
-                if raw.is_some() {
-                    bail!("unexpected argument: {a}  (try `rosec item edit --help`)");
-                }
-                raw = Some(a);
-            }
-        }
-    }
-
-    let raw =
-        raw.ok_or_else(|| anyhow::anyhow!("missing item ID  (try `rosec item edit --help`)"))?;
+async fn cmd_item_edit(args: ItemEditArgs) -> Result<()> {
+    let sync = args.sync;
+    let raw = args.item.as_str();
 
     let conn = conn().await?;
     if !is_rosecd(&conn).await {
@@ -5087,33 +4362,10 @@ async fn cmd_item_edit(args: &[String]) -> Result<()> {
 /// 2. Fetch label for the confirmation prompt
 /// 3. Prompt for confirmation (unless `--yes` / `-y`)
 /// 4. Call DeleteItem via D-Bus
-async fn cmd_item_delete(args: &[String]) -> Result<()> {
-    let mut sync = false;
-    let mut yes = false;
-    let mut raw: Option<&str> = None;
-
-    for arg in args {
-        match arg.as_str() {
-            "--sync" | "-s" => sync = true,
-            "--yes" | "-y" => yes = true,
-            "--help" | "-h" => {
-                print_item_help();
-                return Ok(());
-            }
-            a if a.starts_with('-') => {
-                bail!("unknown flag: {a}  (try `rosec item delete --help`)");
-            }
-            a => {
-                if raw.is_some() {
-                    bail!("unexpected argument: {a}  (try `rosec item delete --help`)");
-                }
-                raw = Some(a);
-            }
-        }
-    }
-
-    let raw =
-        raw.ok_or_else(|| anyhow::anyhow!("missing item ID  (try `rosec item delete --help`)"))?;
+async fn cmd_item_delete(args: ItemDeleteArgs) -> Result<()> {
+    let sync = args.sync;
+    let yes = args.yes;
+    let raw = args.item.as_str();
 
     let conn = conn().await?;
     if !is_rosecd(&conn).await {
@@ -5194,31 +4446,9 @@ async fn cmd_item_delete(args: &[String]) -> Result<()> {
 /// The output uses the same `[item]`/`[attributes]`/`[secrets]` format as
 /// the editor workflow, so it can be piped into `rosec item import` or
 /// redirected to a file for backup.
-async fn cmd_item_export(args: &[String]) -> Result<()> {
-    let mut sync = false;
-    let mut raw: Option<&str> = None;
-
-    for arg in args {
-        match arg.as_str() {
-            "--sync" | "-s" => sync = true,
-            "--help" | "-h" => {
-                print_item_help();
-                return Ok(());
-            }
-            a if a.starts_with('-') => {
-                bail!("unknown flag: {a}  (try `rosec item export --help`)");
-            }
-            a => {
-                if raw.is_some() {
-                    bail!("unexpected argument: {a}  (try `rosec item export --help`)");
-                }
-                raw = Some(a);
-            }
-        }
-    }
-
-    let raw =
-        raw.ok_or_else(|| anyhow::anyhow!("missing item ID  (try `rosec item export --help`)"))?;
+async fn cmd_item_export(args: ItemExportArgs) -> Result<()> {
+    let sync = args.sync;
+    let raw = args.item.as_str();
 
     let conn = conn().await?;
     if !is_rosecd(&conn).await {
@@ -5267,23 +4497,8 @@ async fn cmd_item_export(args: &[String]) -> Result<()> {
 /// Reads the same `[item]`/`[attributes]`/`[secrets]` TOML format produced
 /// by `rosec item export`.  Creates the item via `CreateItemExtended` on
 /// the specified (or default write-capable) provider.
-async fn cmd_item_import(args: &[String]) -> Result<()> {
-    let mut provider_id = String::new();
-
-    for arg in args {
-        if let Some(prov) = arg.strip_prefix("--provider=") {
-            provider_id = prov.to_string();
-        } else if arg == "--provider" {
-            bail!("--provider requires a value: --provider=<id>");
-        } else if arg == "--help" || arg == "-h" {
-            print_item_help();
-            return Ok(());
-        } else if arg.starts_with('-') {
-            bail!("unknown flag: {arg}  (try `rosec item import --help`)");
-        } else {
-            bail!("unexpected argument: {arg}  (try `rosec item import --help`)");
-        }
-    }
+async fn cmd_item_import(args: ItemImportArgs) -> Result<()> {
+    let provider_id = args.provider.unwrap_or_default();
 
     // Read TOML from stdin.
     let mut content = String::new();

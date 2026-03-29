@@ -8,6 +8,7 @@ use zbus::Connection;
 
 use crate::collection::{CollectionState, SecretCollection};
 use crate::daemon::{RosecItems, RosecManagement, RosecSearch, RosecSecrets};
+use crate::portal::PortalSecret;
 use crate::service::SecretService;
 use crate::session::SessionManager;
 use crate::state::ServiceState;
@@ -79,13 +80,7 @@ pub async fn register_objects_with_full_config(
     prompt_config: PromptConfig,
     initial_config: Config,
 ) -> zbus::Result<Arc<ServiceState>> {
-    let paths = ObjectPaths::new();
-    // Keep a reference to all providers for the CollectionState before consuming `providers`
-    let providers_for_collection: Vec<Arc<dyn Provider>> =
-        providers.iter().map(Arc::clone).collect();
     let tokio_handle = tokio::runtime::Handle::current();
-    let sessions_clone = Arc::clone(&sessions);
-    let tokio_handle_clone = tokio_handle.clone();
     let state = Arc::new(ServiceState::new_with_config(
         providers,
         router,
@@ -97,57 +92,8 @@ pub async fn register_objects_with_full_config(
         prompt_config,
         initial_config,
     ));
-    let shared_items = Arc::clone(&state.items);
 
-    let server = conn.object_server();
-    server
-        .at(
-            paths.service.clone(),
-            SecretService::new(Arc::clone(&state)),
-        )
-        .await?;
-    server
-        .at(
-            "/org/rosec/Daemon",
-            RosecManagement::new(Arc::clone(&state)),
-        )
-        .await?;
-    server
-        .at("/org/rosec/Search", RosecSearch::new(Arc::clone(&state)))
-        .await?;
-    server
-        .at("/org/rosec/Secrets", RosecSecrets::new(Arc::clone(&state)))
-        .await?;
-    server
-        .at("/org/rosec/Items", RosecItems::new(Arc::clone(&state)))
-        .await?;
-
-    let collection_state = CollectionState {
-        label: "default".to_string(),
-        items: shared_items,
-        providers: providers_for_collection,
-        service_state: Arc::clone(&state),
-        sessions: sessions_clone,
-        tokio_handle: tokio_handle_clone,
-    };
-    server
-        .at(
-            paths.collection_default.clone(),
-            SecretCollection::new(collection_state.clone()),
-        )
-        .await?;
-
-    // Register the same collection at the standard alias path.
-    // Per the Secret Service spec, /org/freedesktop/secrets/aliases/default
-    // must resolve to the default collection.  Most clients (including
-    // secret-tool from libsecret) access the default collection via this
-    // alias path rather than calling ReadAlias first.
-    server
-        .at(
-            "/org/freedesktop/secrets/aliases/default",
-            SecretCollection::new(collection_state),
-        )
-        .await?;
+    register_all_objects(conn, &state).await?;
 
     Ok(state)
 }
@@ -163,6 +109,14 @@ pub async fn re_register_top_level_objects(
     conn: &Connection,
     state: &Arc<ServiceState>,
 ) -> zbus::Result<()> {
+    register_all_objects(conn, state).await
+}
+
+/// Shared registration logic — single source of truth for all D-Bus object
+/// paths.  Both initial registration and bus-migration re-registration go
+/// through this function, so adding a new interface only requires changing
+/// one place.
+async fn register_all_objects(conn: &Connection, state: &Arc<ServiceState>) -> zbus::Result<()> {
     let paths = ObjectPaths::new();
     let server = conn.object_server();
 
@@ -181,6 +135,12 @@ pub async fn re_register_top_level_objects(
     server
         .at("/org/rosec/Items", RosecItems::new(Arc::clone(state)))
         .await?;
+    server
+        .at(
+            "/org/freedesktop/portal/desktop",
+            PortalSecret::new(Arc::clone(state)),
+        )
+        .await?;
 
     let collection_state = CollectionState {
         label: "default".to_string(),
@@ -196,6 +156,11 @@ pub async fn re_register_top_level_objects(
             SecretCollection::new(collection_state.clone()),
         )
         .await?;
+
+    // Per the Secret Service spec, /org/freedesktop/secrets/aliases/default
+    // must resolve to the default collection.  Most clients (including
+    // secret-tool from libsecret) access the default collection via this
+    // alias path rather than calling ReadAlias first.
     server
         .at(
             "/org/freedesktop/secrets/aliases/default",
