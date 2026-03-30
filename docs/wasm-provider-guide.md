@@ -45,6 +45,8 @@ input and return JSON output through Extism byte buffers.  The guest runs on
 | `capabilities`         | *(empty)*              | `CapabilitiesResponse`       | No            | No               |
 | `export_cache`         | *(empty)*              | `ExportCacheResponse`        | No            | No               |
 | `restore_cache`        | `RestoreCacheRequest`  | `SimpleResponse`             | No            | No               |
+| `get_notification_config` | *(empty)*           | `NotificationConfigResponse` | **Yes**      | No               |
+| `parse_notification`   | `NotificationFrame`    | `NotificationAction`         | No            | No               |
 
 [1] "External I/O" means network calls (HTTP via Extism PDK) *or* file reads
 that may block (e.g. gnome-keyring reads `.keyring` files from WASI during
@@ -573,3 +575,181 @@ and `rosec status` to alert the user that secrets may be stale.
       `export_cache` serializes in-memory state (optionally including session
       tokens for automatic recovery), `restore_cache` deserializes it and
       makes data-access functions work
+
+## Capabilities reference
+
+Every WASM provider exports a `capabilities` function that returns a list of
+string identifiers.  These map to `Capability` enum variants in the host and
+control which optional guest functions the host will call.
+
+```rust
+#[plugin_fn]
+pub fn capabilities(_: ()) -> FnResult<Json<CapabilitiesResponse>> {
+    Ok(Json(CapabilitiesResponse {
+        capabilities: vec![
+            "sync".to_string(),
+            "ssh".to_string(),
+            "offline_cache".to_string(),
+            "notifications".to_string(),
+        ],
+    }))
+}
+```
+
+The host parses these strings case-insensitively (both `"sync"` and `"Sync"`
+are accepted).  Unknown strings are silently ignored.
+
+If a capability is **not** declared, the host never calls the associated guest
+functions — they can be omitted from the guest entirely.  Calling an optional
+trait method without the capability returns `ProviderError::NotSupported`.
+
+### `sync`
+
+**String:** `"sync"` | **CLI code:** `S`
+
+Declares that the provider can synchronise with a remote data source.  Enables
+`rosec sync` and the `-s` flag on `rosec search`.
+
+**Required guest functions:**
+
+| Function | Input | Output | Purpose |
+|---|---|---|---|
+| `sync` | *(empty)* | `SimpleResponse` | Fetch the latest state from the remote and update the guest's in-memory cache. Network-facing; readiness-gated. |
+| `check_remote_changed` | `CheckRemoteChangedRequest` | `CheckRemoteChangedResponse` | Lightweight check whether the remote has new data since the last sync (e.g. compare a revision counter or ETag). Returns `changed: true/false`. Network-facing; readiness-gated. |
+
+**Behaviour:** The host calls `sync` on a configurable interval
+(`refresh_interval_secs`) and after each successful unlock.
+`check_remote_changed` is called before `sync` as an optimisation — if it
+returns `false`, the full sync is skipped.
+
+### `write`
+
+**String:** `"write"` | **CLI code:** `W`
+
+Declares that the provider supports creating, updating, and deleting items.
+Required for `rosec item add`, `rosec item edit`, `rosec item import`,
+`rosec item delete`, and the D-Bus `CreateItem`/`Delete` methods.
+
+**Required guest functions:**
+
+| Function | Input | Output | Purpose |
+|---|---|---|---|
+| `create_item` | `CreateItemRequest` | `CreateItemResponse` | Create a new item (or replace an existing one if `replace` is true). Returns the new item ID. |
+| `update_item` | `UpdateItemRequest` | `SimpleResponse` | Update an existing item's label, attributes, or secret values. |
+| `delete_item` | `DeleteItemRequest` | `SimpleResponse` | Permanently delete an item by ID. |
+
+**Behaviour:** Without this capability, the provider is read-only.  The D-Bus
+`CreateItem` call will route to another provider if the target collection maps
+to a provider without write capability.
+
+### `ssh`
+
+**String:** `"ssh"` | **CLI code:** `s`
+
+Declares that the provider exposes SSH keys to the built-in SSH agent.  Keys
+are loaded automatically when the provider is unlocked and removed when locked.
+
+**Required guest functions:**
+
+| Function | Input | Output | Purpose |
+|---|---|---|---|
+| `list_ssh_keys` | *(empty)* | `SshKeyListResponse` | Return metadata for all SSH keys the provider can serve: item ID, item name, public key, fingerprint, `ssh_host` patterns, `ssh_user`, and `require_confirm` flag. |
+| `get_ssh_private_key` | `SshPrivateKeyRequest` | `SshPrivateKeyResponse` | Return the PEM-encoded private key for a specific item. Called once per key during agent reload. |
+
+**Behaviour:** After unlock and after each sync, the host calls
+`list_ssh_keys` then `get_ssh_private_key` for each returned entry.  Keys are
+parsed, loaded into the in-memory key store, and made available via the SSH
+agent socket and FUSE filesystem.  Each key's metadata controls config snippet
+generation (`ssh_host`, `ssh_user`) and signing confirmation (`require_confirm`).
+
+### `key_wrapping`
+
+**String:** `"key_wrapping"` | **CLI code:** `K`
+
+Declares that the provider supports key wrapping — multiple passwords can
+unlock the same vault.  Enables `rosec provider add-password`,
+`remove-password`, and `list-passwords`.
+
+**Required guest functions:**
+
+| Function | Input | Output | Purpose |
+|---|---|---|---|
+| `add_password` | `AddPasswordRequest` | `AddPasswordResponse` | Add a new wrapping entry (password + optional label) that can unlock the vault. Returns the entry ID. |
+| `remove_password` | `RemovePasswordRequest` | `SimpleResponse` | Remove a wrapping entry by ID. |
+| `list_passwords` | *(empty)* | `ListPasswordsResponse` | List all wrapping entries (ID + optional label). Does not expose key material. |
+
+**Behaviour:** Key wrapping is primarily used by local vaults to support PAM
+auto-unlock when the login password differs from the master password.  Each
+wrapping entry encrypts the same vault key with a different password-derived
+wrapping key, so adding/removing passwords does not require re-encrypting data.
+
+### `password_change`
+
+**String:** `"password_change"` | **CLI code:** `P`
+
+Declares that the provider supports changing the unlock password via
+`rosec provider change-password`.
+
+**Required guest functions:**
+
+| Function | Input | Output | Purpose |
+|---|---|---|---|
+| `change_password` | `ChangePasswordRequest` | `SimpleResponse` | Change the primary unlock password. The guest receives both the old and new passwords, verifies the old one, and re-wraps the vault key. |
+
+**Behaviour:** This is separate from key wrapping.  `change_password` replaces
+the password for an existing wrapping entry (typically the primary one), while
+`add_password`/`remove_password` manage additional entries.
+
+### `offline_cache`
+
+**String:** `"offline_cache"` | **CLI code:** `C`
+
+Declares that the provider supports offline cache export/restore.  Previously
+synced data is available after reboot or without network access.
+
+**Required guest functions:**
+
+| Function | Input | Output | Purpose |
+|---|---|---|---|
+| `export_cache` | *(empty)* | `ExportCacheResponse` | Serialize the guest's current in-memory state into an opaque blob. Called after successful unlock and sync. |
+| `restore_cache` | `RestoreCacheRequest` | `SimpleResponse` | Deserialize a previously exported blob back into the guest's state. Called during offline unlock when readiness probes fail. |
+
+**Behaviour:** Requires **both** the guest capability **and** the host-side
+`offline_cache = true` config (default).  The host wraps the blob in
+AES-256-CBC + HMAC-SHA256 encryption bound to the machine key, password, and
+provider ID.  See the [Offline cache](#offline-cache) section above for the
+full lifecycle and encryption details.
+
+### `notifications`
+
+**String:** `"notifications"` | **CLI code:** `N`
+
+Declares that the provider supports real-time push notifications via a
+WebSocket connection managed by the host.  Enables immediate sync when the
+remote vault changes, rather than waiting for the polling interval.
+
+**Required guest functions:**
+
+| Function | Input | Output | Purpose |
+|---|---|---|---|
+| `get_notification_config` | *(empty)* | `NotificationConfigResponse` | Return a `WebSocketSubscription` containing the full WebSocket URL (including auth tokens), optional HTTP headers for the upgrade request, and an optional handshake message to send after connect. The guest performs any negotiate steps (e.g. SignalR negotiate) internally via HTTP before returning. |
+| `parse_notification` | `NotificationFrame` | `NotificationAction` | Classify a received WebSocket text frame. Returns `action: "sync"` (trigger a sync), `action: "lock"` (lock the provider), or `action: "ignore"` (ping, ack, unknown frame). |
+
+**Behaviour:** After a successful online unlock, the host calls
+`get_notification_config` and establishes a persistent WebSocket connection.
+Each received text frame is passed to `parse_notification`.  On disconnect,
+the host reconnects with exponential backoff, calling
+`get_notification_config` again to get a fresh URL/token.  The host handles
+all connection lifecycle — the guest only provides the URL and frame parsing.
+
+### Capability string reference
+
+| String | Alternate | Enum variant | CLI code |
+|---|---|---|:---:|
+| `"sync"` | `"Sync"` | `Capability::Sync` | `S` |
+| `"write"` | `"Write"` | `Capability::Write` | `W` |
+| `"ssh"` | `"Ssh"` | `Capability::Ssh` | `s` |
+| `"key_wrapping"` | `"KeyWrapping"` | `Capability::KeyWrapping` | `K` |
+| `"password_change"` | `"PasswordChange"` | `Capability::PasswordChange` | `P` |
+| `"offline_cache"` | `"OfflineCache"` | `Capability::OfflineCache` | `C` |
+| `"notifications"` | `"Notifications"` | `Capability::Notifications` | `N` |
