@@ -58,6 +58,7 @@ minisign-verify = "0.2"
 pbkdf2 = "0.12.2"
 tempfile = "3"
 clap = { version = "4", features = ["derive", "wrap_help"] }
+url = "2"
 
 # Hoisted from per-crate declarations to ensure version consistency
 zbus = "5.14.0"

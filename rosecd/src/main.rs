@@ -1501,12 +1501,23 @@ async fn build_single_provider(
                 .to_string();
 
             // User-specified allowed_hosts override manifest defaults.
-            let allowed_hosts: Vec<String> = entry
-                .options
-                .get("allowed_hosts")
-                .and_then(|v| v.as_str())
+            let explicit_hosts = entry.options.get("allowed_hosts").and_then(|v| v.as_str());
+            let mut allowed_hosts: Vec<String> = explicit_hosts
                 .map(|s| s.split(',').map(|h| h.trim().to_string()).collect())
                 .unwrap_or_else(|| discovered.manifest.default_allowed_hosts.clone());
+
+            // When using defaults (no explicit allowed_hosts), auto-derive
+            // hostnames from URL-valued options so self-hosted servers work
+            // without requiring a manual allowed_hosts override.
+            if explicit_hosts.is_none() {
+                let derived: Vec<String> = ["base_url", "api_url", "identity_url"]
+                    .iter()
+                    .filter_map(|k| entry.options.get(*k).and_then(|v| v.as_str()))
+                    .filter_map(extract_host_from_url)
+                    .filter(|h| !allowed_hosts.contains(h))
+                    .collect();
+                allowed_hosts.extend(derived);
+            }
 
             // Forward all options except host-consumed ones to the guest.
             let mut guest_options: std::collections::HashMap<String, serde_json::Value> = entry
@@ -1544,6 +1555,13 @@ async fn build_single_provider(
         }
         other => anyhow::bail!("unknown provider kind '{other}'"),
     }
+}
+
+/// Extract the hostname from a URL string.  Returns `None` for malformed input.
+fn extract_host_from_url(url_str: &str) -> Option<String> {
+    url::Url::parse(url_str)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
 }
 
 /// Compute WASI filesystem paths to pre-open for a plugin.
@@ -1800,4 +1818,30 @@ fn load_or_create_device_id() -> String {
         }
     }
     id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_host_from_base_url() {
+        assert_eq!(
+            extract_host_from_url("https://vault.example.com/identity"),
+            Some("vault.example.com".into()),
+        );
+    }
+
+    #[test]
+    fn extract_host_with_port_strips_port() {
+        assert_eq!(
+            extract_host_from_url("https://vault.lan:8443/api"),
+            Some("vault.lan".into()),
+        );
+    }
+
+    #[test]
+    fn extract_host_garbage_returns_none() {
+        assert_eq!(extract_host_from_url("not-a-url"), None);
+    }
 }
