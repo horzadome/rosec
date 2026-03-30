@@ -17,12 +17,15 @@
 //! 5. Drop of [`SshManager`] unmounts the FUSE filesystem and closes the agent
 //!    socket (both handled by their respective RAII wrappers).
 
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use rosec_core::Provider;
+use rosec_core::config::PromptConfig;
 use rosec_fuse::MountHandle;
+use rosec_ssh_agent::ConfirmCallback;
 use rosec_ssh_agent::keystore::{KeyStore, build_entry};
 use rosec_ssh_agent::session::SshAgent;
 use ssh_key::PrivateKey;
@@ -50,10 +53,13 @@ impl SshManager {
     /// The agent socket is placed at `$XDG_RUNTIME_DIR/rosec/agent.sock`;
     /// the FUSE mount at `$XDG_RUNTIME_DIR/rosec/ssh/`.
     ///
+    /// `confirm_cb` is called before signing with keys that have
+    /// `require_confirm = true` (from `custom.ssh_confirm` / `custom.ssh-confirm`).
+    ///
     /// Returns `None` and logs a warning if `XDG_RUNTIME_DIR` is unset or the
     /// FUSE mount / socket creation fails — the daemon continues without SSH
     /// agent support rather than aborting.
-    pub async fn start() -> Option<Self> {
+    pub async fn start(confirm_cb: ConfirmCallback) -> Option<Self> {
         let runtime_dir = match std::env::var("XDG_RUNTIME_DIR") {
             Ok(d) => PathBuf::from(d),
             Err(_) => {
@@ -91,7 +97,8 @@ impl SshManager {
 
         // Spawn the agent listener in the background.
         {
-            let agent = SshAgent::new(Arc::clone(&store), agent_sock.clone());
+            let agent =
+                SshAgent::new(Arc::clone(&store), agent_sock.clone()).with_confirm(confirm_cb);
             tokio::spawn(async move {
                 if let Err(e) = agent.listen().await {
                     warn!("SSH agent listener exited: {e}");
@@ -304,3 +311,128 @@ impl SshManager {
 }
 
 use std::time::SystemTime;
+
+// ---------------------------------------------------------------------------
+// SSH sign confirmation via rosec-prompt
+// ---------------------------------------------------------------------------
+
+/// Find the `rosec-prompt` binary next to the current executable or on PATH.
+fn resolve_prompt_binary() -> String {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join("rosec-prompt");
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "rosec-prompt".to_string()
+}
+
+/// Build a [`ConfirmCallback`] that spawns `rosec-prompt` in confirmation mode.
+///
+/// `get_config` is called at prompt time (not at construction) so it picks up
+/// hot-reloaded prompt config changes.
+///
+/// Fallback behaviour when no GUI/TTY is available: the sign is **allowed**
+/// with a warning log, matching the pre-confirmation headless behaviour.
+pub fn build_confirm_callback(
+    get_config: impl Fn() -> PromptConfig + Send + Sync + 'static,
+) -> ConfirmCallback {
+    Arc::new(move |fingerprint: String, item_name: String| {
+        let cfg = get_config();
+        Box::pin(async move {
+            // Resolve prompt binary and theme from the live config.
+            let program = match cfg.backend.as_str() {
+                "builtin" | "" => resolve_prompt_binary(),
+                custom => custom.to_string(),
+            };
+            let theme_json = serde_json::to_value(&cfg.theme).unwrap_or_default();
+
+            let has_display = std::env::var_os("WAYLAND_DISPLAY").is_some()
+                || std::env::var_os("DISPLAY").is_some();
+            let has_tty = std::path::Path::new("/dev/tty").exists();
+
+            if !has_display && !has_tty {
+                warn!(
+                    fingerprint = %fingerprint,
+                    item = %item_name,
+                    "no display or TTY available for sign confirmation, allowing"
+                );
+                return true;
+            }
+
+            let request_json = serde_json::json!({
+                "title": format!("SSH sign request"),
+                "message": format!("Allow key \u{201c}{item_name}\u{201d} ({fingerprint}) to sign?"),
+                "hint": "",
+                "provider": "",
+                "confirm_label": "Allow",
+                "cancel_label": "Deny",
+                "fields": [],
+                "confirm_mode": true,
+                "theme": theme_json,
+            });
+
+            let mut cmd = std::process::Command::new(&program);
+            // SAFETY: pre_exec runs after fork() in the child process.
+            // setsid() is async-signal-safe and has no preconditions.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            cmd.stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit());
+
+            if !has_display {
+                cmd.arg("--tty");
+            }
+
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        program = %program,
+                        error = %e,
+                        "failed to spawn rosec-prompt for sign confirmation, allowing"
+                    );
+                    return true;
+                }
+            };
+
+            // Send JSON on stdin then close it.
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write as _;
+                if let Err(e) = stdin.write_all(request_json.to_string().as_bytes()) {
+                    warn!("rosec-prompt stdin write error: {e}, allowing sign");
+                    return true;
+                }
+                // stdin dropped here → EOF sent to child
+            }
+
+            // We only care about the exit code — stdout is `{}` for
+            // confirm-mode dialogs.
+            match child.wait() {
+                Ok(status) => {
+                    if status.success() {
+                        true
+                    } else {
+                        info!(
+                            fingerprint = %fingerprint,
+                            item = %item_name,
+                            "sign confirmation denied (prompt cancelled)"
+                        );
+                        false
+                    }
+                }
+                Err(e) => {
+                    warn!("rosec-prompt wait error: {e}, allowing sign");
+                    true
+                }
+            }
+        })
+    })
+}

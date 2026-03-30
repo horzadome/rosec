@@ -4,7 +4,9 @@ A [`org.freedesktop.secrets`](https://specifications.freedesktop.org/secret-serv
 
 **Providers:** local encrypted vaults, Bitwarden Password Manager, Bitwarden Secrets Manager (more via WASM plugins)
 
-**SSH agent:** SSH keys stored in any provider are exposed via a built-in SSH agent and optional FUSE mount with auto-generated `~/.ssh/config` snippets.
+**SSH agent:** SSH keys stored in any provider are exposed via a built-in SSH agent and optional FUSE mount with auto-generated `~/.ssh/config` snippets. Per-key confirmation prompts supported.
+
+**XDG Desktop Portal:** Sandboxed apps (Flatpak, Snap) get per-application secrets via the `org.freedesktop.impl.portal.Secret` backend.
 
 **PAM unlock:** Log in once; your vaults unlock automatically.
 
@@ -54,9 +56,16 @@ rosec enable
 ```
 
 This writes:
-- `~/.config/systemd/user/rosecd.service`
-- `~/.local/share/dbus-1/services/org.freedesktop.secrets.service`
-- `~/.local/share/dbus-1/services/org.gnome.keyring.service`
+- `~/.config/systemd/user/rosecd.service` — systemd user service
+- `~/.config/systemd/user/rosecd.socket` — systemd socket activation
+- `~/.local/share/dbus-1/services/org.freedesktop.secrets.service` — D-Bus activation
+- `~/.local/share/dbus-1/services/org.freedesktop.impl.portal.desktop.rosec.service` — XDG portal D-Bus activation
+- `~/.local/share/xdg-desktop-portal/portals/rosec.portal` — portal descriptor
+
+With `--mask`, also writes:
+- `~/.local/share/dbus-1/services/org.gnome.keyring.service` — mask (Exec=/bin/false)
+- `~/.config/autostart/gnome-keyring-secrets.desktop` — disable autostart
+- `~/.config/autostart/gnome-keyring-ssh.desktop` — disable autostart
 
 ...then reloads the systemd user daemon and enables the service.  To undo:
 
@@ -140,7 +149,7 @@ rosec supports multiple providers simultaneously. Each is independently locked a
 | `local` | Local encrypted vault (AES-256, PBKDF2, key wrapping) | [docs/providers/local.md](docs/providers/local.md) |
 | `bitwarden` | Bitwarden Password Manager | [docs/providers/bitwarden.md](docs/providers/bitwarden.md) |
 | `bitwarden-sm` | Bitwarden Secrets Manager | [docs/providers/bitwarden-sm.md](docs/providers/bitwarden-sm.md) |
-| `gnome-keyring` | Read-only access to existing GNOME Keyring files | [docs/providers/gnome-keyring.md](docs/providers/gnome-keyring.md) |
+| `gnome-keyring` | Read-only access to existing GNOME Keyring files (WASM plugin) | [Migrating from GNOME Keyring](#migrating-from-gnome-keyring) |
 
 ### Managing providers
 
@@ -405,7 +414,23 @@ Tag items with a `custom.ssh_host` attribute to generate `~/.ssh/config` snippet
 Include /run/user/1000/rosec/ssh/config.d/*
 ```
 
+Set `custom.ssh_confirm = "true"` on a vault item to require interactive confirmation (GUI prompt or TTY) before that key is used for signing.
+
 See [docs/ssh-agent.md](docs/ssh-agent.md) for full details.
+
+---
+
+## XDG Desktop Portal
+
+rosec implements the `org.freedesktop.impl.portal.Secret` interface, which provides sandboxed applications (Flatpak, Snap) with stable per-application secrets. This is the same mechanism used by gnome-keyring, oo7-portal, and KWallet.
+
+When a sandboxed app calls `org.freedesktop.portal.Secret.RetrieveSecret()`:
+
+1. The portal daemon (`xdg-desktop-portal`) routes the request to rosec
+2. rosec looks up an existing secret for that `app_id`, or generates a new 64-byte random secret and stores it in the first write-capable provider
+3. The secret is written to the caller's file descriptor
+
+The portal descriptor and D-Bus activation file are installed automatically by `rosec enable`. However, you must also tell `xdg-desktop-portal` to route Secret requests to rosec — see the [FAQ](#sandboxed-flatpak-apps-cant-find-their-secrets-or-fail-to-authenticate) if sandboxed apps aren't picking up the portal.
 
 ---
 
@@ -509,6 +534,64 @@ Run `rosec provider auth <id> --force` and paste the new token when prompted.
 ```bash
 fusermount3 -uz "$XDG_RUNTIME_DIR/rosec/ssh"
 ```
+
+**Sandboxed (Flatpak) apps can't find their secrets or fail to authenticate**
+
+`rosec enable` installs the portal descriptor (`rosec.portal`) and D-Bus activation file, but `xdg-desktop-portal` also needs a routing entry in your portal configuration to know that rosec handles the Secret interface. Without this, sandboxed apps won't see `org.freedesktop.portal.Secret` as available and may fail to persist credentials, complete OAuth flows, or access their encrypted storage.
+
+Most desktop environment portal sets (Hyprland, GTK, KDE) don't implement Secret themselves, so the routing entry is required.
+
+**Fix — add a routing entry to your portal config:**
+
+*Hyprland:*
+
+```ini
+# ~/.config/xdg-desktop-portal/hyprland-portals.conf
+[preferred]
+default = hyprland;gtk
+org.freedesktop.impl.portal.Secret = rosec
+```
+
+*GNOME:*
+
+```ini
+# ~/.config/xdg-desktop-portal/portals.conf
+[preferred]
+default = gnome
+org.freedesktop.impl.portal.Secret = rosec
+```
+
+*KDE:*
+
+```ini
+# ~/.config/xdg-desktop-portal/portals.conf
+[preferred]
+default = kde
+org.freedesktop.impl.portal.Secret = rosec
+```
+
+*Sway:*
+
+```ini
+# ~/.config/xdg-desktop-portal/sway-portals.conf
+[preferred]
+default = wlr;gtk
+org.freedesktop.impl.portal.Secret = rosec
+```
+
+Then restart xdg-desktop-portal to pick up the change:
+
+```bash
+systemctl --user restart xdg-desktop-portal
+```
+
+Verify with:
+
+```bash
+busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop | grep -i secret
+```
+
+You should see `org.freedesktop.portal.Secret` in the output.
 
 **Chrome / Vivaldi / Chromium shows "Encrypted keystore changed or is now unavailable"**
 

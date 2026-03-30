@@ -9,7 +9,7 @@ When `rosecd` starts, it:
 1. Binds an SSH agent socket at `$XDG_RUNTIME_DIR/rosec/agent.sock`
 2. Mounts a FUSE filesystem at `$XDG_RUNTIME_DIR/rosec/ssh/`
 
-The FUSE filesystem is read-only and entirely in-memory.  Its contents update automatically when the vault is re-synced or a backend is locked/unlocked.  No private keys are ever written to disk.
+The FUSE filesystem is read-only and entirely in-memory.  Its contents update automatically when the vault is re-synced or a provider is locked/unlocked.  No private keys are ever written to disk.
 
 ## FUSE Filesystem Layout
 
@@ -194,26 +194,30 @@ By default, signing operations are silent (like standard `ssh-agent`).  To requi
 |---|---|
 | `ssh_confirm` (or `ssh-confirm`) | `true` |
 
-When this field is present, rosec will prompt for confirmation each time a signing request arrives for that key.
+When this field is present with the value `true`, rosec will launch `rosec-prompt` in confirmation mode each time a signing request arrives for that key.  The prompt shows the key fingerprint and vault item name, and the user must explicitly confirm or deny the operation.
 
-## Multi-Backend Support
+- **GUI mode** (Wayland/X11): a dialog appears with Confirm / Cancel buttons.
+- **TTY fallback**: the terminal shows the key details and asks `Allow / Deny [y/N]:`.
+- **Headless** (no display, no TTY): the sign operation is **allowed** with a warning logged.  This preserves functionality for automated / headless environments.
 
-The SSH agent is backend-agnostic.  Any `VaultBackend` implementation that returns vault items with discoverable SSH key material (native SSH key type, or PEM content in notes/fields) will have those keys automatically included.
+## Multi-Provider Support
 
-This means SSH keys from Bitwarden PM, Bitwarden SM, 1Password (future), Proton Pass (future), or any other backend are all surfaced through the same agent socket and FUSE filesystem without backend-specific configuration.
+The SSH agent is provider-agnostic.  Any `Provider` implementation that returns vault items with discoverable SSH key material (native SSH key type, or PEM content in notes/fields) will have those keys automatically included.
+
+This means SSH keys from Bitwarden PM, Bitwarden SM, 1Password (future), Proton Pass (future), or any other provider are all surfaced through the same agent socket and FUSE filesystem without provider-specific configuration.
 
 ## Security Notes
 
 - **Private keys are never written to disk.**  The FUSE filesystem exposes only public keys (`.pub` files).  Private key material lives exclusively in the agent's in-memory key store, which is zeroized on lock or process exit.
 - **The agent socket is owned by your user** and has mode `0600`.  No other user can connect to it.
-- **Locking the backend locks the agent.**  When a backend is locked (e.g. due to the autolock timer or `rosec backend lock`), its keys are immediately removed from the agent and from the FUSE filesystem.
+- **Locking the provider locks the agent.**  When a provider is locked (e.g. due to the autolock timer or `rosec provider lock`), its keys are immediately removed from the agent and from the FUSE filesystem.
 - **Encrypted PEM keys** (`BEGIN ENCRYPTED PRIVATE KEY`) are supported; the passphrase is prompted interactively the first time the key is loaded.
 
 ## Troubleshooting
 
 ### Keys not appearing
 
-1. Check that the backend is unlocked: `rosec backend list`
+1. Check that the provider is unlocked: `rosec provider list`
 2. Check that the FUSE mount is active: `ls "$XDG_RUNTIME_DIR/rosec/ssh/keys/by-name/"`
 3. For PEM keys, verify the PEM header is one of the recognised formats listed above
 

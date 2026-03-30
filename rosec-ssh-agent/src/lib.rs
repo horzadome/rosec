@@ -32,4 +32,4 @@ pub mod pem;
 pub mod session;
 
 pub use keystore::{KeyEntry, KeyStore};
-pub use session::SshAgent;
+pub use session::{ConfirmCallback, SshAgent};

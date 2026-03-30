@@ -18,6 +18,12 @@
 //! ```
 //! `fields` is optional — if absent a single hidden `password` field is implied.
 //!
+//! ## Confirmation mode
+//!
+//! Set `"confirm_mode": true` for a zero-field confirmation dialog.  The prompt
+//! shows only the title, message, and confirm / cancel buttons — no input fields.
+//! Stdout is `{}` on confirmation.
+//!
 //! **stdout**: a single JSON object mapping field IDs to values:
 //! ```json
 //! {"password": "hunter2"}
@@ -90,17 +96,28 @@ struct PromptRequest {
     /// Label for the cancel button. Defaults to "Cancel".
     #[serde(default)]
     cancel_label: String,
-    /// Field list.  When absent a single hidden `password` field is implied.
+    /// Field list.  When absent a single hidden `password` field is implied
+    /// (unless `confirm_mode` is set).
     #[serde(default)]
     fields: Vec<FieldSpec>,
+    /// When `true`, this is a zero-field confirmation dialog: the prompt
+    /// shows only title + message + confirm/cancel buttons (no input fields).
+    /// Exit code 0 = confirmed, 1 = cancelled.  Stdout is `{}`.
+    #[serde(default)]
+    confirm_mode: bool,
     #[serde(default)]
     theme: ThemeConfig,
 }
 
 impl PromptRequest {
     /// Return the effective field list, inserting the default if none were given.
+    ///
+    /// In `confirm_mode`, fields are always empty — the dialog is purely
+    /// confirm / cancel with no input collection.
     fn effective_fields(&self) -> Vec<FieldSpec> {
-        if self.fields.is_empty() {
+        if self.confirm_mode {
+            Vec::new()
+        } else if self.fields.is_empty() {
             vec![FieldSpec {
                 id: "password".to_string(),
                 label: "Password".to_string(),
@@ -232,6 +249,7 @@ fn main() -> Result<()> {
             confirm_label: String::new(),
             cancel_label: String::new(),
             fields: Vec::new(),
+            confirm_mode: false,
             theme: ThemeConfig::default(),
         }
     } else {
@@ -260,6 +278,9 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Collect credentials from a TTY using rpassword (hidden) or plain readline (text).
+///
+/// In confirm mode (zero fields), prints the title/message and asks for y/N
+/// confirmation.  Exit 0 = confirmed, exit 1 = cancelled.
 fn run_tty(request: PromptRequest) -> Result<()> {
     let fields = request.effective_fields();
 
@@ -273,6 +294,31 @@ fn run_tty(request: PromptRequest) -> Result<()> {
         eprintln!("({})", request.hint);
     }
     eprintln!();
+
+    // Confirm-only mode: no fields to collect.
+    if fields.is_empty() {
+        let confirm_label = if request.confirm_label.is_empty() {
+            "OK"
+        } else {
+            &request.confirm_label
+        };
+        let cancel_label = if request.cancel_label.is_empty() {
+            "Cancel"
+        } else {
+            &request.cancel_label
+        };
+        eprint!("{confirm_label} / {cancel_label} [y/N]: ");
+        let mut buf = String::new();
+        io::stdin()
+            .read_line(&mut buf)
+            .map_err(|e| anyhow::anyhow!("failed to read confirmation: {e}"))?;
+        let answer = buf.trim().to_lowercase();
+        if answer == "y" || answer == "yes" {
+            println!("{{}}");
+            return Ok(());
+        }
+        std::process::exit(1);
+    }
 
     let mut values: HashMap<String, Zeroizing<String>> = HashMap::new();
 
@@ -414,9 +460,14 @@ fn run_gui(request: PromptRequest) -> Result<()> {
             ..Default::default()
         })
         .run_with(|| {
+            let has_fields = !fields.is_empty();
             let state = GuiApp::from_request(request, fields);
-            // Focus the first text input on startup.
-            let task = iced::widget::text_input::focus(FIRST_FIELD_ID.clone());
+            // Focus the first text input on startup (no-op when there are no fields).
+            let task = if has_fields {
+                iced::widget::text_input::focus(FIRST_FIELD_ID.clone())
+            } else {
+                iced::Task::none()
+            };
             (state, task)
         })?;
     Ok(())

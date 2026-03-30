@@ -150,7 +150,11 @@ async fn run() -> Result<()> {
     // Start the SSH agent and FUSE filesystem.  Returns None if XDG_RUNTIME_DIR
     // is unset or FUSE is unavailable — the daemon continues without SSH
     // agent support.
-    let ssh_manager: Option<Arc<ssh::SshManager>> = ssh::SshManager::start().await.map(Arc::new);
+    let ssh_manager: Option<Arc<ssh::SshManager>> = {
+        let state_for_ssh = Arc::clone(&state);
+        let confirm_cb = ssh::build_confirm_callback(move || state_for_ssh.prompt_config());
+        ssh::SshManager::start(confirm_cb).await.map(Arc::new)
+    };
 
     if let Some(ref sm) = ssh_manager {
         tracing::info!(sock = %sm.agent_sock().display(), "SSH agent ready");
