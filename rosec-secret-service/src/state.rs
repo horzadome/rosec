@@ -338,6 +338,17 @@ impl ServiceState {
             .unwrap_or_default()
     }
 
+    /// Return a snapshot of the current prompt configuration.
+    ///
+    /// Used by the SSH agent to resolve the `rosec-prompt` binary and theme
+    /// for per-key signing confirmation dialogs.
+    pub fn prompt_config(&self) -> PromptConfig {
+        self.prompt_config
+            .read()
+            .map(|c| c.clone())
+            .unwrap_or_default()
+    }
+
     /// Return the `return_attr` patterns for a given provider ID.
     ///
     /// Returns the configured patterns if present, otherwise the default list.
@@ -456,6 +467,14 @@ impl ServiceState {
             .unwrap_or_else(|e| e.into_inner())
             .get(id)
             .map(Arc::clone)
+    }
+
+    /// Return a snapshot of the current provider ordering (config-driven).
+    pub fn provider_order_snapshot(&self) -> Vec<String> {
+        self.provider_order
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Return the provider to use for write operations.
@@ -1630,6 +1649,29 @@ impl ServiceState {
         Ok((unlocked, locked))
     }
 
+    /// Search the persistent metadata cache, returning full `ItemMeta` entries.
+    ///
+    /// Like [`search_metadata_cache`] but returns `(path, ItemMeta)` pairs so
+    /// callers can inspect `provider_id`, `attributes`, etc. for ranking.
+    pub fn search_metadata_cache_entries(
+        &self,
+        attrs: &HashMap<String, String>,
+    ) -> Result<Vec<(String, ItemMeta)>, FdoError> {
+        let cache = self.metadata_cache.lock().map_err(|_| {
+            map_provider_error(ProviderError::Unavailable(
+                "metadata_cache lock poisoned".to_string(),
+            ))
+        })?;
+
+        let mut results = Vec::new();
+        for (path, meta) in cache.iter() {
+            if attributes_match(&meta.attributes, attrs) {
+                results.push((path.clone(), meta.clone()));
+            }
+        }
+        Ok(results)
+    }
+
     /// Search the persistent metadata cache using glob patterns.
     ///
     /// Like `search_items_glob` but reads from `metadata_cache` (which survives
@@ -2423,6 +2465,21 @@ fn hash_id(input: &str) -> u64 {
             .try_into()
             .unwrap_or_else(|_| unreachable!("SHA-256 output is always 32 bytes")),
     )
+}
+
+// ── Test-only helpers ────────────────────────────────────────────────────────
+#[cfg(test)]
+impl ServiceState {
+    /// Insert an entry directly into the metadata cache (test helper).
+    ///
+    /// Used to simulate items from providers that are currently locked
+    /// (whose cache entries persisted from a prior unlock cycle).
+    pub fn seed_metadata_cache(&self, path: &str, meta: ItemMeta) {
+        self.metadata_cache
+            .lock()
+            .unwrap()
+            .insert(path.to_string(), meta);
+    }
 }
 
 #[cfg(test)]

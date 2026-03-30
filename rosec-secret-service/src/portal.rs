@@ -18,7 +18,7 @@ use zbus::message::Header;
 use zeroize::Zeroizing;
 use zvariant::{ObjectPath, OwnedValue};
 
-use rosec_core::{ItemType, NewItem, SecretBytes};
+use rosec_core::{ItemType, NewItem, ProviderError, SecretBytes};
 
 use crate::state::{ServiceState, map_provider_error};
 
@@ -36,6 +36,7 @@ const PORTAL_ATTR_SCHEMA: &str = "xdg:schema";
 const SECRET_SIZE: usize = 64;
 
 /// Result of looking up an existing portal secret.
+#[derive(Debug)]
 enum PortalLookup {
     /// Secret found and readable.
     Found(Zeroizing<Vec<u8>>),
@@ -122,46 +123,131 @@ impl PortalSecret {
 }
 
 impl PortalSecret {
+    /// Secret attribute names to try when retrieving a portal secret.
+    ///
+    /// rosec stores portal secrets under `"secret"`.  gnome-keyring items
+    /// expose their single secret as `"password"` (and `"secret"` as alias).
+    /// Try both so we can retrieve portal secrets originally stored by
+    /// gnome-keyring-daemon or oo7-portal.
+    const SECRET_ATTRS: &[&str] = &["secret", "password"];
+
     /// Search for an existing portal secret item matching `app_id`.
+    ///
+    /// Compatibility: both gnome-keyring-daemon and oo7-portal search by
+    /// `app_id` alone — gnome-keyring-daemon stores `xdg:schema` on creation
+    /// but oo7-portal does not.  We search by `app_id` only and use
+    /// `xdg:schema` presence as a ranking signal.
+    ///
+    /// Candidates are ranked by:
+    /// 1. Provider order (config-driven priority — lower index wins)
+    /// 2. Within same provider, prefer items with `xdg:schema` set
     ///
     /// Uses the metadata cache (survives lock/unlock cycles) so we never
     /// accidentally regenerate a secret just because the vault was locked
     /// between the store and the next lookup.
     async fn find_portal_secret(&self, app_id: &str) -> Result<Option<PortalLookup>, FdoError> {
+        // Search by app_id alone for compatibility with all portal backends.
         let mut search_attrs = HashMap::new();
         search_attrs.insert(PORTAL_ATTR_APP_ID.to_string(), app_id.to_string());
-        search_attrs.insert(PORTAL_ATTR_SCHEMA.to_string(), PORTAL_SCHEMA.to_string());
 
-        let (unlocked, locked) = self.state.search_metadata_cache(&search_attrs)?;
+        let mut entries = self.state.search_metadata_cache_entries(&search_attrs)?;
 
-        // If the secret exists but its provider is locked, signal that to the
-        // caller so it can return response code 2 rather than generating a new
-        // (conflicting) secret.
-        if let Some(path) = locked.first() {
+        if entries.is_empty() {
+            return Ok(None);
+        }
+
+        // Build a provider-id → priority index map from the config ordering.
+        let order = self.state.provider_order_snapshot();
+        let priority: HashMap<&str, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
+
+        // Rank candidates: (provider priority, !has_schema) — lower is better.
+        entries.sort_by(|(_, a), (_, b)| {
+            let pri_a = priority
+                .get(a.provider_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX);
+            let pri_b = priority
+                .get(b.provider_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX);
+            let schema_a = a
+                .attributes
+                .get(PORTAL_ATTR_SCHEMA)
+                .map(|v| v == PORTAL_SCHEMA)
+                .unwrap_or(false);
+            let schema_b = b
+                .attributes
+                .get(PORTAL_ATTR_SCHEMA)
+                .map(|v| v == PORTAL_SCHEMA)
+                .unwrap_or(false);
+            pri_a.cmp(&pri_b).then_with(|| schema_b.cmp(&schema_a))
+        });
+
+        // If any candidate is locked, report it so the caller does not
+        // generate a replacement that would silently overwrite the real secret.
+        if let Some((path, _)) = entries.iter().find(|(_, m)| m.locked) {
             tracing::debug!(app_id, path, "portal: secret exists but provider is locked");
             return Ok(Some(PortalLookup::Locked));
         }
 
-        let path = match unlocked.first() {
-            Some(p) => p.clone(),
-            None => return Ok(None),
-        };
+        // Try each candidate in rank order until one yields a readable secret.
+        for (path, meta) in &entries {
+            let Ok((provider, item_id)) = self.state.provider_and_id_for_path(path) else {
+                continue;
+            };
 
-        let (provider, item_id) = self.state.provider_and_id_for_path(&path)?;
+            for attr in Self::SECRET_ATTRS {
+                let result = self
+                    .state
+                    .run_on_tokio({
+                        let provider = Arc::clone(&provider);
+                        let item_id = item_id.clone();
+                        let attr = *attr;
+                        async move { provider.get_secret_attr(&item_id, attr).await }
+                    })
+                    .await;
 
-        let secret = self
-            .state
-            .run_on_tokio({
-                let provider = Arc::clone(&provider);
-                let item_id = item_id.to_string();
-                async move { provider.get_secret_attr(&item_id, "secret").await }
-            })
-            .await?
-            .map_err(map_provider_error)?;
+                match result {
+                    Ok(Ok(secret)) => {
+                        tracing::debug!(
+                            app_id,
+                            provider_id = meta.provider_id,
+                            attr,
+                            "portal: returning existing secret"
+                        );
+                        return Ok(Some(PortalLookup::Found(Zeroizing::new(
+                            secret.as_slice().to_vec(),
+                        ))));
+                    }
+                    Ok(Err(ProviderError::NotFound)) => continue,
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            app_id,
+                            provider_id = meta.provider_id,
+                            attr,
+                            error = %e,
+                            "portal: failed to retrieve secret, trying next candidate"
+                        );
+                        break; // skip remaining attrs for this item, try next candidate
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            app_id,
+                            provider_id = meta.provider_id,
+                            error = %e,
+                            "portal: tokio task failed, trying next candidate"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
 
-        Ok(Some(PortalLookup::Found(Zeroizing::new(
-            secret.as_slice().to_vec(),
-        ))))
+        Ok(None)
     }
 
     /// Generate a new 64-byte random secret and store it as an item.
@@ -524,5 +610,365 @@ mod tests {
         let mut fds = [0i32; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         (fds[0], fds[1])
+    }
+
+    // ── Additional mocks for compat tests ──────────────────────────────────────
+
+    /// Mock provider that exposes secrets only via the `"password"` attribute,
+    /// simulating gnome-keyring's single-secret-per-item model.
+    #[derive(Debug)]
+    struct PasswordOnlyMock {
+        id: String,
+        items: Vec<ItemMeta>,
+        /// Maps item_id → raw secret bytes.
+        secrets: HashMap<String, Vec<u8>>,
+        locked: bool,
+    }
+
+    impl PasswordOnlyMock {
+        fn new(id: &str, items: Vec<ItemMeta>, secrets: HashMap<String, Vec<u8>>) -> Self {
+            Self {
+                id: id.to_string(),
+                items,
+                secrets,
+                locked: false,
+            }
+        }
+
+        fn new_locked(id: &str, items: Vec<ItemMeta>) -> Self {
+            Self {
+                id: id.to_string(),
+                items,
+                secrets: HashMap::new(),
+                locked: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rosec_core::Provider for PasswordOnlyMock {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "Password-Only Mock"
+        }
+        fn kind(&self) -> &str {
+            "gnome-keyring"
+        }
+        fn capabilities(&self) -> &'static [Capability] {
+            &[]
+        }
+
+        async fn status(&self) -> Result<ProviderStatus, ProviderError> {
+            Ok(ProviderStatus {
+                locked: self.locked,
+                last_sync: None,
+                cached: false,
+                offline_cache: false,
+                last_cache_write: None,
+            })
+        }
+
+        async fn unlock(&self, _input: UnlockInput) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn lock(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        async fn list_items(&self) -> Result<Vec<ItemMeta>, ProviderError> {
+            if self.locked {
+                return Err(ProviderError::Locked);
+            }
+            Ok(self.items.clone())
+        }
+
+        async fn search(&self, attrs: &Attributes) -> Result<Vec<ItemMeta>, ProviderError> {
+            Ok(self
+                .items
+                .iter()
+                .filter(|item| attrs.iter().all(|(k, v)| item.attributes.get(k) == Some(v)))
+                .cloned()
+                .collect())
+        }
+
+        async fn get_item_attributes(
+            &self,
+            _id: &str,
+        ) -> Result<rosec_core::ItemAttributes, ProviderError> {
+            Ok(rosec_core::ItemAttributes {
+                public: Attributes::new(),
+                secret_names: vec!["password".to_string(), "secret".to_string()],
+            })
+        }
+
+        async fn get_secret_attr(
+            &self,
+            id: &str,
+            attr: &str,
+        ) -> Result<SecretBytes, ProviderError> {
+            // Only respond to "password" or "secret" — like the real gnome-keyring provider.
+            if attr != "password" && attr != "secret" {
+                return Err(ProviderError::NotFound);
+            }
+            self.secrets
+                .get(id)
+                .map(|v| SecretBytes::new(v.clone()))
+                .ok_or(ProviderError::NotFound)
+        }
+    }
+
+    /// Helper to create a ServiceState with multiple providers in a specific order.
+    async fn portal_state_multi(
+        providers: Vec<Arc<dyn rosec_core::Provider>>,
+    ) -> Arc<ServiceState> {
+        let router = Arc::new(Router::new(RouterConfig {
+            dedup_strategy: DedupStrategy::Priority,
+            dedup_time_fallback: DedupTimeFallback::Created,
+        }));
+        let sessions = Arc::new(SessionManager::new());
+        let conn = Connection::session()
+            .await
+            .expect("session bus required for tests");
+        Arc::new(ServiceState::new(
+            providers,
+            router,
+            sessions,
+            conn,
+            tokio::runtime::Handle::current(),
+        ))
+    }
+
+    // ── Compat tests ───────────────────────────────────────────────────────────
+
+    /// oo7-portal stores portal secrets with `app_id` only — no `xdg:schema`.
+    /// Verify find_portal_secret still discovers them.
+    #[tokio::test]
+    async fn find_discovers_oo7_portal_secret_without_schema() {
+        let secret_bytes = vec![0xAA; SECRET_SIZE];
+        let mut attrs = HashMap::new();
+        attrs.insert("app_id".to_string(), "com.test.Oo7App".to_string());
+        // Deliberately NO xdg:schema — this is how oo7-portal stores secrets.
+
+        let item = ItemMeta {
+            id: "oo7-item-1".to_string(),
+            provider_id: "gk-mock".to_string(),
+            label: "Secret Portal token for com.test.Oo7App".to_string(),
+            attributes: attrs,
+            created: None,
+            modified: None,
+            locked: false,
+        };
+
+        let mut secrets = HashMap::new();
+        secrets.insert("oo7-item-1".to_string(), secret_bytes.clone());
+
+        let mock = Arc::new(PasswordOnlyMock::new("gk-mock", vec![item], secrets));
+        let state = portal_state_multi(vec![mock as Arc<dyn rosec_core::Provider>]).await;
+        state
+            .resolve_items(Some(HashMap::new()), None)
+            .await
+            .expect("cache");
+
+        let portal = PortalSecret::new(state);
+        let found = portal
+            .find_portal_secret("com.test.Oo7App")
+            .await
+            .expect("find should not error");
+
+        match found {
+            Some(PortalLookup::Found(bytes)) => {
+                assert_eq!(bytes.as_slice(), &secret_bytes);
+            }
+            Some(PortalLookup::Locked) => panic!("expected Found, got Locked"),
+            None => panic!("expected Found, got None — schema-less portal secret not discovered"),
+        }
+    }
+
+    /// gnome-keyring-daemon stores portal secrets with xdg:schema +
+    /// the item's secret as "password".  Verify we find and retrieve it.
+    #[tokio::test]
+    async fn find_discovers_gnome_keyring_daemon_portal_secret() {
+        let secret_bytes = vec![0xBB; SECRET_SIZE];
+        let mut attrs = HashMap::new();
+        attrs.insert("app_id".to_string(), "com.test.GkApp".to_string());
+        attrs.insert(
+            "xdg:schema".to_string(),
+            "org.freedesktop.portal.Secret".to_string(),
+        );
+
+        let item = ItemMeta {
+            id: "gk-item-1".to_string(),
+            provider_id: "gk-mock".to_string(),
+            label: "Application key for com.test.GkApp".to_string(),
+            attributes: attrs,
+            created: None,
+            modified: None,
+            locked: false,
+        };
+
+        let mut secrets = HashMap::new();
+        secrets.insert("gk-item-1".to_string(), secret_bytes.clone());
+
+        let mock = Arc::new(PasswordOnlyMock::new("gk-mock", vec![item], secrets));
+        let state = portal_state_multi(vec![mock as Arc<dyn rosec_core::Provider>]).await;
+        state
+            .resolve_items(Some(HashMap::new()), None)
+            .await
+            .expect("cache");
+
+        let portal = PortalSecret::new(state);
+        let found = portal
+            .find_portal_secret("com.test.GkApp")
+            .await
+            .expect("find should not error");
+
+        match found {
+            Some(PortalLookup::Found(bytes)) => {
+                assert_eq!(bytes.as_slice(), &secret_bytes);
+            }
+            Some(PortalLookup::Locked) => panic!("expected Found, got Locked"),
+            None => panic!("expected Found, got None"),
+        }
+    }
+
+    /// When multiple providers have a portal secret for the same app_id,
+    /// the provider listed first in the config (lower index) wins.
+    #[tokio::test]
+    async fn find_prefers_higher_priority_provider() {
+        let secret_hi = vec![0x11; SECRET_SIZE];
+        let secret_lo = vec![0x22; SECRET_SIZE];
+        let app_id = "com.test.DupApp";
+
+        // High-priority provider (index 0).
+        let mut attrs_hi = HashMap::new();
+        attrs_hi.insert("app_id".to_string(), app_id.to_string());
+        let item_hi = ItemMeta {
+            id: "hi-item".to_string(),
+            provider_id: "hi-priority".to_string(),
+            label: format!("Portal secret for {app_id}"),
+            attributes: attrs_hi,
+            created: None,
+            modified: None,
+            locked: false,
+        };
+        let mut secrets_hi = HashMap::new();
+        secrets_hi.insert("hi-item".to_string(), secret_hi.clone());
+        let mock_hi = Arc::new(PasswordOnlyMock::new(
+            "hi-priority",
+            vec![item_hi],
+            secrets_hi,
+        ));
+
+        // Low-priority provider (index 1).
+        let mut attrs_lo = HashMap::new();
+        attrs_lo.insert("app_id".to_string(), app_id.to_string());
+        let item_lo = ItemMeta {
+            id: "lo-item".to_string(),
+            provider_id: "lo-priority".to_string(),
+            label: format!("Portal secret for {app_id}"),
+            attributes: attrs_lo,
+            created: None,
+            modified: None,
+            locked: false,
+        };
+        let mut secrets_lo = HashMap::new();
+        secrets_lo.insert("lo-item".to_string(), secret_lo.clone());
+        let mock_lo = Arc::new(PasswordOnlyMock::new(
+            "lo-priority",
+            vec![item_lo],
+            secrets_lo,
+        ));
+
+        // hi-priority is first in the providers list → higher priority.
+        let state = portal_state_multi(vec![
+            mock_hi as Arc<dyn rosec_core::Provider>,
+            mock_lo as Arc<dyn rosec_core::Provider>,
+        ])
+        .await;
+        state
+            .resolve_items(Some(HashMap::new()), None)
+            .await
+            .expect("cache");
+
+        let portal = PortalSecret::new(state);
+        let found = portal
+            .find_portal_secret(app_id)
+            .await
+            .expect("find should not error");
+
+        match found {
+            Some(PortalLookup::Found(bytes)) => {
+                assert_eq!(
+                    bytes.as_slice(),
+                    &secret_hi,
+                    "should return secret from higher-priority provider"
+                );
+            }
+            other => panic!("expected Found with hi-priority secret, got {other:?}"),
+        }
+    }
+
+    /// If a portal secret exists but its provider is locked, return Locked
+    /// rather than generating a conflicting replacement.
+    #[tokio::test]
+    async fn find_returns_locked_when_provider_locked() {
+        let mut attrs = HashMap::new();
+        attrs.insert("app_id".to_string(), "com.test.LockedApp".to_string());
+        attrs.insert(
+            "xdg:schema".to_string(),
+            "org.freedesktop.portal.Secret".to_string(),
+        );
+
+        let item = ItemMeta {
+            id: "locked-item".to_string(),
+            provider_id: "locked-mock".to_string(),
+            label: "Portal secret for com.test.LockedApp".to_string(),
+            attributes: attrs,
+            created: None,
+            modified: None,
+            locked: true, // item reports as locked in cache
+        };
+
+        let mock = Arc::new(PasswordOnlyMock::new_locked("locked-mock", vec![item]));
+        let state = portal_state_multi(vec![mock as Arc<dyn rosec_core::Provider>]).await;
+
+        // Manually seed the metadata cache since the locked provider's
+        // list_items returns Err.  In production the cache persists from a
+        // prior unlock cycle.
+        {
+            let mut attrs_locked = HashMap::new();
+            attrs_locked.insert("app_id".to_string(), "com.test.LockedApp".to_string());
+            attrs_locked.insert(
+                "xdg:schema".to_string(),
+                "org.freedesktop.portal.Secret".to_string(),
+            );
+            let meta = ItemMeta {
+                id: "locked-item".to_string(),
+                provider_id: "locked-mock".to_string(),
+                label: "Portal secret for com.test.LockedApp".to_string(),
+                attributes: attrs_locked,
+                created: None,
+                modified: None,
+                locked: true,
+            };
+            state.seed_metadata_cache(
+                "/org/freedesktop/secrets/collection/default/locked_mock_locked_item",
+                meta,
+            );
+        }
+
+        let portal = PortalSecret::new(state);
+        let found = portal
+            .find_portal_secret("com.test.LockedApp")
+            .await
+            .expect("find should not error");
+
+        match found {
+            Some(PortalLookup::Locked) => {} // expected
+            Some(PortalLookup::Found(_)) => panic!("expected Locked, got Found"),
+            None => panic!("expected Locked, got None"),
+        }
     }
 }

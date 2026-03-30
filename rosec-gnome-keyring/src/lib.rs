@@ -553,8 +553,10 @@ pub fn get_item_attributes(
         error: None,
         error_kind: None,
         public,
-        // The only secret is `password` — the raw keyring item secret.
-        secret_names: vec!["password".into()],
+        // The single secret is the raw keyring item secret, accessible as
+        // either "password" (canonical) or "secret" (alias — used by the
+        // portal and generic item lookups).
+        secret_names: vec!["password".into(), "secret".into()],
     }))
 }
 
@@ -604,7 +606,10 @@ pub fn get_secret_attr(Json(req): Json<SecretAttrRequest>) -> FnResult<Json<Secr
         }));
     };
 
-    if req.attr != "password" {
+    // gnome-keyring items have a single secret.  Accept both "password"
+    // (canonical name) and "secret" (alias used by the portal layer and
+    // generic item lookups) — they return the same underlying data.
+    if req.attr != "password" && req.attr != "secret" {
         return Ok(Json(SecretAttrResponse {
             ok: false,
             error: Some(format!("unknown secret attribute: {}", req.attr)),
