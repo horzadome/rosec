@@ -1663,15 +1663,12 @@ pub fn readiness_probes(_input: ()) -> FnResult<Json<ReadinessProbesResponse>> {
         return Ok(Json(ReadinessProbesResponse { probes: vec![] }));
     };
 
-    // Probe the identity server's OIDC discovery endpoint.
-    // Bitwarden identity servers (cloud and self-hosted) respond with
-    // 200 to GET on /.well-known/openid-configuration.  HEAD returns
-    // 405 on Bitwarden cloud, so we use GET.  The response is small
-    // (~1 KB JSON) and is not parsed — we only check the status code.
-    let probe_url = format!(
-        "{}/.well-known/openid-configuration",
-        state.config.urls.identity_url
-    );
+    // Probe the API server's /alive health-check endpoint.
+    // Both Bitwarden cloud and Vaultwarden return 200 with a small
+    // timestamp body.  The previous OIDC discovery endpoint
+    // (identity /.well-known/openid-configuration) returns 422 on
+    // Vaultwarden, making it unsuitable as a universal probe.
+    let probe_url = format!("{}/alive", state.config.urls.api_url);
 
     Ok(Json(ReadinessProbesResponse {
         probes: vec![ReadinessProbe::Http {
