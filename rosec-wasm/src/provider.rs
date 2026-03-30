@@ -834,27 +834,34 @@ impl Provider for WasmProvider {
         // offline unlock instead of propagating the error immediately.
         // Use quick mode for cache-capable providers — no point waiting
         // ~100 s on exponential backoff when we will fall back to cache.
-        let readiness_ok = match self.wait_for_readiness(has_offline_cache).await {
-            Ok(()) => true,
+        let readiness_err = match self.wait_for_readiness(has_offline_cache).await {
+            Ok(()) => None,
             Err(e) => {
                 if has_offline_cache {
                     info!(
                         provider = %self.config.id,
                         "readiness probes failed, attempting offline cache fallback: {e}"
                     );
-                    false
+                    Some(e)
                 } else {
                     return Err(e);
                 }
             }
         };
 
-        if !readiness_ok {
+        if let Some(probe_err) = readiness_err {
             // Offline unlock path — derive the cache key now so we can
             // decrypt the cache file.  The key is only stored on success
             // (unlock_from_cache will read it from self.cache_key).
             self.derive_and_store_cache_key(password_ref.as_str());
-            return self.unlock_from_cache().await;
+            return self.unlock_from_cache().await.map_err(|cache_err| {
+                // Surface both the original probe failure and the cache
+                // failure so the user gets actionable diagnostic context.
+                ProviderError::Unavailable(format!(
+                    "readiness probe failed: {probe_err}; \
+                     offline cache also unavailable: {cache_err}"
+                ))
+            });
         }
 
         // ── Online unlock path ──────────────────────────────────────
