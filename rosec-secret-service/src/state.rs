@@ -2355,12 +2355,23 @@ pub(crate) fn map_provider_error(err: ProviderError) -> FdoError {
         ProviderError::AlreadyExists => FdoError::Failed("already exists".to_string()),
         // Invalid input (validation failed).
         ProviderError::InvalidInput(reason) => FdoError::Failed(reason.to_string()),
-        // Other/internal errors: log the full chain server-side, return an
-        // opaque message to the D-Bus caller to avoid leaking internal detail
-        // (cipher UUIDs, server HTTP bodies, file paths, etc.).
+        // Other/internal errors: log the full chain server-side.  Extract a
+        // user-facing hint for common failure classes (TLS, DNS, connection)
+        // while keeping internal details (cipher UUIDs, HTTP bodies, paths)
+        // off the D-Bus wire.
         ProviderError::Other(err) => {
             warn!(error = %err, "internal provider error");
-            FdoError::Failed("provider error".to_string())
+            let msg = err.to_string();
+            let hint = if msg.contains("invalid peer certificate") || msg.contains("certificate") {
+                "provider error: TLS certificate rejected — see journal for details"
+            } else if msg.contains("dns") || msg.contains("resolve") {
+                "provider error: DNS resolution failed — see journal for details"
+            } else if msg.contains("connection refused") || msg.contains("Connection refused") {
+                "provider error: connection refused — see journal for details"
+            } else {
+                "provider error — see journal for details"
+            };
+            FdoError::Failed(hint.to_string())
         }
     }
 }
