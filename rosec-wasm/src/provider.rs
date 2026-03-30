@@ -1507,8 +1507,16 @@ pub(crate) fn evaluate_probe(
 
             // Build agent with redirects disabled to prevent SSRF via
             // an allowed host that 302-redirects to internal endpoints.
+            // TLS verification is disabled because this is a connectivity
+            // check, not a trust boundary — self-hosted servers often use
+            // self-signed certs or internal CAs.
             let agent = ureq::Agent::config_builder()
                 .max_redirects(0)
+                .tls_config(
+                    ureq::tls::TlsConfig::builder()
+                        .disable_verification(true)
+                        .build(),
+                )
                 .build()
                 .new_agent();
             let req = ureq::http::request::Builder::new()
