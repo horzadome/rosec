@@ -3291,18 +3291,12 @@ async fn cmd_unlock() -> Result<()> {
     type ResultEntry = (String, bool, String); // (provider_id, success, message)
     let results: Vec<ResultEntry> = proxy.call("UnlockWithTty", &(tty_fd,)).await?;
 
-    for (id, success, message) in &results {
+    for (id, success, _message) in &results {
         if *success {
             println!("'{id}' unlocked.");
-        } else {
-            let display_msg = match message.as_str() {
-                "auth_failed" => "wrong password (skipped)",
-                "offline, no cache" => "offline, no cached data available",
-                "provider error" => "provider error (skipped)",
-                other => other,
-            };
-            eprintln!("'{id}': {display_msg}");
         }
+        // Failures are already printed inline on the TTY by the daemon
+        // as each provider is attempted — no need to repeat them here.
     }
 
     Ok(())
