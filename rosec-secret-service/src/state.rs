@@ -908,6 +908,7 @@ impl ServiceState {
         prompt_path: &str,
         provider_id: &str,
         label: &str,
+        caller: Option<CallerInfo>,
     ) -> Result<Zeroizing<String>, FdoError> {
         use std::io::BufRead as _;
         use std::process::Stdio;
@@ -990,7 +991,7 @@ impl ServiceState {
         // ── 2 & 3. GUI or TTY via rosec-prompt ────────────────────────────
         if has_display || has_tty {
             // Build the JSON request that rosec-prompt expects.
-            let json = build_prompt_json(provider_id_str, label, &prompt_cfg);
+            let json = build_prompt_json(provider_id_str, label, &prompt_cfg, caller);
 
             tracing::debug!(
                 %program, has_display, has_tty,
@@ -2242,6 +2243,20 @@ impl ServiceState {
 // Prompt helpers (module-private)
 // ---------------------------------------------------------------------------
 
+/// Information about the D-Bus caller that triggered a prompt.
+///
+/// Resolved from the caller's unique bus name via the D-Bus daemon's
+/// `GetConnectionUnixProcessID` and `/proc/<pid>/comm` + `/proc/<pid>/exe`.
+#[derive(Debug, Clone)]
+pub struct CallerInfo {
+    /// Short process name (from `/proc/<pid>/comm`).
+    pub name: String,
+    /// Process ID.
+    pub pid: u32,
+    /// Full executable path (from `/proc/<pid>/exe` readlink).
+    pub path: String,
+}
+
 /// Resolved prompt environment: config snapshot, binary path, display state.
 struct PromptEnv {
     cfg: PromptConfig,
@@ -2268,9 +2283,17 @@ fn resolve_prompt_binary() -> String {
 ///
 /// Includes enough context for the prompt to display a useful title and
 /// theme, but deliberately excludes the field values (those come back).
-fn build_prompt_json(provider_id: String, label: &str, cfg: &PromptConfig) -> String {
+fn build_prompt_json(
+    provider_id: String,
+    label: &str,
+    cfg: &PromptConfig,
+    caller: Option<CallerInfo>,
+) -> String {
     use serde_json::{Value, json};
     let theme = serde_json::to_value(&cfg.theme).unwrap_or_default();
+    let info = caller
+        .map(|c| format_caller_info(&cfg.info_format, &c))
+        .unwrap_or_default();
     let req: Value = json!({
         "title": label,
         "message": "",
@@ -2286,9 +2309,20 @@ fn build_prompt_json(provider_id: String, label: &str, cfg: &PromptConfig) -> St
                 "placeholder": "",
             }
         ],
+        "info": info,
         "theme": theme,
     });
     req.to_string()
+}
+
+/// Expand `{name}`, `{pid}`, `{path}` placeholders in the caller format string.
+fn format_caller_info(fmt: &str, caller: &CallerInfo) -> String {
+    if fmt.is_empty() {
+        return String::new();
+    }
+    fmt.replace("{name}", &caller.name)
+        .replace("{pid}", &caller.pid.to_string())
+        .replace("{path}", &caller.path)
 }
 
 /// Build a JSON request payload for `rosec-prompt` with caller-specified fields.

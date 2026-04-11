@@ -13,10 +13,17 @@
 //!     {"id": "password", "label": "Master Password", "kind": "password", "placeholder": "…"},
 //!     {"id": "email",    "label": "Email",           "kind": "text",     "placeholder": "…"}
 //!   ],
+//!   "info": "Requested by **firefox** (PID 1234)",
 //!   "theme": { … }
 //! }
 //! ```
 //! `fields` is optional — if absent a single hidden `password` field is implied.
+//!
+//! ## Rich text
+//!
+//! The `info`, `message`, and `hint` fields support inline markup:
+//! `**bold**` and `_italic_` (word-boundary delimited).  Useful for
+//! highlighting process names or paths in the caller identification line.
 //!
 //! ## Confirmation mode
 //!
@@ -105,6 +112,10 @@ struct PromptRequest {
     /// Exit code 0 = confirmed, 1 = cancelled.  Stdout is `{}`.
     #[serde(default)]
     confirm_mode: bool,
+    /// Rich-text info line shown below the title (e.g. caller identification).
+    /// Supports `**bold**` and `_italic_` markers for styled rendering.
+    #[serde(default)]
+    info: String,
     #[serde(default)]
     theme: ThemeConfig,
 }
@@ -250,6 +261,7 @@ fn main() -> Result<()> {
             cancel_label: String::new(),
             fields: Vec::new(),
             confirm_mode: false,
+            info: String::new(),
             theme: ThemeConfig::default(),
         }
     } else {
@@ -391,6 +403,23 @@ fn run_gui(request: PromptRequest) -> Result<()> {
         cosmic_text::Weight::BOLD,
     );
 
+    let info_h = if request.info.trim().is_empty() {
+        0.0
+    } else {
+        // Strip **bold** markers for measurement; leave _ alone since
+        // word-boundary italic markers are rare and the width difference
+        // between normal and italic glyphs is negligible for sizing.
+        let plain = request.info.replace("**", "");
+        measure_text_height(
+            &mut font_system,
+            &plain,
+            font_size - 1.0,
+            content_w,
+            font_family,
+            cosmic_text::Weight::NORMAL,
+        )
+    };
+
     let msg_h = if request.message.is_empty() {
         0.0
     } else {
@@ -427,6 +456,8 @@ fn run_gui(request: PromptRequest) -> Result<()> {
     let height = (4.0 + 14.0) * 2.0                         // outer pad + inner pad (top+bottom)
         + title_h                                            // title (exact, may wrap)
         + 10.0                                               // spacing after title
+        + info_h                                             // info line (0 if absent)
+        + if info_h > 0.0 { 10.0 } else { 0.0 }             // spacing after info (only if present)
         + msg_h                                              // message (exact, 0 if absent)
         + if msg_h > 0.0 { 10.0 } else { 0.0 }              // spacing after message (only if present)
         + fields_total_h                                     // fields (label may wrap)
@@ -498,6 +529,7 @@ struct GuiApp {
     title: String,
     message: String,
     hint: String,
+    info: String,
     confirm_label: String,
     cancel_label: String,
     fields: Vec<FieldState>,
@@ -567,6 +599,7 @@ impl GuiApp {
             title: req.title,
             message: req.message,
             hint,
+            info: req.info,
             confirm_label: if req.confirm_label.is_empty() {
                 "OK".to_string()
             } else {
@@ -660,12 +693,13 @@ fn view(state: &GuiApp) -> iced::Element<'_, Message> {
         } else {
             iced::widget::tooltip(
                 t,
-                container(
-                    text(&state.hint)
-                        .size(font_size)
-                        .color(state.label_color)
-                        .font(state.font),
-                )
+                container(iced::widget::rich_text(parse_styled_spans(
+                    &state.hint,
+                    font_size,
+                    state.label_color,
+                    state.fg,
+                    state.font,
+                )))
                 .padding(6)
                 .style(|_| container::Style {
                     background: Some(Background::Color(state.bg)),
@@ -772,12 +806,29 @@ fn view(state: &GuiApp) -> iced::Element<'_, Message> {
         .into();
 
     let mut items: Vec<Element<'_, Message>> = vec![title_widget];
+
+    // Info line with **bold** and _italic_ markers parsed into rich_text spans.
+    if !state.info.trim().is_empty() {
+        let spans = parse_styled_spans(
+            &state.info,
+            font_size - 1,
+            state.label_color,
+            state.fg,
+            state.font,
+        );
+        let info_widget: Element<'_, Message> = iced::widget::rich_text(spans).into();
+        items.push(info_widget);
+    }
+
     if !state.message.is_empty() {
-        let message_widget: Element<'_, Message> = text(&state.message)
-            .size(font_size)
-            .color(state.label_color)
-            .font(state.font)
-            .into();
+        let spans = parse_styled_spans(
+            &state.message,
+            font_size,
+            state.label_color,
+            state.fg,
+            state.font,
+        );
+        let message_widget: Element<'_, Message> = iced::widget::rich_text(spans).into();
         items.push(message_widget);
     }
     items.extend(field_widgets);
@@ -861,6 +912,140 @@ fn cosmic_font_family(name: &str) -> cosmic_text::Family<'_> {
         return cosmic_text::Family::Serif;
     }
     cosmic_text::Family::Name(name)
+}
+
+/// Parse a string with `**bold**` and `_italic_` markers into iced rich_text spans.
+///
+/// Segments outside markers use `normal_color` and the base font.
+/// Bold segments (`**...**`) use `emphasis_color` and bold weight.
+/// Italic segments (`_..._`) use `normal_color` and italic style.
+///
+/// Italic `_` markers must be at word boundaries (start/end of string or
+/// adjacent to whitespace) to avoid false matches on paths like
+/// `/usr/share/signal_desktop`.
+fn parse_styled_spans<'a>(
+    input: &str,
+    size: u16,
+    normal_color: iced::Color,
+    emphasis_color: iced::Color,
+    base_font: iced::Font,
+) -> Vec<iced::widget::text::Span<'a, Message>> {
+    let bold_font = iced::Font {
+        weight: iced::font::Weight::Bold,
+        ..base_font
+    };
+    let italic_font = iced::Font {
+        style: iced::font::Style::Italic,
+        ..base_font
+    };
+
+    /// Find a `_` that sits at a word boundary: preceded by start-of-string or
+    /// whitespace, and followed by a non-whitespace character (opening), or
+    /// preceded by a non-whitespace character and followed by end-of-string or
+    /// whitespace (closing).  Returns the byte offset of a valid opening `_`.
+    fn find_italic_pair(s: &str) -> Option<(usize, usize)> {
+        let bytes = s.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b != b'_' {
+                continue;
+            }
+            // Opening _: at start or after whitespace, followed by non-ws
+            let at_start = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            let next_non_ws = i + 1 < bytes.len() && !bytes[i + 1].is_ascii_whitespace();
+            if !(at_start && next_non_ws) {
+                continue;
+            }
+            // Search for closing _: before end or whitespace, after non-ws
+            for j in (i + 2)..bytes.len() {
+                if bytes[j] != b'_' {
+                    continue;
+                }
+                let prev_non_ws = !bytes[j - 1].is_ascii_whitespace();
+                let at_end = j + 1 == bytes.len() || bytes[j + 1].is_ascii_whitespace();
+                if prev_non_ws && at_end {
+                    return Some((i, j));
+                }
+            }
+        }
+        None
+    }
+
+    let mut spans = Vec::new();
+    let mut rest = input;
+
+    while !rest.is_empty() {
+        // Find the earliest marker: ** or boundary-aware _
+        let bold_pos = rest
+            .find("**")
+            .and_then(|start| rest[start + 2..].find("**").map(|end| (start, end)));
+        let ital_pos = find_italic_pair(rest);
+
+        // Pick whichever comes first in the string.
+        let next = match (bold_pos, ital_pos) {
+            (Some((bs, _)), Some((is, _))) => {
+                if bs <= is {
+                    Some(("bold", bs))
+                } else {
+                    Some(("italic", is))
+                }
+            }
+            (Some((bs, _)), None) => Some(("bold", bs)),
+            (None, Some((is, _))) => Some(("italic", is)),
+            (None, None) => None,
+        };
+
+        match next {
+            Some(("bold", start)) => {
+                let end = rest[start + 2..].find("**").unwrap();
+                if start > 0 {
+                    spans.push(
+                        iced::widget::text::Span::new(rest[..start].to_string())
+                            .size(size)
+                            .color(normal_color)
+                            .font(base_font),
+                    );
+                }
+                let content = &rest[start + 2..start + 2 + end];
+                spans.push(
+                    iced::widget::text::Span::new(content.to_string())
+                        .size(size)
+                        .color(emphasis_color)
+                        .font(bold_font),
+                );
+                rest = &rest[start + 2 + end + 2..];
+            }
+            Some(("italic", start)) => {
+                let (_, close) = find_italic_pair(rest).unwrap();
+                if start > 0 {
+                    spans.push(
+                        iced::widget::text::Span::new(rest[..start].to_string())
+                            .size(size)
+                            .color(normal_color)
+                            .font(base_font),
+                    );
+                }
+                let content = &rest[start + 1..close];
+                spans.push(
+                    iced::widget::text::Span::new(content.to_string())
+                        .size(size)
+                        .color(normal_color)
+                        .font(italic_font),
+                );
+                rest = &rest[close + 1..];
+            }
+            _ => {
+                spans.push(
+                    iced::widget::text::Span::new(rest.to_string())
+                        .size(size)
+                        .color(normal_color)
+                        .font(base_font),
+                );
+                break;
+            }
+        }
+    }
+
+    spans
 }
 
 fn parse_color(value: &str, fallback: iced::Color) -> iced::Color {

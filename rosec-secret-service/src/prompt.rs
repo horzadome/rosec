@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use rosec_core::{ItemMeta, NewItem};
+use zbus::Connection;
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
 use zeroize::Zeroizing;
@@ -18,7 +19,7 @@ use zeroize::Zeroizing;
 use std::collections::HashMap;
 
 use crate::service::to_object_path;
-use crate::state::{ServiceState, make_item_path};
+use crate::state::{CallerInfo, ServiceState, make_item_path};
 
 /// A deferred operation to execute after a successful unlock prompt.
 ///
@@ -82,6 +83,8 @@ impl SecretPrompt {
         &mut self,
         _window_id: &str,
         #[zbus(signal_emitter)] ctxt: SignalEmitter<'_>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] conn: &Connection,
     ) -> zbus::fdo::Result<()> {
         tracing::debug!(
             prompt_path = %self.path,
@@ -92,6 +95,9 @@ impl SecretPrompt {
         let state = Arc::clone(&self.state);
         let prompt_path = self.path.clone();
         let provider_id = self.provider_id.clone();
+
+        // Resolve the calling process so the prompt can display it.
+        let caller = resolve_caller_info(&header, conn).await;
 
         // Determine a human-readable label for the prompt dialog.
         let label = state
@@ -111,7 +117,8 @@ impl SecretPrompt {
         state
             .run_on_tokio(async move {
                 tokio::spawn(async move {
-                    run_prompt_task(state2, prompt_path, provider_id, label, ctxt_owned).await;
+                    run_prompt_task(state2, prompt_path, provider_id, label, ctxt_owned, caller)
+                        .await;
                 });
             })
             .await?;
@@ -155,6 +162,7 @@ async fn run_prompt_task(
     provider_id: String,
     label: String,
     ctxt: SignalEmitter<'static>,
+    caller: Option<crate::state::CallerInfo>,
 ) {
     /// Maximum number of unlock attempts before giving up.
     const MAX_ATTEMPTS: u32 = 3;
@@ -222,9 +230,10 @@ async fn run_prompt_task(
             format!("{label} (wrong password, attempt {attempt}/{MAX_ATTEMPTS})")
         };
 
+        let caller2 = caller.clone();
         let password_result: Result<Zeroizing<String>, zbus::fdo::Error> =
             match tokio::task::spawn_blocking(move || {
-                state2.spawn_prompt(&prompt_path2, &provider_id2, &label2)
+                state2.spawn_prompt(&prompt_path2, &provider_id2, &label2, caller2)
             })
             .await
             {
@@ -616,4 +625,35 @@ async fn execute_deferred_delete(
     state.remove_deleted_item(item_path);
 
     Some(zvariant::Value::from(to_object_path("/")))
+}
+
+// ---------------------------------------------------------------------------
+// Caller identification
+// ---------------------------------------------------------------------------
+
+/// Resolve the calling process from the D-Bus message header.
+///
+/// Uses `GetConnectionUnixProcessID` to get the PID, then reads
+/// `/proc/<pid>/comm` for the short name and `/proc/<pid>/exe` for the full
+/// path.  Returns `None` if the sender is unknown or the PID lookup fails.
+async fn resolve_caller_info(
+    header: &zbus::message::Header<'_>,
+    conn: &Connection,
+) -> Option<CallerInfo> {
+    let sender = header.sender()?.as_str().to_string();
+    let proxy = zbus::fdo::DBusProxy::new(conn).await.ok()?;
+    let pid = proxy
+        .get_connection_unix_process_id(zbus::names::BusName::try_from(sender.as_str()).ok()?)
+        .await
+        .ok()?;
+
+    let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    let path = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    Some(CallerInfo { name, pid, path })
 }

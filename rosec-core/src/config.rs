@@ -89,8 +89,19 @@ pub struct PromptConfig {
     pub backend: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Format string for the caller identification line shown in prompts.
+    /// Supports placeholders: `{name}` (process name), `{pid}` (process ID),
+    /// `{path}` (full executable path).  Use `**...**` for bold segments.
+    /// Example: `"Requested by **{name}** ({pid})"`
+    /// Set to empty string to disable the caller line entirely.
+    #[serde(default = "default_info_format")]
+    pub info_format: String,
     #[serde(default)]
     pub theme: PromptTheme,
+}
+
+fn default_info_format() -> String {
+    "Requested by **{name}** ({pid})".to_string()
 }
 
 impl Default for PromptConfig {
@@ -98,6 +109,7 @@ impl Default for PromptConfig {
         Self {
             backend: default_prompt_backend(),
             args: Vec::new(),
+            info_format: default_info_format(),
             theme: PromptTheme::default(),
         }
     }

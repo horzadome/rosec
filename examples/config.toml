@@ -17,6 +17,9 @@ max_unlocked_minutes = 240      # lock after N minutes unlocked (omit to disable
 [prompt]
 backend = "builtin"             # "builtin" uses rosec-prompt; or path to custom binary
 # args = ["--hint=Backend: {{backend}}"]
+# info_format = "Requested by **{name}** ({pid})"  # info line shown in prompt
+# Placeholders: {name} (process name), {pid} (PID), {path} (full exe path)
+# Supports **bold** and _italic_ markers.  Set to "" to disable.
 
 [prompt.theme]
 # Colors are 8-digit hex (#RRGGBBAA). Short aliases shown in comments.
