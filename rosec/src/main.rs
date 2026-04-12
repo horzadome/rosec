@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
         Commands::Search(args) => cmd_search(args).await,
         Commands::Item { action } => cmd_item(action).await,
         Commands::Get(args) => cmd_get(args).await,
+        Commands::Totp(cmd) => cmd_totp_dispatch(cmd).await,
         Commands::Inspect(args) => cmd_inspect(args).await,
         Commands::Lock => cmd_lock().await,
         Commands::Unlock => cmd_unlock().await,
@@ -2840,6 +2841,412 @@ async fn cmd_get(args: GetArgs) -> Result<()> {
             }
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// rosec totp
+// ───────────────────────────────────────────────────────────────────────────
+
+async fn cmd_totp_dispatch(cmd: TotpCommand) -> Result<()> {
+    match cmd.action {
+        Some(TotpSubcommands::Get(args)) => cmd_totp_get(args).await,
+        Some(TotpSubcommands::Add(args)) => cmd_totp_add(args).await,
+        None => {
+            // Default: treat trailing args as `totp get <item>`
+            // Parse the first non-flag arg as the item.
+            let mut sync = false;
+            let mut no_unlock = false;
+            let mut stdout = false;
+            let mut item = None;
+            for arg in &cmd.default_args {
+                match arg.as_str() {
+                    "-s" | "--sync" => sync = true,
+                    "--no-unlock" => no_unlock = true,
+                    "--stdout" => stdout = true,
+                    other => {
+                        if item.is_none() {
+                            item = Some(other.to_string());
+                        }
+                    }
+                }
+            }
+            let item = item.ok_or_else(|| anyhow::anyhow!("missing item identifier"))?;
+            cmd_totp_get(TotpGetArgs {
+                sync,
+                no_unlock,
+                stdout,
+                item,
+            })
+            .await
+        }
+    }
+}
+
+async fn cmd_totp_get(args: TotpGetArgs) -> Result<()> {
+    if args.sync && args.no_unlock {
+        bail!("--sync and --no-unlock are mutually exclusive");
+    }
+
+    let conn = conn().await?;
+
+    if args.sync {
+        preemptive_sync(&conn).await?;
+    }
+
+    let resolve_result = resolve_item_path(&conn, args.item.as_str()).await;
+
+    let (path, is_locked) = match resolve_result {
+        Ok(result) => result,
+        Err(e) if args.sync && !args.no_unlock => {
+            trigger_unlock(&conn).await?;
+            preemptive_sync(&conn).await?;
+            resolve_item_path(&conn, args.item.as_str())
+                .await
+                .map_err(|_| e)?
+        }
+        Err(e) => return Err(e),
+    };
+
+    if is_locked {
+        if args.no_unlock {
+            bail!("item is locked — use --sync to unlock the provider first");
+        }
+        trigger_unlock(&conn).await?;
+        if args.sync {
+            preemptive_sync(&conn).await?;
+        }
+    }
+
+    match cmd_totp_inner(&conn, &path, args.stdout).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let zbus_err = e.downcast_ref::<zbus::Error>();
+            if !args.no_unlock
+                && let Some(ze) = zbus_err
+                && try_lazy_unlock(&conn, ze).await?
+            {
+                cmd_totp_inner(&conn, &path, args.stdout).await
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+async fn cmd_totp_inner(conn: &Connection, path: &str, use_stdout: bool) -> Result<()> {
+    let secrets_proxy = zbus::Proxy::new(
+        conn,
+        "org.freedesktop.secrets",
+        "/org/rosec/Secrets",
+        "org.rosec.Secrets",
+    )
+    .await?;
+
+    let item_obj_path = zvariant::ObjectPath::try_from(path)
+        .map_err(|e| anyhow::anyhow!("invalid item path: {e}"))?;
+    let (code, remaining): (String, u32) = secrets_proxy
+        .call("GetTotpCode", &(&item_obj_path,))
+        .await
+        .map_err(|e| anyhow::anyhow!("GetTotpCode failed: {e}"))?;
+
+    if use_stdout || !has_display() {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        out.write_all(code.as_bytes())?;
+        if std::io::IsTerminal::is_terminal(&out) && !code.ends_with('\n') {
+            out.write_all(b"\n")?;
+        }
+        out.flush()?;
+        return Ok(());
+    }
+
+    // Launch rosec-prompt in TOTP display mode.
+    let prompt_bin = resolve_prompt_binary_cli();
+
+    // Fetch the item label for the window title.
+    let item_proxy = zbus::Proxy::new(
+        conn,
+        "org.freedesktop.secrets",
+        path,
+        "org.freedesktop.Secret.Item",
+    )
+    .await?;
+    let label: String = item_proxy
+        .get_property("Label")
+        .await
+        .unwrap_or_else(|_| "TOTP".to_string());
+
+    // Fetch the raw TOTP seed so the prompter can regenerate codes on expiry.
+    let seed: Option<zeroize::Zeroizing<String>> = secrets_proxy
+        .call("GetSecretAttribute", &(&item_obj_path, "totp"))
+        .await
+        .ok()
+        .map(|bytes: Vec<u8>| {
+            zeroize::Zeroizing::new(String::from_utf8_lossy(&bytes).into_owned())
+        });
+
+    let json = serde_json::json!({
+        "title": format!("TOTP — {label}"),
+        "totp_display": {
+            "code": code,
+            "remaining": remaining,
+            "period": seed.as_deref()
+                .and_then(|s| rosec_core::totp::parse_totp_input(s.as_bytes()).ok())
+                .map(|p| p.period)
+                .unwrap_or(30),
+            "seed": seed.as_deref(),
+        }
+    });
+
+    let mut cmd = std::process::Command::new(&prompt_bin);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to launch rosec-prompt: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(json.to_string().as_bytes());
+    }
+
+    let _ = child.wait();
+
+    Ok(())
+}
+
+fn has_display() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some()
+}
+
+/// Resolve the `rosec-prompt` binary: sibling of this executable, or PATH.
+fn resolve_prompt_binary_cli() -> String {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join("rosec-prompt");
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "rosec-prompt".to_string()
+}
+
+async fn cmd_totp_add(args: TotpAddArgs) -> Result<()> {
+    let conn = conn().await?;
+
+    // Try to find the item. Use key=value search or hex ID to locate an
+    // existing item. Plain names (no '=', not hex ID, not a path) are treated
+    // as labels for a new item.
+    let is_search = args.item.contains('=')
+        || args.item.starts_with('/')
+        || (args.item.len() == 16 && args.item.chars().all(|c| c.is_ascii_hexdigit()));
+    let (path, is_new) = if is_search {
+        match resolve_item_path(&conn, args.item.as_str()).await {
+            Ok((path, is_locked)) => {
+                if is_locked {
+                    trigger_unlock(&conn).await?;
+                }
+                (path, false)
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        (String::new(), true)
+    };
+
+    // Collect the TOTP seed — either via QR scanner or hidden prompt.
+    let seed: zeroize::Zeroizing<String> = if args.qr {
+        collect_totp_seed_qr()?
+    } else {
+        collect_totp_seed_prompt()?
+    };
+
+    if seed.is_empty() {
+        bail!("no TOTP seed provided");
+    }
+
+    // Validate the seed by parsing it.
+    let params = rosec_core::totp::parse_totp_input(seed.as_bytes())
+        .map_err(|e| anyhow::anyhow!("invalid TOTP seed: {e}"))?;
+
+    // Show the test code and ask for confirmation via the prompter.
+    let now = std::time::SystemTime::now();
+    let test_code = rosec_core::totp::generate_code(&params, now)
+        .map_err(|e| anyhow::anyhow!("TOTP generation failed: {e}"))?;
+    let remaining = rosec_core::totp::time_remaining_at(&params, now);
+    if has_display() {
+        let prompt_bin = resolve_prompt_binary_cli();
+        let json = serde_json::json!({
+            "title": "Confirm TOTP",
+            "totp_display": {
+                "code": &*test_code,
+                "remaining": remaining,
+                "period": params.period,
+                "confirm": "Save",
+            },
+        });
+        let mut cmd = std::process::Command::new(&prompt_bin);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to launch rosec-prompt: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(json.to_string().as_bytes());
+        }
+        let status = child.wait()?;
+        if !status.success() {
+            bail!("cancelled");
+        }
+    } else {
+        eprintln!("Current code: {}", &*test_code);
+        eprint!("Does this match? [y/N] ");
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf)?;
+        if !buf.trim().eq_ignore_ascii_case("y") {
+            bail!("cancelled");
+        }
+    }
+
+    let items_proxy = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.secrets",
+        "/org/rosec/Items",
+        "org.rosec.Items",
+    )
+    .await?;
+
+    let mut secrets: HashMap<String, Vec<u8>> = HashMap::new();
+    let seed_bytes = zeroize::Zeroizing::new(seed.as_bytes().to_vec());
+    secrets.insert("totp".to_string(), seed_bytes.to_vec());
+
+    if is_new {
+        // Create a new login item with the TOTP seed.
+        let label = args.item.as_str();
+        let empty_attrs: HashMap<String, String> = HashMap::new();
+        let item_path: String = items_proxy
+            .call(
+                "CreateItemExtended",
+                &(label, "login", &empty_attrs, &secrets, false),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("CreateItemExtended failed: {e}"))?;
+        let display_id = item_path.rsplit('/').next().unwrap_or(&item_path);
+        eprintln!("Created item \"{label}\" with TOTP seed ({display_id})");
+    } else {
+        // Update existing item with the TOTP seed.
+        let empty_attrs: HashMap<String, String> = HashMap::new();
+        let _: () = items_proxy
+            .call(
+                "UpdateItem",
+                &(path.as_str(), "", "", &empty_attrs, &secrets),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("UpdateItem failed: {e}"))?;
+        let display_id = path.rsplit('/').next().unwrap_or(&path);
+        eprintln!("TOTP seed saved for item {display_id}");
+    }
+    Ok(())
+}
+
+/// Collect a TOTP seed via the prompter (hidden input).
+fn collect_totp_seed_prompt() -> Result<zeroize::Zeroizing<String>> {
+    let prompt_bin = resolve_prompt_binary_cli();
+    let has_display = has_display();
+
+    let json = serde_json::json!({
+        "title": "Add TOTP",
+        "message": "Enter the TOTP seed or otpauth:// URI",
+        "fields": [{
+            "id": "seed",
+            "label": "TOTP seed",
+            "kind": "secret",
+            "placeholder": "otpauth://totp/... or base32 secret"
+        }],
+        "confirm_label": "Add",
+    });
+
+    if has_display {
+        let mut cmd = std::process::Command::new(&prompt_bin);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to launch rosec-prompt: {e}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(json.to_string().as_bytes());
+        }
+
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            bail!("cancelled");
+        }
+        let mut response: HashMap<String, String> = serde_json::from_slice(&output.stdout)?;
+        let seed = response
+            .remove("seed")
+            .ok_or_else(|| anyhow::anyhow!("no seed in response"))?;
+        // Zeroize remaining response values.
+        for v in response.values_mut() {
+            zeroize::Zeroize::zeroize(v);
+        }
+        Ok(zeroize::Zeroizing::new(seed))
+    } else {
+        // TTY fallback: use rpassword for hidden input.
+        eprint!("TOTP seed or otpauth:// URI: ");
+        let seed = rpassword::read_password()?;
+        Ok(zeroize::Zeroizing::new(seed))
+    }
+}
+
+/// Collect a TOTP seed via QR scanner overlay.
+fn collect_totp_seed_qr() -> Result<zeroize::Zeroizing<String>> {
+    let prompt_bin = resolve_prompt_binary_cli();
+
+    if !has_display() {
+        bail!("--qr requires a display server (WAYLAND_DISPLAY or DISPLAY)");
+    }
+
+    let json = serde_json::json!({
+        "title": "Scan TOTP QR Code",
+        "qr_scan": true,
+    });
+
+    let mut cmd = std::process::Command::new(&prompt_bin);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to launch rosec-prompt: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(json.to_string().as_bytes());
+    }
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!("QR scan cancelled");
+    }
+    let mut response: HashMap<String, String> = serde_json::from_slice(&output.stdout)?;
+    let uri = response
+        .remove("otpauth_uri")
+        .ok_or_else(|| anyhow::anyhow!("no otpauth URI from QR scanner"))?;
+    for v in response.values_mut() {
+        zeroize::Zeroize::zeroize(v);
+    }
+    Ok(zeroize::Zeroizing::new(uri))
 }
 
 /// Normalise an `--attr` value that may use dot-index syntax.

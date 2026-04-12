@@ -13,6 +13,7 @@ pub mod machine_key;
 pub mod oauth;
 pub mod prompt;
 pub mod router;
+pub mod totp;
 
 /// Crate-wide mutex used by tests that mutate `XDG_DATA_HOME`.
 ///
@@ -63,6 +64,11 @@ pub const ATTR_PROVIDER: &str = "rosec:provider";
 /// attribute name.
 pub const ATTR_TYPE: &str = "rosec:type";
 
+/// Boolean flag indicating the item has a TOTP seed.  Stamped by providers
+/// during item creation/sync when a `"totp"` secret attribute is present.
+/// Searchable via `SearchItems({"rosec:totp": "true"})`.
+pub const ATTR_TOTP: &str = "rosec:totp";
+
 /// Attribute names that cannot be set by users.
 ///
 /// Built from the named constants above so the list stays in sync.
@@ -73,6 +79,7 @@ pub const RESERVED_ATTRIBUTES: &[&str] = &[
     ATTR_MODIFIED,
     ATTR_PROVIDER,
     ATTR_TYPE,
+    ATTR_TOTP,
 ];
 
 // ---------------------------------------------------------------------------
@@ -110,6 +117,9 @@ pub enum Capability {
     /// optional handshake) and `parse_notification` (classifies received frames
     /// as sync, lock, or ignore).  The host manages the connection lifecycle.
     Notifications,
+    /// Provider stores TOTP seeds and supports code generation
+    /// (items may expose `"totp"` as a secret attribute).
+    Totp,
 }
 
 /// Check that `provider` declares `cap`; return `ProviderError::NotSupported` if not.

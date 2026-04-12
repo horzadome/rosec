@@ -47,6 +47,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use anyhow::Result;
 use iced::widget::text_input;
@@ -84,6 +85,32 @@ struct FieldSpec {
 }
 
 // ---------------------------------------------------------------------------
+// TOTP display request
+// ---------------------------------------------------------------------------
+
+/// When present in a `PromptRequest`, the prompt shows a TOTP code display
+/// instead of the normal input fields.
+#[derive(Debug, Clone, Deserialize)]
+struct TotpDisplayRequest {
+    /// The current TOTP code to display.
+    code: String,
+    /// Seconds remaining before the code expires.
+    remaining: u32,
+    /// TOTP period in seconds (kept for protocol compat, not used internally).
+    #[allow(dead_code)]
+    period: u32,
+    /// When set, show a confirm/cancel dialog instead of copy/close.
+    /// The value is used as the confirm button label (e.g. "Save").
+    /// Disables auto-copy and auto-dismiss.
+    #[serde(default)]
+    confirm: Option<String>,
+    /// Raw TOTP seed (otpauth URI or base32). When present, the prompter
+    /// regenerates codes locally when the period expires.
+    #[serde(default)]
+    seed: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Request / theme types
 // ---------------------------------------------------------------------------
 
@@ -116,6 +143,14 @@ struct PromptRequest {
     /// Supports `**bold**` and `_italic_` markers for styled rendering.
     #[serde(default)]
     info: String,
+    /// When set, display a TOTP code instead of input fields.
+    #[serde(default)]
+    totp_display: Option<TotpDisplayRequest>,
+    /// When `true`, enter QR scan mode: show a compact window with a "Scan"
+    /// button that captures the screen and decodes a QR code containing an
+    /// `otpauth://` URI.
+    #[serde(default)]
+    qr_scan: bool,
     #[serde(default)]
     theme: ThemeConfig,
 }
@@ -236,6 +271,15 @@ fn default_font_size() -> f32 {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
+    // Internal screenshot helper — runs in a subprocess to avoid portal
+    // D-Bus session reuse issues.  Not user-facing.
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() == 3 && args[1] == "--screenshot-helper" {
+            run_screenshot_helper(std::path::Path::new(&args[2]));
+        }
+    }
+
     // Handle --version before anything else (no stdin read needed).
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!(
@@ -262,6 +306,8 @@ fn main() -> Result<()> {
             fields: Vec::new(),
             confirm_mode: false,
             info: String::new(),
+            totp_display: None,
+            qr_scan: false,
             theme: ThemeConfig::default(),
         }
     } else {
@@ -293,7 +339,25 @@ fn main() -> Result<()> {
 ///
 /// In confirm mode (zero fields), prints the title/message and asks for y/N
 /// confirmation.  Exit 0 = confirmed, exit 1 = cancelled.
+///
+/// In TOTP display mode, prints the code and expiry to stderr, emits `{}`
+/// to stdout, and exits immediately (no clipboard in TTY mode).
 fn run_tty(request: PromptRequest) -> Result<()> {
+    if request.qr_scan {
+        eprintln!("QR scanning requires a display server");
+        std::process::exit(1);
+    }
+
+    if let Some(totp) = &request.totp_display {
+        if !request.title.is_empty() {
+            eprintln!("{}", request.title);
+        }
+        eprintln!("{}", totp.code);
+        eprintln!("Expires in {}s", totp.remaining);
+        println!("{{}}");
+        return Ok(());
+    }
+
     let fields = request.effective_fields();
 
     if !request.title.is_empty() {
@@ -374,8 +438,17 @@ fn run_tty(request: PromptRequest) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_gui(request: PromptRequest) -> Result<()> {
-    use iced::application;
     use iced::window::settings::PlatformSpecific;
+
+    if request.qr_scan {
+        return run_gui_qr(request);
+    }
+
+    if request.totp_display.is_some() {
+        return run_gui_totp(request);
+    }
+
+    use iced::application;
 
     let fields = request.effective_fields();
     let font_size = request.theme.font_size;
@@ -513,6 +586,14 @@ enum Message {
     FieldChanged(usize, String),
     Confirm,
     Cancel,
+    KeyPressed(iced::keyboard::Key),
+}
+
+#[derive(Debug, Clone)]
+enum TotpMessage {
+    Tick,
+    CopyToClipboard,
+    AutoDismiss,
     KeyPressed(iced::keyboard::Key),
 }
 
@@ -860,6 +941,718 @@ fn view(state: &GuiApp) -> iced::Element<'_, Message> {
 }
 
 // ---------------------------------------------------------------------------
+// TOTP display GUI
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct TotpApp {
+    title: String,
+    code: String,
+    remaining: u32,
+    /// When Some, this is a confirmation dialog (Save/Cancel) instead of
+    /// copy/close. The String is the confirm button label.
+    confirm_label: Option<String>,
+    /// Parsed TOTP params for code regeneration on period expiry.
+    totp_params: Option<rosec_core::totp::TotpParams>,
+    theme: ThemeConfig,
+    fg: iced::Color,
+    bg: iced::Color,
+    border: iced::Color,
+    label_color: iced::Color,
+    accent: iced::Color,
+    input_bg: iced::Color,
+    confirm_bg: iced::Color,
+    confirm_text_color: iced::Color,
+    cancel_bg: iced::Color,
+    cancel_text_color: iced::Color,
+    font: iced::Font,
+}
+
+fn run_gui_totp(request: PromptRequest) -> Result<()> {
+    use iced::application;
+    use iced::window::settings::PlatformSpecific;
+
+    let totp = request
+        .totp_display
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("totp_display missing"))?;
+    let code = totp.code.clone();
+
+    application("rosec prompt", totp_update, totp_view)
+        .subscription(totp_subscription)
+        .window(iced::window::Settings {
+            size: iced::Size::new(380.0, 190.0),
+            resizable: false,
+            decorations: false,
+            transparent: true,
+            platform_specific: PlatformSpecific {
+                application_id: "rosec.prompt".to_string(),
+                override_redirect: false,
+            },
+            ..Default::default()
+        })
+        .run_with(move || {
+            let state = TotpApp::from_request(&request);
+            if state.confirm_label.is_none() {
+                clipboard_write(&code);
+            }
+            (state, iced::Task::none())
+        })?;
+    Ok(())
+}
+
+impl TotpApp {
+    fn from_request(req: &PromptRequest) -> Self {
+        let totp = req
+            .totp_display
+            .as_ref()
+            .expect("totp_display must be Some");
+        let fg = parse_color(&req.theme.foreground, iced::Color::WHITE);
+        let bg = parse_color(&req.theme.background, iced::Color::BLACK);
+        let border = parse_color(&req.theme.border_color, iced::Color::WHITE);
+        let label_color = parse_color(&req.theme.label_color, fg);
+        let accent = parse_color(&req.theme.accent_color, fg);
+        let confirm_bg = if req.theme.confirm_background.trim().is_empty() {
+            accent
+        } else {
+            parse_color(&req.theme.confirm_background, accent)
+        };
+        let confirm_text = if req.theme.confirm_text.trim().is_empty() {
+            fg
+        } else {
+            parse_color(&req.theme.confirm_text, fg)
+        };
+        let cancel_bg = if req.theme.cancel_background.trim().is_empty() {
+            iced::Color::from_rgb(0.25, 0.25, 0.28)
+        } else {
+            parse_color(
+                &req.theme.cancel_background,
+                iced::Color::from_rgb(0.25, 0.25, 0.28),
+            )
+        };
+        let cancel_text = if req.theme.cancel_text.trim().is_empty() {
+            fg
+        } else {
+            parse_color(&req.theme.cancel_text, label_color)
+        };
+        let input_bg = parse_color(&req.theme.input_background, bg);
+        let font = font_from_string(&req.theme.font_family);
+        let totp_params = totp
+            .seed
+            .as_deref()
+            .and_then(|s| rosec_core::totp::parse_totp_input(s.as_bytes()).ok());
+        Self {
+            title: req.title.clone(),
+            code: totp.code.clone(),
+            remaining: totp.remaining,
+            confirm_label: totp.confirm.clone(),
+            totp_params,
+            theme: req.theme.clone(),
+            fg,
+            bg,
+            border,
+            label_color,
+            accent,
+            input_bg,
+            confirm_bg,
+            confirm_text_color: confirm_text,
+            cancel_bg,
+            cancel_text_color: cancel_text,
+            font,
+        }
+    }
+}
+
+/// Write text to the system clipboard via `wl-copy` (Wayland) or `xclip` (X11).
+///
+/// `wl-copy` forks a background daemon that owns the clipboard content and
+/// serves paste requests until another app copies something.  This is the
+/// standard mechanism for short-lived processes on Wayland.
+fn clipboard_write(text: &str) {
+    use std::process::{Command, Stdio};
+
+    if let Ok(mut child) = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        return;
+    }
+
+    if let Ok(mut child) = Command::new("xclip")
+        .args(["-selection", "clipboard"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
+fn totp_emit_stdout() {
+    use std::io::Write as _;
+    let _ = std::io::stdout().write_all(b"{}\n");
+    let _ = std::io::stdout().flush();
+}
+
+fn totp_update(state: &mut TotpApp, message: TotpMessage) -> iced::Task<TotpMessage> {
+    match message {
+        TotpMessage::Tick => {
+            if state.confirm_label.is_some() {
+                return iced::Task::none();
+            }
+            if state.remaining > 0 {
+                state.remaining -= 1;
+            }
+            if state.remaining == 0 {
+                if let Some(ref params) = state.totp_params {
+                    let now = std::time::SystemTime::now();
+                    if let Ok(code) = rosec_core::totp::generate_code(params, now) {
+                        state.code = code.to_string();
+                    }
+                    state.remaining = rosec_core::totp::time_remaining_at(params, now) as u32;
+                } else {
+                    std::process::exit(0);
+                }
+            }
+            iced::Task::none()
+        }
+        TotpMessage::CopyToClipboard => {
+            // iced's clipboard::write requires the window surface to stay
+            // alive on Wayland, which is impractical for a short-lived prompt.
+            // Use wl-copy (standard on all Wayland desktops) or xclip as a
+            // reliable cross-desktop clipboard mechanism.
+            clipboard_write(&state.code);
+            totp_emit_stdout();
+            std::process::exit(0);
+        }
+        TotpMessage::AutoDismiss => {
+            std::process::exit(0);
+        }
+        TotpMessage::KeyPressed(key) => {
+            use iced::keyboard::Key;
+            use iced::keyboard::key::Named;
+            match key {
+                Key::Named(Named::Escape) => std::process::exit(1),
+                _ => iced::Task::none(),
+            }
+        }
+    }
+}
+
+fn totp_subscription(state: &TotpApp) -> iced::Subscription<TotpMessage> {
+    let tick = if state.confirm_label.is_none() {
+        iced::time::every(Duration::from_secs(1)).map(|_| TotpMessage::Tick)
+    } else {
+        iced::Subscription::none()
+    };
+
+    let keys = iced::event::listen_with(|event, _status, _id| {
+        if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) = event {
+            Some(TotpMessage::KeyPressed(key))
+        } else {
+            None
+        }
+    });
+
+    iced::Subscription::batch([tick, keys])
+}
+
+fn totp_view(state: &TotpApp) -> iced::Element<'_, TotpMessage> {
+    use iced::widget::{button, column, container, row, text};
+    use iced::{Alignment, Background, Element, Length};
+
+    let font_size = state.theme.font_size as u16;
+
+    let bold_font = iced::Font {
+        weight: iced::font::Weight::Bold,
+        ..state.font
+    };
+
+    let title_widget: Element<'_, TotpMessage> = text(&state.title)
+        .size(font_size + 1)
+        .color(state.fg)
+        .font(bold_font)
+        .into();
+
+    let expiring = state.remaining <= 8 && state.confirm_label.is_none();
+    let digit_color = if expiring {
+        iced::Color::from_rgb(0.9, 0.25, 0.25)
+    } else {
+        state.accent
+    };
+
+    let code_widget: Element<'_, TotpMessage> = container(pin_box_row::<TotpMessage>(
+        &state.code,
+        font_size,
+        digit_color,
+        state.input_bg,
+        state.border,
+    ))
+    .width(Length::Fill)
+    .align_x(iced::alignment::Horizontal::Center)
+    .into();
+
+    let is_confirm = state.confirm_label.is_some();
+
+    let subtitle: Element<'_, TotpMessage> = if is_confirm {
+        text("Does this match your authenticator?")
+            .size(font_size)
+            .color(state.label_color)
+            .font(state.font)
+            .width(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .into()
+    } else {
+        text(format!("Expires in {}s", state.remaining))
+            .size(font_size)
+            .color(state.label_color)
+            .font(state.font)
+            .width(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .into()
+    };
+
+    let primary_label = state.confirm_label.as_deref().unwrap_or("Copy");
+    let primary_btn = button(
+        text(primary_label)
+            .size(font_size)
+            .width(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .color(state.confirm_text_color)
+            .font(state.font),
+    )
+    .width(Length::Fill)
+    .padding(8)
+    .style(move |_, s| button_style(state.confirm_bg, state.confirm_text_color, s))
+    .on_press(if is_confirm {
+        TotpMessage::AutoDismiss
+    } else {
+        TotpMessage::CopyToClipboard
+    });
+
+    let cancel_label = if is_confirm { "Cancel" } else { "Close" };
+    let cancel_btn = button(
+        text(cancel_label)
+            .size(font_size)
+            .width(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .color(state.cancel_text_color)
+            .font(state.font),
+    )
+    .width(Length::Fill)
+    .padding(8)
+    .style(move |_, s| button_style(state.cancel_bg, state.cancel_text_color, s))
+    .on_press(TotpMessage::KeyPressed(iced::keyboard::Key::Named(
+        iced::keyboard::key::Named::Escape,
+    )));
+
+    let actions: Element<'_, TotpMessage> = row![primary_btn, cancel_btn]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .into();
+
+    let content = column![title_widget, code_widget, subtitle, actions]
+        .spacing(10)
+        .padding(14)
+        .align_x(Alignment::Center);
+
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(4)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(state.bg)),
+            border: iced::Border {
+                color: state.border,
+                width: state.theme.border_width,
+                radius: 8.0.into(),
+            },
+            text_color: None,
+            shadow: iced::Shadow::default(),
+        })
+        .into()
+}
+
+// ---------------------------------------------------------------------------
+// QR scan GUI
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum QrMessage {
+    Scan,
+    Cancel,
+    WindowHidden,
+    ScanResult(Result<String, String>),
+    KeyPressed(iced::keyboard::Key),
+}
+
+#[derive(Debug)]
+struct QrApp {
+    title: String,
+    status: String,
+    scanning: bool,
+    theme: ThemeConfig,
+    fg: iced::Color,
+    bg: iced::Color,
+    border: iced::Color,
+    label_color: iced::Color,
+    _accent: iced::Color,
+    confirm_bg: iced::Color,
+    confirm_text: iced::Color,
+    cancel_bg: iced::Color,
+    cancel_text: iced::Color,
+    font: iced::Font,
+}
+
+fn run_gui_qr(request: PromptRequest) -> Result<()> {
+    use iced::application;
+    use iced::window::settings::PlatformSpecific;
+
+    application("rosec prompt", qr_update, qr_view)
+        .subscription(qr_subscription)
+        .window(iced::window::Settings {
+            size: iced::Size::new(380.0, 145.0),
+            resizable: false,
+            decorations: false,
+            transparent: true,
+            platform_specific: PlatformSpecific {
+                application_id: "rosec.prompt".to_string(),
+                override_redirect: false,
+            },
+            ..Default::default()
+        })
+        .run_with(move || {
+            let state = QrApp::from_request(&request);
+            (state, iced::Task::none())
+        })?;
+    Ok(())
+}
+
+impl QrApp {
+    fn from_request(req: &PromptRequest) -> Self {
+        let fg = parse_color(&req.theme.foreground, iced::Color::WHITE);
+        let bg = parse_color(&req.theme.background, iced::Color::BLACK);
+        let border = parse_color(&req.theme.border_color, iced::Color::WHITE);
+        let label_color = parse_color(&req.theme.label_color, fg);
+        let accent = parse_color(&req.theme.accent_color, fg);
+        let confirm_bg = if req.theme.confirm_background.trim().is_empty() {
+            accent
+        } else {
+            parse_color(&req.theme.confirm_background, accent)
+        };
+        let confirm_text = if req.theme.confirm_text.trim().is_empty() {
+            fg
+        } else {
+            parse_color(&req.theme.confirm_text, fg)
+        };
+        let cancel_bg = if req.theme.cancel_background.trim().is_empty() {
+            iced::Color::from_rgb(0.25, 0.25, 0.28)
+        } else {
+            parse_color(
+                &req.theme.cancel_background,
+                iced::Color::from_rgb(0.25, 0.25, 0.28),
+            )
+        };
+        let cancel_text = if req.theme.cancel_text.trim().is_empty() {
+            fg
+        } else {
+            parse_color(&req.theme.cancel_text, label_color)
+        };
+        let font = font_from_string(&req.theme.font_family);
+        Self {
+            title: req.title.clone(),
+            status: "Position the QR code on your screen, then click Scan".to_string(),
+            scanning: false,
+            theme: req.theme.clone(),
+            fg,
+            bg,
+            border,
+            label_color,
+            _accent: accent,
+            confirm_bg,
+            confirm_text,
+            cancel_bg,
+            cancel_text,
+            font,
+        }
+    }
+}
+
+fn qr_emit_and_exit(uri: &str) {
+    use std::io::Write as _;
+    let json = format!("{{\"otpauth_uri\":{}}}", serde_json::json!(uri));
+    let _ = std::io::stdout().write_all(json.as_bytes());
+    let _ = std::io::stdout().write_all(b"\n");
+    let _ = std::io::stdout().flush();
+    std::process::exit(0);
+}
+
+/// Capture a full-screen screenshot via the XDG Desktop Portal.
+///
+/// Spawns a **child process** for each attempt so the portal D-Bus session
+/// is fully torn down between retries.  The `ashpd` library caches
+/// connections process-globally, which causes the second in-process call
+/// to hang on some portal implementations (e.g. xdg-desktop-portal-hyprland).
+///
+/// The child re-invokes the current binary with `--screenshot-helper <path>`
+/// and exits 0 on success (file written) or non-zero on failure.
+fn capture_screenshot(path: &std::path::Path) -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    match std::process::Command::new(exe)
+        .arg("--screenshot-helper")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+    {
+        Ok(s) => s.success(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to spawn screenshot helper");
+            false
+        }
+    }
+}
+
+/// Entry point for the `--screenshot-helper <path>` subprocess.
+/// Takes a screenshot via the XDG portal and writes it to the given path.
+/// Exits 0 on success, 1 on failure.
+fn run_screenshot_helper(dest: &std::path::Path) -> ! {
+    let dest = dest.to_path_buf();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("screenshot-helper: tokio init failed: {e}");
+            std::process::exit(1);
+        });
+    let ok = rt.block_on(async {
+        let portal = match ashpd::desktop::screenshot::Screenshot::request()
+            .interactive(false)
+            .modal(false)
+            .send()
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("screenshot-helper: portal request failed: {e}");
+                return false;
+            }
+        };
+        let response = match portal.response() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("screenshot-helper: portal response failed: {e}");
+                return false;
+            }
+        };
+        let uri = response.uri().to_string();
+        let file_path = uri.strip_prefix("file://").unwrap_or(&uri);
+        if std::path::Path::new(file_path).exists() {
+            if let Err(e) = std::fs::copy(file_path, &dest) {
+                eprintln!("screenshot-helper: copy failed: {e}");
+                return false;
+            }
+            let _ = std::fs::remove_file(file_path);
+            true
+        } else {
+            eprintln!("screenshot-helper: file not found: {file_path}");
+            false
+        }
+    });
+    std::process::exit(if ok { 0 } else { 1 });
+}
+
+fn decode_qr_from_file(path: &std::path::Path) -> Option<String> {
+    let img = image::open(path).ok()?;
+    let gray = img.to_luma8();
+    let mut prepared = rqrr::PreparedImage::prepare(gray);
+    let grids = prepared.detect_grids();
+    for grid in grids {
+        if let Ok((_, content)) = grid.decode()
+            && content.starts_with("otpauth://")
+        {
+            return Some(content);
+        }
+    }
+    None
+}
+
+fn qr_update(state: &mut QrApp, message: QrMessage) -> iced::Task<QrMessage> {
+    match message {
+        QrMessage::Scan => {
+            state.scanning = true;
+            state.status = "Scanning...".to_string();
+            iced::window::get_oldest().and_then(|id| {
+                iced::window::minimize(id, true).chain(iced::Task::done(QrMessage::WindowHidden))
+            })
+        }
+        QrMessage::WindowHidden => iced::Task::perform(
+            async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let path =
+                    std::env::temp_dir().join(format!("rosec-qr-{}.png", std::process::id()));
+                // Wrap the screenshot in a timeout to prevent portal hangs.
+                let captured = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tokio::task::spawn_blocking(move || capture_screenshot(&path)),
+                )
+                .await;
+                let ok = match captured {
+                    Ok(Ok(true)) => true,
+                    Ok(Ok(false)) => false,
+                    Ok(Err(_)) => false,
+                    Err(_) => {
+                        return Err("Screenshot timed out. Portal may be unresponsive.".to_string());
+                    }
+                };
+                let path =
+                    std::env::temp_dir().join(format!("rosec-qr-{}.png", std::process::id()));
+                if !ok {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(
+                        "Screenshot failed. Ensure xdg-desktop-portal is running.".to_string()
+                    );
+                }
+                let result = decode_qr_from_file(&path);
+                let _ = std::fs::remove_file(&path);
+                match result {
+                    Some(uri) => Ok(uri),
+                    None => Err("No otpauth:// QR code found on screen. Try again.".to_string()),
+                }
+            },
+            QrMessage::ScanResult,
+        ),
+        QrMessage::ScanResult(Ok(uri)) => {
+            qr_emit_and_exit(&uri);
+            iced::Task::none()
+        }
+        QrMessage::ScanResult(Err(msg)) => {
+            state.scanning = false;
+            state.status = msg;
+            iced::window::get_oldest().and_then(|id| iced::window::minimize(id, false))
+        }
+        QrMessage::Cancel => std::process::exit(1),
+        QrMessage::KeyPressed(key) => {
+            use iced::keyboard::Key;
+            use iced::keyboard::key::Named;
+            match key {
+                Key::Named(Named::Escape) => std::process::exit(1),
+                _ => iced::Task::none(),
+            }
+        }
+    }
+}
+
+fn qr_subscription(_state: &QrApp) -> iced::Subscription<QrMessage> {
+    iced::event::listen_with(|event, _status, _id| {
+        if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, .. }) = event {
+            Some(QrMessage::KeyPressed(key))
+        } else {
+            None
+        }
+    })
+}
+
+fn qr_view(state: &QrApp) -> iced::Element<'_, QrMessage> {
+    use iced::widget::{button, column, container, row, text};
+    use iced::{Alignment, Background, Element, Length};
+
+    let font_size = state.theme.font_size as u16;
+
+    let bold_font = iced::Font {
+        weight: iced::font::Weight::Bold,
+        ..state.font
+    };
+
+    let title_widget: Element<'_, QrMessage> = text(&state.title)
+        .size(font_size + 1)
+        .color(state.fg)
+        .font(bold_font)
+        .into();
+
+    let status_widget: Element<'_, QrMessage> = text(&state.status)
+        .size(font_size)
+        .color(state.label_color)
+        .font(state.font)
+        .width(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .wrapping(iced::widget::text::Wrapping::Word)
+        .into();
+
+    let scan_btn = button(
+        text("Scan")
+            .size(font_size)
+            .width(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .color(state.confirm_text)
+            .font(state.font),
+    )
+    .width(Length::Fill)
+    .padding(8)
+    .style(move |_, s| button_style(state.confirm_bg, state.confirm_text, s))
+    .on_press_maybe(if state.scanning {
+        None
+    } else {
+        Some(QrMessage::Scan)
+    });
+
+    let cancel_btn = button(
+        text("Cancel")
+            .size(font_size)
+            .width(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .color(state.cancel_text)
+            .font(state.font),
+    )
+    .width(Length::Fill)
+    .padding(8)
+    .style(move |_, s| button_style(state.cancel_bg, state.cancel_text, s))
+    .on_press(QrMessage::Cancel);
+
+    let actions: Element<'_, QrMessage> = row![scan_btn, cancel_btn]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .into();
+
+    let content = column![title_widget, status_widget, actions]
+        .spacing(10)
+        .padding(14)
+        .align_x(Alignment::Center);
+
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(4)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(state.bg)),
+            border: iced::Border {
+                color: state.border,
+                width: state.theme.border_width,
+                radius: 8.0.into(),
+            },
+            text_color: None,
+            shadow: iced::Shadow::default(),
+        })
+        .into()
+}
+
+// ---------------------------------------------------------------------------
 // Colour / font helpers
 // ---------------------------------------------------------------------------
 
@@ -1086,6 +1879,59 @@ fn darken(c: iced::Color, f: f32) -> iced::Color {
         b: c.b * f,
         a: c.a,
     }
+}
+
+/// Render a TOTP code as individual digit boxes (pin-entry style).
+fn pin_box_row<'a, M: 'a>(
+    code: &str,
+    font_size: u16,
+    digit_color: iced::Color,
+    box_bg: iced::Color,
+    box_border: iced::Color,
+) -> iced::Element<'a, M> {
+    use iced::widget::{center, container, text};
+    use iced::{Alignment, Background, Length};
+
+    let mono = iced::Font {
+        family: iced::font::Family::Name("monospace"),
+        weight: iced::font::Weight::Bold,
+        ..iced::Font::default()
+    };
+    let digit_size = font_size + 8;
+    let box_size = (digit_size as f32 * 1.8).ceil();
+
+    let digit_boxes: Vec<iced::Element<'_, M>> = code
+        .chars()
+        .map(|ch| {
+            let digit = text(ch.to_string())
+                .size(digit_size)
+                .color(digit_color)
+                .font(mono)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Center);
+
+            container(center(digit).width(box_size).height(box_size))
+                .width(box_size)
+                .height(box_size)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(box_bg)),
+                    border: iced::Border {
+                        color: box_border,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    text_color: None,
+                    shadow: iced::Shadow::default(),
+                })
+                .into()
+        })
+        .collect();
+
+    iced::widget::Row::with_children(digit_boxes)
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .width(Length::Shrink)
+        .into()
 }
 
 fn button_style(

@@ -142,6 +142,20 @@ EXAMPLES:
     )]
     Get(GetArgs),
 
+    /// TOTP operations (get code, add seed)
+    #[command(
+        long_about = "TOTP operations: get codes or add TOTP seeds to items.\n\n\
+            Without a subcommand, behaves like `rosec totp get`.",
+        after_long_help = "\
+EXAMPLES:
+    rosec totp name=GitHub                  show code in GUI popup
+    rosec totp --stdout name=GitHub         print code to stdout
+    rosec totp get --sync a1b2c3d4e5f60718  sync first, then show code
+    rosec totp add name=GitHub              add TOTP seed via hidden prompt
+    rosec totp add --qr name=GitHub         add TOTP seed via QR scanner"
+    )]
+    Totp(TotpCommand),
+
     /// Show full item detail: label, attributes, secret
     #[command(after_long_help = "\
 EXAMPLES:
@@ -268,6 +282,60 @@ pub struct GetArgs {
     /// Print a named public attribute instead of the primary secret
     #[arg(long)]
     pub attr: Option<String>,
+
+    /// Item identifier: 16-char hex ID, key=value filter, or D-Bus object path
+    pub item: String,
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// totp
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Container for `rosec totp [get|add]`.
+///
+/// When invoked without a subcommand (`rosec totp <item>`), the trailing
+/// positional args are forwarded to `get`.
+#[derive(Parser)]
+pub struct TotpCommand {
+    #[command(subcommand)]
+    pub action: Option<TotpSubcommands>,
+
+    /// (default subcommand) Positional args forwarded to `totp get`
+    #[arg(trailing_var_arg = true, hide = true)]
+    pub default_args: Vec<String>,
+}
+
+#[derive(Subcommand)]
+pub enum TotpSubcommands {
+    /// Get a TOTP code for an item (default)
+    Get(TotpGetArgs),
+    /// Add a TOTP seed to an item
+    Add(TotpAddArgs),
+}
+
+#[derive(Parser)]
+pub struct TotpGetArgs {
+    /// Sync providers before fetching
+    #[arg(short = 's', long = "sync")]
+    pub sync: bool,
+
+    /// Never prompt for credentials — only use cached/unlocked items
+    #[arg(long)]
+    pub no_unlock: bool,
+
+    /// Print code to stdout instead of showing in GUI popup
+    #[arg(long)]
+    pub stdout: bool,
+
+    /// Item identifier: 16-char hex ID, key=value filter, or D-Bus object path
+    pub item: String,
+}
+
+#[derive(Parser)]
+pub struct TotpAddArgs {
+    /// Use QR scanner overlay to scan a TOTP QR code
+    #[arg(long)]
+    pub qr: bool,
 
     /// Item identifier: 16-char hex ID, key=value filter, or D-Bus object path
     pub item: String,
