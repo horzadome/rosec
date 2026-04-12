@@ -64,7 +64,7 @@ This writes:
 - `~/.local/share/dbus-1/services/org.freedesktop.impl.portal.desktop.rosec.service` — XDG portal D-Bus activation
 - `~/.local/share/xdg-desktop-portal/portals/rosec.portal` — portal descriptor
 
-With `--mask`, also writes:
+With `--mask`, also writes (when the corresponding system entries exist):
 - `~/.local/share/dbus-1/services/org.gnome.keyring.service` — mask (Exec=/bin/false)
 - `~/.config/autostart/gnome-keyring-secrets.desktop` — disable autostart
 - `~/.config/autostart/gnome-keyring-ssh.desktop` — disable autostart
@@ -292,50 +292,9 @@ rosec item list --format=json
 
 ## PAM auto-unlock
 
-rosec ships a native PAM module (`pam_rosec.so`) that captures your login
-password during the `auth` phase, then passes it to `rosec-pam-unlock` during
-the `session` phase (when the D-Bus session bus is available).  This means
-your providers unlock automatically at both **initial login** and
-**screen unlock** — just like gnome-keyring does.
-
-The module also handles **password changes** (`passwd`): when the `password`
-PAM phase fires, it sends the old and new passwords to the daemon, which
-updates local vault wrapping entries automatically.  Your vaults stay
-unlockable with the new login password without manual intervention.
-
-The password is sent to `rosecd` via Unix pipe fd-passing (SCM_RIGHTS) — it
-never appears on the D-Bus wire.  Any provider with a matching password
-unlocks silently.  Providers without a match are skipped.  **Login is never
-blocked** — `pam_rosec.so` always returns `PAM_SUCCESS` on failure.
-
-### Setup
-
-**1.** Install the PAM module and helper:
-
-```bash
-# From the AUR package (installed automatically):
-#   /usr/lib/security/pam_rosec.so
-#   /usr/lib/rosec/rosec-pam-unlock
-#   /etc/pam.d/rosec
-
-# Or build manually:
-cd contrib/pam && make && sudo make install
-```
-
-**2.** If your login password differs from your vault master password, add it
-as a wrapping entry:
-
-```bash
-rosec provider add-password <vault-id> --label pam
-```
-
-Enter your **login password** when prompted. If it matches your vault master
-password, skip this step.
-
-**3.** Add rosec to your PAM config.  A drop-in snippet is installed at
-`/etc/pam.d/rosec` — include it from whichever PAM service you use:
-
-**For login + screen lock (recommended — covers both):**
+rosec ships a native PAM module (`pam_rosec.so`) that unlocks your providers
+automatically at login and screen unlock — just like gnome-keyring. Password
+changes are also handled automatically.
 
 ```
 # /etc/pam.d/system-local-login — add at the end:
@@ -344,60 +303,15 @@ session   include   rosec
 password  include   rosec
 ```
 
-This covers GDM, SDDM, console login, and screen lockers that include the
-`login` chain (hyprlock, swaylock, etc.).  Do **not** add rosec to
-`/etc/pam.d/system-login` — that file is also used by SSH and other remote
-services where there is no D-Bus session bus.
+If your login password differs from your vault master password, add it as a wrapping entry first:
 
-**For a specific screen locker only** (if you don't want rosec on initial login).
-Most screen lockers (hyprlock, swaylock, etc.) include `system-local-login`
-under the hood, so the above is usually sufficient.  If yours doesn't, add
-rosec directly to the locker's PAM config — only `auth` and `session` are
-needed here (screen lockers don't do password changes):
-
-```
-# /etc/pam.d/<locker> — add after the existing auth line:
-auth     include   rosec
-session  include   rosec
+```bash
+rosec provider add-password <vault-id> --label pam
 ```
 
-| Screen locker | PAM config |
-|---|---|
-| hyprlock | `/etc/pam.d/hyprlock` |
-| swaylock | `/etc/pam.d/swaylock` |
-| i3lock | `/etc/pam.d/i3lock` |
-| GDM | `/etc/pam.d/gdm-password` |
-| SDDM | `/etc/pam.d/sddm` |
+Login is never blocked — `pam_rosec.so` always returns `PAM_SUCCESS` on failure. Passwords are sent via pipe fd-passing and never appear on the D-Bus wire.
 
-### Fallback: pam_exec (no native module)
-
-If you prefer not to install `pam_rosec.so`, the helper works standalone
-via `pam_exec`.  This only works for **screen unlock** (not initial login,
-because the session bus doesn't exist yet during the `auth` phase):
-
-```
-# /etc/pam.d/hyprlock — after auth:
-auth  optional  pam_exec.so  expose_authtok quiet /usr/lib/rosec/rosec-pam-unlock
-```
-
-### Security
-
-- **Cannot block login:** `pam_rosec.so` returns `PAM_SUCCESS` on every
-  error path — stash failure, fork failure, helper timeout, helper crash.
-  The PAM config line uses `optional` as defence-in-depth.
-- **Password zeroization:** The stashed password is zeroized with
-  `explicit_bzero()` + volatile barrier on cleanup (PAM transaction end,
-  stash overwrite, or explicit clear after use).
-- **Password sent via pipe:** Never appears as a D-Bus message, argv
-  argument, or environment variable.  `rosec-pam-unlock` reads from stdin,
-  passes to `rosecd` via pipe fd (SCM_RIGHTS).
-- **Fire-and-forget:** The helper runs in the background (double-forked).
-  Login and screen unlock are never delayed.
-- **Minimal attack surface:** The `.so` is 17 KB of C with no runtime
-  dependencies beyond libc and libpam.  All crypto and D-Bus logic lives
-  in the separate `rosec-pam-unlock` binary.
-- **Process isolation:** All fds above stderr are closed in the child
-  before exec.  stdout/stderr are redirected to `/dev/null`.
+See [docs/pam.md](docs/pam.md) for screen locker configs, `pam_exec` fallback, and security details.
 
 ---
 
@@ -422,6 +336,52 @@ See [docs/ssh-agent.md](docs/ssh-agent.md) for full details.
 
 ---
 
+## TOTP
+
+Vault items with TOTP seeds generate time-based one-time passwords on-the-fly:
+
+```bash
+# Show a TOTP code (GUI pin-box display with countdown, or plain text in TTY)
+rosec totp my-service
+
+# Print code to stdout (for scripting / piping to clipboard)
+rosec totp my-service --stdout
+```
+
+### Adding TOTP seeds
+
+```bash
+# Enter a seed or otpauth:// URI interactively
+rosec totp add my-service
+
+# Scan a QR code from the screen (requires xdg-desktop-portal)
+rosec totp add my-service --qr
+```
+
+### FUSE filesystem
+
+TOTP codes are also available as virtual files, refreshed each period:
+
+```bash
+cat "$XDG_RUNTIME_DIR/rosec/totp/by-name/My Service.code"
+# 482019
+
+# Watch codes refresh
+watch cat "$XDG_RUNTIME_DIR/rosec/totp/by-name/My Service.code"
+```
+
+### D-Bus method
+
+Programmatic access via the `org.rosec.Secrets` interface:
+
+```bash
+busctl --user call org.freedesktop.secrets /org/rosec/Secrets \
+  org.rosec.Secrets GetTotpCode o /org/freedesktop/secrets/collection/.../item
+# Returns (code, seconds_remaining)
+```
+
+---
+
 ## XDG Desktop Portal
 
 rosec implements the `org.freedesktop.impl.portal.Secret` interface, which provides sandboxed applications (Flatpak, Snap) with stable per-application secrets. This is the same mechanism used by gnome-keyring, oo7-portal, and KWallet.
@@ -442,7 +402,7 @@ The portal descriptor and D-Bus activation file are installed automatically by `
 
 ```toml
 [service]
-refresh_interval_secs = 60
+# refresh_interval_secs = 60   # optional background sync interval
 
 [autolock]
 on_logout        = true
@@ -529,12 +489,13 @@ The master password is never stored. After changing it in the Bitwarden web vaul
 
 Run `rosec provider auth <id> --force` and paste the new token when prompted.
 
-**SSH agent fails with "Transport endpoint is not connected"**
+**SSH agent or TOTP FUSE fails with "Transport endpoint is not connected"**
 
 `rosecd` cleans up stale FUSE mounts on startup — restart it. If that fails:
 
 ```bash
 fusermount3 -uz "$XDG_RUNTIME_DIR/rosec/ssh"
+fusermount3 -uz "$XDG_RUNTIME_DIR/rosec/totp"
 ```
 
 **Sandboxed (Flatpak) apps can't find their secrets or fail to authenticate**
@@ -597,139 +558,11 @@ You should see `org.freedesktop.portal.Secret` in the output.
 
 **Chrome / Vivaldi / Chromium shows "Encrypted keystore changed or is now unavailable"**
 
-This happens when Chromium-based browsers find their "Chrome Safe Storage"
-encryption key has a different value than expected.  The most common cause when
-running rosec is **cross-provider duplication**: the same item exists in two
-providers (e.g. `gnome-keyring` and your `local` vault) with different secret
-values, and deduplication picks the wrong copy.
+Usually caused by cross-provider duplication — the same Chrome Safe Storage key exists in two providers with different values. See [docs/troubleshooting.md](docs/troubleshooting.md#chrome--vivaldi--chromium--encrypted-keystore-changed-or-is-now-unavailable) for diagnosis and fix.
 
-Chromium identifies its key by searching for
-`application=chrome xdg:schema=chrome_libsecret_os_crypt_password_v2` (or the
-`_v1` variant).  Vivaldi, Brave, and other Chromium forks also use
-`application=chrome`.
+**Self-signed certificate / Vaultwarden with private CA**
 
-*Diagnose — find the duplicates:*
-
-Temporarily set `dedup_strategy = "none"` in your config so both copies are
-visible:
-
-```toml
-# ~/.config/rosec/config.toml
-[service]
-dedup_strategy = "none"
-```
-
-Then search for the duplicate items:
-
-```bash
-rosec search application=chrome
-```
-
-If two items appear from different providers with the same label but different
-`rosec:provider` values, you have cross-provider duplication.
-
-*Fix — keep the correct copy:*
-
-1. Identify which provider holds the **original** secret (typically the one your
-   browser was using before rosec — often `gnome-keyring`).
-
-2. Set `dedup_strategy = "priority"` and list that provider **first** in your
-   config so its copy wins:
-
-   ```toml
-   [service]
-   dedup_strategy = "priority"
-
-   # provider listed first wins dedup
-   [[provider]]
-   id = "gnome-keyring"
-   kind = "gnome-keyring"
-
-   [[provider]]
-   id = "local"
-   kind = "local"
-   # ...remaining providers...
-   ```
-
-3. Restart your browser to verify it no longer shows the error.
-
-4. *(Optional)* Migrate the correct secret into your preferred vault and remove
-   the stale copy:
-
-   ```bash
-   # Export the correct item from gnome-keyring
-   rosec item export <item-id> > chrome-key.toml
-
-   # Import into your local vault
-   rosec item import --provider=local < chrome-key.toml
-
-   # Delete the stale copy from the local vault (the old wrong one)
-   rosec item delete <stale-item-id>
-   ```
-
-   After migrating, you can switch back to `dedup_strategy = "newest"` or
-   remove the explicit strategy to use the default.
-
-> **Why does this happen?**  When rosec replaced `gnome-keyring-daemon` as the
-> Secret Service provider, Chromium's `CreateItem` call stored a new encryption
-> key in rosec's write target (your local vault).  The original key in
-> gnome-keyring was still present but had a different value.  Depending on which
-> copy won deduplication, Chromium could see the wrong key on its next startup.
-
-**I host my Vaultwarden behind a self-signed certificate (with its CA in the system trust store). How do I make this work?**
-
-By default, rosec uses Mozilla's bundled root certificates for TLS verification.
-Self-signed certs or certs signed by a private CA are not in this bundle, so
-connections will fail even if your OS trusts the CA.
-
-Set `tls_mode = "system"` on your provider to use the OS trust store instead:
-
-```toml
-[[provider]]
-id   = "bitwarden"
-kind = "bitwarden"
-tls_mode = "system"
-
-[provider.options]
-email    = "user@example.com"
-base_url = "https://vaultwarden.example.com"
-```
-
-Make sure your CA certificate is installed in the system trust store (e.g. via
-`update-ca-certificates` on Debian/Ubuntu or `trust anchor` on Arch/Fedora).
-
-> **Important:** The certificate presented by the server must be a leaf
-> (end-entity) certificate signed by the CA in the trust store. A bare
-> self-signed certificate added directly as a trust anchor will be rejected with
-> a `CaUsedAsEndEntity` error because TLS libraries treat trust-store entries as
-> CA certificates, which are not valid end-entity certificates.
->
-> To set this up correctly, create a private CA and use it to sign a server
-> certificate:
->
-> ```bash
-> # 1. Create a CA
-> openssl req -x509 -newkey rsa:2048 -keyout ca-key.pem -out ca-cert.pem \
->   -days 365 -nodes -subj "/CN=My Private CA" \
->   -addext "basicConstraints=critical,CA:true" \
->   -addext "keyUsage=critical,keyCertSign,cRLSign"
->
-> # 2. Create a server key + CSR
-> openssl req -newkey rsa:2048 -keyout server-key.pem -out server.csr \
->   -nodes -subj "/CN=vaultwarden.example.com"
->
-> # 3. Sign the server cert with the CA
-> openssl x509 -req -in server.csr -CA ca-cert.pem -CAkey ca-key.pem \
->   -CAcreateserial -out server-cert.pem -days 365 \
->   -extfile <(printf 'subjectAltName=DNS:vaultwarden.example.com,IP:127.0.0.1\nbasicConstraints=CA:false\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth')
-> ```
->
-> Install `ca-cert.pem` in the system trust store and configure your server with
-> `server-cert.pem` and `server-key.pem`.
-
-By default, readiness probes inherit the same TLS mode.  You can override this
-separately with `tls_mode_probe` (accepts `"bundled"`, `"system"`, or
-`"disabled"` to skip TLS verification entirely).
+Set `tls_mode = "system"` on the provider to use the OS trust store instead of the bundled Mozilla roots. See [docs/troubleshooting.md](docs/troubleshooting.md#self-signed-certificates--vaultwarden-with-private-ca) for details and CA setup.
 
 ---
 
