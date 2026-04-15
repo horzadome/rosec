@@ -337,6 +337,29 @@ pub struct ProviderEntry {
     /// ```
     #[serde(default)]
     pub tls_mode_probe: Option<TlsMode>,
+
+    /// Maximum time (in seconds) to wait for this provider's unlock to
+    /// complete during the parallel multi-provider unlock flow.
+    ///
+    /// If the provider's readiness probes + authentication exceed this
+    /// duration, the attempt is cancelled and reported as a timeout.  The
+    /// remaining providers are not blocked.
+    ///
+    /// Defaults to `30`.  Set higher for providers with slow APIs or
+    /// high-latency networks.
+    ///
+    /// ```toml
+    /// [[provider]]
+    /// id                  = "bw1"
+    /// kind                = "bitwarden-pm"
+    /// unlock_timeout_secs = 60
+    /// ```
+    #[serde(default = "default_unlock_timeout_secs")]
+    pub unlock_timeout_secs: u64,
+}
+
+fn default_unlock_timeout_secs() -> u64 {
+    30
 }
 
 fn default_true() -> bool {
@@ -423,6 +446,7 @@ impl std::fmt::Debug for ProviderEntry {
             .field("offline_cache", &self.offline_cache)
             .field("tls_mode", &self.tls_mode)
             .field("tls_mode_probe", &self.tls_mode_probe)
+            .field("unlock_timeout_secs", &self.unlock_timeout_secs)
             .finish()
     }
 }

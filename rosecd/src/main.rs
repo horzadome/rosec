@@ -1600,6 +1600,7 @@ async fn build_single_provider(
                     .tls_mode_probe
                     .clone()
                     .unwrap_or_else(|| entry.tls_mode.clone()),
+                unlock_timeout_secs: entry.unlock_timeout_secs,
             };
 
             Ok(Arc::new(

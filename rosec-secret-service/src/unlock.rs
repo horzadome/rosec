@@ -8,6 +8,7 @@ use std::os::unix::io::RawFd;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
+use futures_util::future::join_all;
 use tracing::{debug, info};
 use zeroize::Zeroizing;
 
@@ -151,13 +152,38 @@ pub async fn unlock_with_tty(
     // Track which providers had a plain auth failure (wrong password etc).
     let mut need_individual: Vec<String> = Vec::new();
 
-    for provider in &locked {
+    // Phase 1: try the password against all locked providers **in parallel**,
+    // each bounded by its own `unlock_timeout`.  This avoids one slow provider
+    // (e.g. slow readiness probes / API) blocking the rest.
+    let futures = locked.iter().map(|provider| {
         let id = provider.id().to_string();
-        // Map the password to this provider's expected field name.
         let pw_field_id = provider.password_field().id.to_string();
-        let mut fields_for_provider = HashMap::new();
-        fields_for_provider.insert(pw_field_id, raw_password.clone());
-        match state.try_auth_provider(&id, fields_for_provider).await {
+        let timeout = provider.unlock_timeout();
+        let state = Arc::clone(&state);
+        let password = raw_password.clone();
+        async move {
+            let mut fields_for_provider = HashMap::new();
+            fields_for_provider.insert(pw_field_id, password);
+            let result =
+                tokio::time::timeout(timeout, state.try_auth_provider(&id, fields_for_provider))
+                    .await;
+            match result {
+                Ok(inner) => (id, inner),
+                Err(_elapsed) => (
+                    id,
+                    Err(ProviderError::Unavailable(format!(
+                        "unlock timed out after {}s",
+                        timeout.as_secs()
+                    ))),
+                ),
+            }
+        }
+    });
+
+    let outcomes = join_all(futures).await;
+
+    for (id, result) in outcomes {
+        match result {
             Ok(()) => {
                 // Sync immediately so on_sync_succeeded callbacks fire.
                 if let Err(e) = state.try_sync_provider(&id).await {
@@ -187,9 +213,6 @@ pub async fn unlock_with_tty(
                 });
             }
             Err(ProviderError::Unavailable(ref reason)) => {
-                // Readiness probe / connectivity failure.  Show the reason
-                // directly — it already contains actionable detail (TLS error,
-                // DNS failure, etc.).
                 print_on_fd(tty_fd, &format!("  {id}: {reason}\n"));
                 results.push(UnlockResult {
                     provider_id: id.clone(),
@@ -211,8 +234,6 @@ pub async fn unlock_with_tty(
                 });
             }
             Err(ProviderError::Other(ref e)) => {
-                // Internal error (WASM trap, etc.) — extract a user-facing
-                // hint from the error chain.
                 let hint = crate::state::user_facing_hint(e);
                 print_on_fd(tty_fd, &format!("  {id}: {hint}\n"));
                 results.push(UnlockResult {

@@ -139,6 +139,7 @@ be listed; items are deduplicated across them (see [Deduplication](#deduplicatio
 | `match_attr` | array of strings | no | Glob patterns controlling which attributes participate in `SearchItems` filtering. Reserved for future use. |
 | `tls_mode` | string | no | TLS certificate verification for plugin HTTP requests. `"bundled"` (default): Mozilla root certs only. `"system"`: use the OS trust store (for self-signed / private CA certs). |
 | `tls_mode_probe` | string | no | TLS certificate verification for readiness probes. Inherits from `tls_mode` if not set. `"disabled"`: skip TLS verification. `"system"`: OS trust store. `"bundled"`: Mozilla root certs. |
+| `unlock_timeout_secs` | integer | no | Maximum seconds to wait for this backend's unlock (readiness probes + authentication) during the parallel multi-provider unlock flow. If exceeded, the attempt is cancelled without blocking other backends. Default: `30`. |
 
 ### `[backend.autolock]` — Per-backend autolock overrides
 

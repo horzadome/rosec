@@ -68,6 +68,9 @@ pub struct WasmProviderConfig {
     pub tls_mode: rosec_core::config::TlsMode,
     /// TLS certificate verification mode for readiness probes.
     pub tls_mode_probe: rosec_core::config::TlsMode,
+    /// Maximum seconds to wait for unlock (readiness probes + auth) in the
+    /// parallel multi-provider unlock flow.  Defaults to 30.
+    pub unlock_timeout_secs: u64,
 }
 
 // ── WasmProvider ─────────────────────────────────────────────────
@@ -825,6 +828,10 @@ impl Provider for WasmProvider {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()),
         })
+    }
+
+    fn unlock_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.config.unlock_timeout_secs)
     }
 
     async fn unlock(&self, input: UnlockInput) -> Result<(), ProviderError> {

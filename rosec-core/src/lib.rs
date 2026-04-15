@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -883,6 +883,17 @@ pub trait Provider: Send + Sync {
     /// first-time setup before the normal password unlock can succeed.
     async fn unlock(&self, input: UnlockInput) -> Result<(), ProviderError>;
     async fn lock(&self) -> Result<(), ProviderError>;
+
+    /// Maximum time the parallel unlock flow should wait for this provider's
+    /// `unlock` call (including readiness probes) to complete.
+    ///
+    /// If the provider does not complete within this duration, the attempt is
+    /// cancelled and reported as a timeout without blocking other providers.
+    ///
+    /// Default: 30 seconds.
+    fn unlock_timeout(&self) -> Duration {
+        Duration::from_secs(30)
+    }
 
     /// Change the unlock password for this provider.
     ///

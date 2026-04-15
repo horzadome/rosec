@@ -44,6 +44,7 @@ font_size = 14                  # alias: size
 [[backend]]
 id = "bitwarden"
 type = "bitwarden"
+# unlock_timeout_secs = 30  # max seconds for unlock (probes + auth); default: 30
 
 [backend.options]
 email = "user@example.com"
