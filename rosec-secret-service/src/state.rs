@@ -986,6 +986,7 @@ impl ServiceState {
             program,
             has_display,
             has_tty,
+            display_env,
         } = self.resolve_prompt_env();
 
         // ── 2 & 3. GUI or TTY via rosec-prompt ────────────────────────────
@@ -1012,6 +1013,12 @@ impl ServiceState {
             cmd.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit());
+
+            // Inject display vars discovered from the systemd user manager
+            // so the child can connect to the compositor.
+            for (key, value) in &display_env {
+                cmd.env(key, value);
+            }
 
             if !has_display {
                 // No GUI available — request TTY mode.
@@ -1113,6 +1120,11 @@ impl ServiceState {
         }
 
         // ── 4. Headless — cannot prompt ────────────────────────────────────
+        tracing::debug!(
+            %provider_id,
+            "prompt dismissed: no display server, no controlling TTY, \
+             and SSH_ASKPASS is not set — cannot prompt interactively"
+        );
         Err(FdoError::Failed(format!(
             "headless: no display, no TTY, and SSH_ASKPASS is not set — \
              run `rosec auth {provider_id}` to unlock manually"
@@ -1121,6 +1133,12 @@ impl ServiceState {
 
     /// Snapshot the prompt configuration and resolve the binary path and
     /// display environment in one place.
+    ///
+    /// When `WAYLAND_DISPLAY` / `DISPLAY` are absent from the daemon's own
+    /// process environment (common when running as a D-Bus-activated systemd
+    /// service), attempts to discover them from the systemd user manager's
+    /// environment via the session bus.  Discovered variables are returned in
+    /// `display_env` so callers can inject them into child processes.
     fn resolve_prompt_env(&self) -> PromptEnv {
         let cfg = self
             .prompt_config
@@ -1131,14 +1149,39 @@ impl ServiceState {
             "builtin" | "" => resolve_prompt_binary(),
             custom => custom.to_string(),
         };
-        let has_display =
+
+        let mut has_display =
             std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
-        let has_tty = std::path::Path::new("/dev/tty").exists();
+
+        // If the daemon's own environment lacks display vars (e.g. started by
+        // systemd before the compositor imported them), try to discover them
+        // from the systemd user manager's environment over D-Bus.
+        let mut display_env: Vec<(String, String)> = Vec::new();
+        if !has_display {
+            display_env = discover_display_env_from_systemd(&self.tokio_handle, &self.conn());
+            if !display_env.is_empty() {
+                tracing::debug!(
+                    vars = ?display_env,
+                    "discovered display environment from systemd user manager"
+                );
+                has_display = true;
+            }
+        }
+
+        // Actually try to open /dev/tty — the path exists even inside
+        // systemd services, but open() fails with ENXIO when there is no
+        // controlling terminal.
+        let has_tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .is_ok();
         PromptEnv {
             cfg,
             program,
             has_display,
             has_tty,
+            display_env,
         }
     }
 
@@ -1173,9 +1216,15 @@ impl ServiceState {
             program,
             has_display,
             has_tty,
+            display_env,
         } = self.resolve_prompt_env();
 
         if !has_display && !has_tty {
+            tracing::debug!(
+                %title,
+                "prompt dismissed: no display server and no controlling TTY — \
+                 cannot prompt interactively"
+            );
             return Err(FdoError::Failed(
                 "headless: no display, no TTY — cannot prompt for 2FA".to_string(),
             ));
@@ -1195,6 +1244,11 @@ impl ServiceState {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+
+        // Inject display vars discovered from the systemd user manager.
+        for (key, value) in &display_env {
+            cmd.env(key, value);
+        }
 
         if !has_display {
             cmd.arg("--tty");
@@ -2263,6 +2317,10 @@ struct PromptEnv {
     program: String,
     has_display: bool,
     has_tty: bool,
+    /// Display environment variables discovered from the systemd user manager
+    /// when they are absent from the daemon's own process environment.
+    /// Must be injected into child processes that need a display server.
+    display_env: Vec<(String, String)>,
 }
 
 /// Find the `rosec-prompt` binary next to the current executable or on PATH.
@@ -2277,6 +2335,63 @@ fn resolve_prompt_binary() -> String {
         }
     }
     "rosec-prompt".to_string() // fall back to PATH lookup
+}
+
+/// Discover `WAYLAND_DISPLAY` / `DISPLAY` from the systemd user manager's
+/// environment via the session D-Bus bus.
+///
+/// The compositor (sway, Hyprland, GNOME Shell, …) typically calls
+/// `systemctl --user import-environment WAYLAND_DISPLAY DISPLAY` during
+/// startup.  When rosecd is D-Bus-activated before those vars are in its
+/// own process environment, this function retrieves them so they can be
+/// injected into child processes (e.g. `rosec-prompt`).
+///
+/// Returns an empty vec on any error (not on the session bus, systemd not
+/// reachable, vars not present).  This is intentionally best-effort.
+fn discover_display_env_from_systemd(
+    handle: &tokio::runtime::Handle,
+    conn: &zbus::Connection,
+) -> Vec<(String, String)> {
+    /// Display-related variable names to look for.
+    const DISPLAY_VARS: &[&str] = &["WAYLAND_DISPLAY", "DISPLAY"];
+
+    let conn = conn.clone();
+    let result = handle.block_on(async {
+        let reply = conn
+            .call_method(
+                Some("org.freedesktop.systemd1"),
+                "/org/freedesktop/systemd1",
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.freedesktop.systemd1.Manager", "Environment"),
+            )
+            .await?;
+        // The reply body is a VARIANT wrapping an array of strings (as).
+        let body = reply.body();
+        let variant: zbus::zvariant::OwnedValue = body.deserialize()?;
+        let env_strings: Vec<String> = variant.try_into().unwrap_or_default();
+        Ok::<Vec<String>, zbus::Error>(env_strings)
+    });
+
+    let env_strings = match result {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("failed to query systemd user manager environment: {e}");
+            return Vec::new();
+        }
+    };
+
+    env_strings
+        .iter()
+        .filter_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            if DISPLAY_VARS.contains(&key) {
+                Some((key.to_string(), value.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Build the JSON request payload that `rosec-prompt` expects on stdin.

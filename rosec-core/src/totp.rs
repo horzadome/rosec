@@ -463,7 +463,7 @@ mod tests {
             account: None,
         };
         let remaining = time_remaining(&params);
-        assert!(remaining >= 1 && remaining <= 30);
+        assert!((1..=30).contains(&remaining));
     }
 
     #[test]
