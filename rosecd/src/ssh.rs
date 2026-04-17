@@ -106,11 +106,8 @@ impl SshManager {
             });
         }
 
-        debug!(
-            sock = %agent_sock.display(),
-            mount = %ssh_dir.display(),
-            "SSH agent started"
-        );
+        info!(mount = %ssh_dir.display(), "SSH FUSE ready");
+        info!(sock = %agent_sock.display(), "SSH agent ready");
 
         Some(Self {
             store,
@@ -269,11 +266,6 @@ impl SshManager {
         }
         info!("SSH key store cleared");
         self.refresh_fuse();
-    }
-
-    /// Return the agent socket path for display / env-var injection.
-    pub fn agent_sock(&self) -> &std::path::Path {
-        &self.agent_sock
     }
 
     // -----------------------------------------------------------------------

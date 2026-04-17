@@ -160,9 +160,7 @@ async fn run() -> Result<()> {
         None
     };
 
-    if let Some(ref sm) = ssh_manager {
-        tracing::info!(sock = %sm.agent_sock().display(), "SSH agent ready");
-    }
+    // SSH FUSE ready + SSH agent ready are logged inside SshManager::start().
 
     // Start the TOTP FUSE filesystem.  Returns None if disabled by config,
     // XDG_RUNTIME_DIR is unset, or FUSE is unavailable.
