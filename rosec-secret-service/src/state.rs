@@ -1156,6 +1156,13 @@ impl ServiceState {
         // If the daemon's own environment lacks display vars (e.g. started by
         // systemd before the compositor imported them), try to discover them
         // from the systemd user manager's environment over D-Bus.
+        //
+        // Log at info the first time we fail to find display vars (so the
+        // admin sees it at startup), but only at debug on subsequent calls
+        // (to avoid spamming when clients repeatedly trigger prompts).
+        static LOGGED_NO_DISPLAY: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
         let mut display_env: Vec<(String, String)> = Vec::new();
         if !has_display {
             display_env = discover_display_env_from_systemd(&self.tokio_handle, &self.conn());
@@ -1165,6 +1172,12 @@ impl ServiceState {
                     "discovered display environment from systemd user manager"
                 );
                 has_display = true;
+            } else if !LOGGED_NO_DISPLAY.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(
+                    "no display environment found (process env or systemd user manager) — \
+                     GUI prompts will not be available until a compositor imports \
+                     WAYLAND_DISPLAY or DISPLAY"
+                );
             }
         }
 

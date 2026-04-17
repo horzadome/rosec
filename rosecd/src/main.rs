@@ -670,7 +670,7 @@ async fn shutdown_signal() {
 /// Returns the session ID string (e.g. "3") on success, or `None` if logind
 /// is unavailable or our process has no associated session (e.g. running in a
 /// pure TTY without PAM, or inside a container).
-async fn resolve_session_id_from_logind(system_bus: &zbus::Connection) -> Option<String> {
+async fn find_session_by_pid(system_bus: &zbus::Connection) -> Option<String> {
     let pid = std::process::id();
     let proxy = zbus::Proxy::new(
         system_bus,
@@ -692,6 +692,104 @@ async fn resolve_session_id_from_logind(system_bus: &zbus::Connection) -> Option
     let id = decode_dbus_path_component(id_encoded);
     tracing::debug!(pid, session_id = %id, "resolved session ID from logind");
     Some(id)
+}
+
+/// Find all graphical sessions (wayland or x11) for our UID via logind's
+/// `ListSessions`.
+///
+/// Returns a vec of `(session_id, object_path)` for each graphical session
+/// belonging to the current user.  Used to subscribe to Lock/Unlock signals
+/// on all of them so providers are only locked when *every* graphical session
+/// is locked.
+async fn find_graphical_sessions(system_bus: &zbus::Connection) -> Vec<(String, String)> {
+    // SAFETY: getuid() is always safe and has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let proxy = match zbus::Proxy::new(
+        system_bus,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    // ListSessions returns a(susso): (session_id, uid, user_name, seat, object_path)
+    let sessions: Vec<(String, u32, String, String, zbus::zvariant::OwnedObjectPath)> =
+        match proxy.call("ListSessions", &()).await {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+    let mut result = Vec::new();
+    for (id, sess_uid, _, _, obj_path) in &sessions {
+        if *sess_uid != uid {
+            continue;
+        }
+        let sess_proxy = match zbus::Proxy::new(
+            system_bus,
+            "org.freedesktop.login1",
+            obj_path.as_str(),
+            "org.freedesktop.login1.Session",
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let sess_type: String = match sess_proxy.get_property("Type").await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if sess_type == "wayland" || sess_type == "x11" {
+            tracing::debug!(
+                session_id = %id,
+                session_type = %sess_type,
+                "found graphical session"
+            );
+            result.push((id.clone(), obj_path.to_string()));
+        }
+    }
+
+    if result.is_empty() {
+        tracing::debug!("no graphical sessions found for uid {uid}");
+    }
+    result
+}
+
+/// Check whether a single logind session (by object path) is graphical
+/// (wayland or x11) and belongs to our UID.
+async fn is_graphical_session(system_bus: &zbus::Connection, obj_path: &str) -> bool {
+    let uid = unsafe { libc::getuid() };
+    let proxy = match zbus::Proxy::new(
+        system_bus,
+        "org.freedesktop.login1",
+        obj_path,
+        "org.freedesktop.login1.Session",
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    // The User property is (uid, object_path).  We only need the uid.
+    let sess_uid: u32 = match proxy
+        .get_property::<(u32, zbus::zvariant::OwnedObjectPath)>("User")
+        .await
+    {
+        Ok((u, _)) => u,
+        Err(_) => return false,
+    };
+    if sess_uid != uid {
+        return false;
+    }
+    let sess_type: String = match proxy.get_property("Type").await {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    sess_type == "wayland" || sess_type == "x11"
 }
 
 /// Reverse systemd's D-Bus object-path encoding: `_XX` → the character with
@@ -754,36 +852,36 @@ async fn logind_watcher(
 
     let system_bus = Connection::system().await?;
 
-    // Determine our own session ID.  Prefer XDG_SESSION_ID from the environment
-    // (set by PAM / login shells), but fall back to asking logind for the session
-    // that owns our PID.  This handles the case where rosecd is started as a
-    // systemd user service and XDG_SESSION_ID is not propagated into the unit.
-    let session_id = match std::env::var("XDG_SESSION_ID").ok() {
+    // ── Discover graphical sessions ──────────────────────────────────────
+    //
+    // Find all graphical sessions (wayland/x11) for our UID.  We track their
+    // lock state individually so providers are only locked when *every*
+    // graphical session is locked.
+    //
+    // `session_locks` maps object_path → is_locked.
+    use std::collections::HashMap;
+
+    let graphical = find_graphical_sessions(&system_bus).await;
+    let mut session_locks: HashMap<String, bool> = HashMap::new();
+    for (id, obj_path) in &graphical {
+        tracing::debug!(session_id = %id, path = %obj_path, "tracking graphical session");
+        session_locks.insert(obj_path.clone(), false);
+    }
+
+    // Also resolve a "primary" session ID for the SessionRemoved (logout)
+    // handler — prefer XDG_SESSION_ID, then GetSessionByPID, then the first
+    // graphical session.
+    let primary_session_id: Option<String> = match std::env::var("XDG_SESSION_ID").ok() {
         Some(id) => Some(id),
-        None => resolve_session_id_from_logind(&system_bus).await,
+        None => match find_session_by_pid(&system_bus).await {
+            Some(id) => Some(id),
+            None => graphical.first().map(|(id, _)| id.clone()),
+        },
     };
 
-    // Identify our session path for the per-session Lock signal.
-    // logind session paths are /org/freedesktop/login1/session/<id>.
-    // Special characters in the ID are escaped as '_XX' (systemd D-Bus path encoding);
-    // for typical numeric IDs this is a no-op.
-    let session_path: Option<String> = session_id.as_ref().map(|id| {
-        let encoded: String = id
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    c.to_string()
-                } else {
-                    format!("_{:02x}", c as u32)
-                }
-            })
-            .collect();
-        format!("/org/freedesktop/login1/session/{encoded}")
-    });
+    // ── Subscribe to signals ──────────────────────────────────────────────
 
-    // -----------------------------------------------------------------------
-    // Subscribe to PrepareForSleep — fires before suspend/hibernate
-    // -----------------------------------------------------------------------
+    // PrepareForSleep — fires before suspend/hibernate (always honoured).
     let sleep_rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .interface("org.freedesktop.login1.Manager")?
@@ -793,9 +891,7 @@ async fn logind_watcher(
     let mut sleep_stream =
         zbus::MessageStream::for_match_rule(sleep_rule, &system_bus, None).await?;
 
-    // -----------------------------------------------------------------------
-    // Subscribe to SessionRemoved — fires when any session is removed (logout)
-    // -----------------------------------------------------------------------
+    // SessionRemoved — fires when any session ends (on_logout policy).
     let session_removed_rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .interface("org.freedesktop.login1.Manager")?
@@ -805,38 +901,57 @@ async fn logind_watcher(
     let mut session_removed_stream =
         zbus::MessageStream::for_match_rule(session_removed_rule, &system_bus, None).await?;
 
-    // -----------------------------------------------------------------------
-    // Always subscribe to the Lock signal on our own session (if we know the
-    // path).  Whether to act on it is decided at signal-arrival time by reading
-    // the live config, so enabling on_session_lock in the config takes effect
-    // without a restart.
-    // -----------------------------------------------------------------------
-    let mut lock_stream_opt: Option<zbus::MessageStream> = if let Some(ref spath) = session_path {
-        let lock_rule = zbus::MatchRule::builder()
-            .msg_type(zbus::message::Type::Signal)
-            .interface("org.freedesktop.login1.Session")?
-            .member("Lock")?
-            .path(spath.as_str())?
-            .build();
-        let stream = zbus::MessageStream::for_match_rule(lock_rule, &system_bus, None).await?;
-        Some(stream)
-    } else {
-        tracing::warn!("XDG_SESSION_ID not set — session Lock signal not subscribed");
-        None
-    };
+    // SessionNew — fires when a session is created (dynamic tracking).
+    let session_new_rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.login1.Manager")?
+        .member("SessionNew")?
+        .path("/org/freedesktop/login1")?
+        .build();
+    let mut session_new_stream =
+        zbus::MessageStream::for_match_rule(session_new_rule, &system_bus, None).await?;
+
+    // Lock/Unlock — subscribe to ALL sessions (no path filter) and filter
+    // against our tracked set in the handler.  This avoids managing a dynamic
+    // number of per-session streams.
+    let lock_rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.login1.Session")?
+        .member("Lock")?
+        .build();
+    let mut lock_stream = zbus::MessageStream::for_match_rule(lock_rule, &system_bus, None).await?;
+
+    let unlock_rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.login1.Session")?
+        .member("Unlock")?
+        .build();
+    let mut unlock_stream =
+        zbus::MessageStream::for_match_rule(unlock_rule, &system_bus, None).await?;
+
+    if session_locks.is_empty() {
+        tracing::warn!(
+            "no graphical sessions found — session Lock/Unlock signals will not trigger auto-lock"
+        );
+    }
 
     tracing::info!(
-        session_id = session_id.as_deref().unwrap_or("unknown"),
+        sessions = session_locks.len(),
+        primary = primary_session_id.as_deref().unwrap_or("unknown"),
         "logind watcher started"
     );
 
-    // Event loop — config flags are read fresh from live_config on each signal.
+    // ── Helper: check if all tracked graphical sessions are locked ─────
+    let all_sessions_locked =
+        |locks: &HashMap<String, bool>| !locks.is_empty() && locks.values().all(|v| *v);
+
+    // ── Event loop ────────────────────────────────────────────────────────
     loop {
         tokio::select! {
+            // ── PrepareForSleep ───────────────────────────────────────────
             msg = sleep_stream.try_next() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        // PrepareForSleep is always honoured regardless of config.
                         if let Ok(going_to_sleep) = msg.body().deserialize::<(bool,)>()
                             && going_to_sleep.0
                         {
@@ -860,15 +975,26 @@ async fn logind_watcher(
                     }
                 }
             }
+
+            // ── SessionRemoved (logout) ──────────────────────────────────
             msg = session_removed_stream.try_next() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        // SessionRemoved(id: &str, path: OwnedObjectPath)
-                        // Only lock if the removed session is *our* session.
                         if let Ok(body) = msg.body().deserialize::<(String, zbus::zvariant::OwnedObjectPath)>() {
-                            let removed_id = body.0;
-                            if session_id.as_deref() == Some(&removed_id) {
-                                // Check per-provider on_logout policies.
+                            let removed_id = &body.0;
+                            let removed_path = body.1.to_string();
+
+                            // Stop tracking this session if it was graphical.
+                            if session_locks.remove(&removed_path).is_some() {
+                                tracing::debug!(
+                                    session_id = %removed_id,
+                                    remaining = session_locks.len(),
+                                    "graphical session removed from tracking"
+                                );
+                            }
+
+                            // Apply on_logout policy if this was our primary session.
+                            if primary_session_id.as_deref() == Some(removed_id.as_str()) {
                                 let mut any_locked = false;
                                 for provider in state.providers_ordered() {
                                     let pid = provider.id().to_string();
@@ -877,7 +1003,7 @@ async fn logind_watcher(
                                         tracing::info!(
                                             session = %removed_id,
                                             provider = %pid,
-                                            "logind: our session removed — locking provider"
+                                            "logind: primary session removed — locking provider"
                                         );
                                         if let Err(e) = state.auto_lock_provider(&pid).await {
                                             tracing::warn!(provider = %pid, "auto-lock on logout failed: {e}");
@@ -906,58 +1032,103 @@ async fn logind_watcher(
                     }
                 }
             }
-            msg = poll_lock_stream(&mut lock_stream_opt), if lock_stream_opt.is_some() => {
+
+            // ── SessionNew — dynamically track new graphical sessions ────
+            msg = session_new_stream.try_next() => {
                 match msg {
-                    Some(Ok(_)) => {
-                        // Check per-provider on_session_lock policies.
-                        let mut any_locked = false;
-                        for provider in state.providers_ordered() {
-                            let pid = provider.id().to_string();
-                            let policy = state.effective_autolock_policy(&pid);
-                            if policy.on_session_lock {
+                    Ok(Some(msg)) => {
+                        // SessionNew(id: &str, path: OwnedObjectPath)
+                        if let Ok(body) = msg.body().deserialize::<(String, zbus::zvariant::OwnedObjectPath)>() {
+                            let new_id = &body.0;
+                            let new_path = body.1.to_string();
+                            if !session_locks.contains_key(&new_path)
+                                && is_graphical_session(&system_bus, &new_path).await
+                            {
                                 tracing::info!(
-                                    provider = %pid,
-                                    "logind: session Lock signal — locking provider"
+                                    session_id = %new_id,
+                                    path = %new_path,
+                                    "new graphical session — adding to Lock tracking"
                                 );
-                                if let Err(e) = state.auto_lock_provider(&pid).await {
-                                    tracing::warn!(provider = %pid, "auto-lock on session lock failed: {e}");
-                                } else {
-                                    any_locked = true;
+                                session_locks.insert(new_path, false);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        anyhow::bail!("SessionNew stream ended");
+                    }
+                    Err(e) => {
+                        tracing::debug!("SessionNew stream error (skipping): {e}");
+                    }
+                }
+            }
+
+            // ── Lock signal — mark session as locked ─────────────────────
+            msg = lock_stream.try_next() => {
+                match msg {
+                    Ok(Some(msg)) => {
+                        let path = msg.header().path().map(|p| p.to_string()).unwrap_or_default();
+                        if let Some(locked) = session_locks.get_mut(&path) {
+                            *locked = true;
+                            tracing::debug!(session = %path, "session locked");
+
+                            // Only lock providers when ALL graphical sessions are locked.
+                            if all_sessions_locked(&session_locks) {
+                                let mut any_locked = false;
+                                for provider in state.providers_ordered() {
+                                    let pid = provider.id().to_string();
+                                    let policy = state.effective_autolock_policy(&pid);
+                                    if policy.on_session_lock {
+                                        tracing::info!(
+                                            provider = %pid,
+                                            "logind: all graphical sessions locked — locking provider"
+                                        );
+                                        if let Err(e) = state.auto_lock_provider(&pid).await {
+                                            tracing::warn!(provider = %pid, "auto-lock on session lock failed: {e}");
+                                        } else {
+                                            any_locked = true;
+                                        }
+                                    }
+                                }
+                                if any_locked && state.all_providers_locked() {
+                                    if let Some(ref sm) = ssh_manager {
+                                        sm.clear();
+                                    }
+                                    if let Some(ref tm) = totp_manager {
+                                        tm.clear();
+                                    }
+                                    state.mark_locked();
                                 }
                             }
                         }
-                        if any_locked && state.all_providers_locked() {
-                            if let Some(ref sm) = ssh_manager {
-                                sm.clear();
-                            }
-                            if let Some(ref tm) = totp_manager {
-                                tm.clear();
-                            }
-                            state.mark_locked();
+                    }
+                    Ok(None) => {
+                        anyhow::bail!("Lock stream ended");
+                    }
+                    Err(e) => {
+                        tracing::debug!("Lock stream error (skipping): {e}");
+                    }
+                }
+            }
+
+            // ── Unlock signal — mark session as unlocked ─────────────────
+            msg = unlock_stream.try_next() => {
+                match msg {
+                    Ok(Some(msg)) => {
+                        let path = msg.header().path().map(|p| p.to_string()).unwrap_or_default();
+                        if let Some(locked) = session_locks.get_mut(&path) {
+                            *locked = false;
+                            tracing::debug!(session = %path, "session unlocked");
                         }
                     }
-                    Some(Err(e)) => {
-                        tracing::debug!("session Lock stream error (skipping): {e}");
+                    Ok(None) => {
+                        anyhow::bail!("Unlock stream ended");
                     }
-                    None => {
-                        tracing::warn!("session Lock stream ended; no longer watching session Lock");
-                        lock_stream_opt = None;
+                    Err(e) => {
+                        tracing::debug!("Unlock stream error (skipping): {e}");
                     }
                 }
             }
         }
-    }
-}
-
-/// Poll the next message from an `Option<MessageStream>`, returning `None` forever
-/// if the stream is `None` (so the `select!` branch is disabled).
-async fn poll_lock_stream(
-    stream: &mut Option<zbus::MessageStream>,
-) -> Option<Result<zbus::Message, zbus::Error>> {
-    use futures_util::TryStreamExt;
-    match stream {
-        Some(s) => s.try_next().await.transpose(),
-        None => std::future::pending().await,
     }
 }
 
